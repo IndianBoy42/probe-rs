@@ -15,3 +15,5 @@
 
 # recorded profiles
 *.json.gz
+
+.venv

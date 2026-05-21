@@ -1,0 +1,27 @@
+[package]
+name = "pyprobe-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Python bindings for the probe-rs embedded debugging toolkit"
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pyprobe_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["espressif"]
+espressif = ["dep:probe-rs-espressif"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"] }
+probe-rs.workspace = true
+probe-rs-target.workspace = true
+probe-rs-espressif = { workspace = true, optional = true }
+
+[lints]
+workspace = true

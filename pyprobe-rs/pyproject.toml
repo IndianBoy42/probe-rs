@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyprobe-rs"
+version = "0.31.0"
+description = "Python bindings for the probe-rs embedded debugging toolkit"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+
+[tool.maturin]
+module-name = "pyprobe_rs._pyprobe_rs"
+features = ["espressif"]
+python-source = "python"
