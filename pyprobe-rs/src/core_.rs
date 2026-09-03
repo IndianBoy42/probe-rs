@@ -16,7 +16,7 @@ use std::time::Duration;
 pub struct CoreHandle {
     session: Py<Session>,
     core_index: usize,
-    register_map: RefCell<Option<HashMap<String, RegisterId>>>,
+    register_map: RefCell<Option<HashMap<String, (RegisterId, u32)>>>,
 }
 
 impl CoreHandle {
@@ -61,6 +61,34 @@ fn register_value_to_u128(v: RegisterValue) -> u128 {
         RegisterValue::U64(x) => x as u128,
         RegisterValue::U128(x) => x,
     }
+}
+
+/// Build a RegisterValue validated against the register's width in bits.
+fn register_value_from_u128(value: u128, bits: u32) -> PyResult<RegisterValue> {
+    let max: u128 = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    if value > max {
+        return Err(pyo3::exceptions::PyOverflowError::new_err(format!(
+            "register value {value:#x} does not fit in a {bits}-bit register"
+        )));
+    }
+    Ok(match bits {
+        0..=32 => RegisterValue::U32(value as u32),
+        33..=64 => RegisterValue::U64(value as u64),
+        _ => RegisterValue::U128(value),
+    })
+}
+
+/// Width of the register with the given ID; 32 for unknown IDs.
+fn register_bits_by_id(core: &Core<'_>, id: RegisterId) -> u32 {
+    core.registers()
+        .all_registers()
+        .find(|r| r.id().0 == id.0)
+        .map(|r| r.size_in_bits() as u32)
+        .unwrap_or(32)
 }
 
 #[pymethods]
@@ -207,15 +235,11 @@ impl CoreHandle {
     // ── Register access ────────────────────────────────────────────
 
     /// Read a core register by name or numeric ID.
-    #[pyo3(signature = (name_or_id, size=None))]
-    fn read_core_reg(
-        &self,
-        py: Python<'_>,
-        name_or_id: &Bound<'_, PyAny>,
-        size: Option<usize>,
-    ) -> PyResult<u128> {
-        let _ = &size; // size hint reserved for future use
-        let reg_id = self.resolve_register_id(py, name_or_id)?;
+    ///
+    /// Names are case-insensitive; common aliases (`pc`, `sp`, `lr`, `fp`)
+    /// resolve through the core's architecture descriptions.
+    fn read_core_reg(&self, py: Python<'_>, name_or_id: &Bound<'_, PyAny>) -> PyResult<u128> {
+        let (reg_id, _) = self.resolve_register(py, name_or_id)?;
         self.with_core(py, |core| {
             let value = core.read_core_reg(reg_id).map_err(to_py_err)?;
             Ok(register_value_to_u128(value))
@@ -223,18 +247,19 @@ impl CoreHandle {
     }
 
     /// Write a core register by name or numeric ID.
-    #[pyo3(signature = (name_or_id, value, size=None))]
+    ///
+    /// The value is validated against the register's width; `OverflowError`
+    /// is raised when it does not fit.
     fn write_core_reg(
         &self,
         py: Python<'_>,
         name_or_id: &Bound<'_, PyAny>,
         value: u128,
-        size: Option<usize>,
     ) -> PyResult<()> {
-        let _ = &size;
-        let reg_id = self.resolve_register_id(py, name_or_id)?;
+        let (reg_id, known_bits) = self.resolve_register(py, name_or_id)?;
         self.with_core(py, |core| {
-            let rv = RegisterValue::U32(value as u32);
+            let bits = known_bits.unwrap_or_else(|| register_bits_by_id(core, reg_id));
+            let rv = register_value_from_u128(value, bits)?;
             core.write_core_reg(reg_id, rv).map_err(to_py_err)
         })
     }
@@ -398,40 +423,65 @@ impl CoreHandle {
 }
 
 impl CoreHandle {
-    fn resolve_register_id(
+    /// Resolve a register by name (case-insensitive, with common aliases),
+    /// returning its ID and cached width; numeric IDs carry no cached width.
+    fn resolve_register(
         &self,
         py: Python<'_>,
         name_or_id: &Bound<'_, PyAny>,
-    ) -> PyResult<RegisterId> {
+    ) -> PyResult<(RegisterId, Option<u32>)> {
         if let Ok(id) = name_or_id.extract::<u16>() {
-            return Ok(RegisterId(id));
+            return Ok((RegisterId(id), None));
         }
         if let Ok(id) = name_or_id.extract::<i64>() {
-            return Ok(RegisterId(id as u16));
+            return Ok((RegisterId(id as u16), None));
         }
         let name = name_or_id.extract::<String>()?;
-
-        {
-            let mut map = self.register_map.borrow_mut();
-            if map.is_none() {
-                let mut sess = self.session.borrow_mut(py);
-                let sess_ref = sess
-                    .inner
-                    .as_mut()
-                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
-                let core = sess_ref.core(self.core_index).map_err(to_py_err)?;
-                let mut m = HashMap::new();
-                for reg in core.registers().all_registers() {
-                    m.insert(reg.name().to_string(), reg.id());
-                }
-                *map = Some(m);
-            }
-        }
-
+        self.ensure_register_map(py)?;
         let map = self.register_map.borrow();
         let map = map.as_ref().unwrap();
-        map.get(&name)
-            .copied()
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("unknown register: {name}")))
+        map
+            .get(&name.to_lowercase())
+            .map(|(id, bits)| (*id, Some(*bits)))
+            .ok_or_else(|| {
+                let mut known: Vec<&str> = map.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "unknown register: {name} (known: {})",
+                    known.join(", ")
+                ))
+            })
+    }
+
+    /// Build the name → (id, width) cache on first register access. Keys are
+    /// lowercase canonical names; arch-neutral aliases (pc/sp/lr/fp) resolve
+    /// through probe-rs's core descriptions and never shadow canonical names.
+    fn ensure_register_map(&self, py: Python<'_>) -> PyResult<()> {
+        let mut slot = self.register_map.borrow_mut();
+        if slot.is_some() {
+            return Ok(());
+        }
+        let mut sess = self.session.borrow_mut(py);
+        let sess_ref = sess
+            .inner
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let core = sess_ref.core(self.core_index).map_err(to_py_err)?;
+        let mut map: HashMap<String, (RegisterId, u32)> = core
+            .registers()
+            .all_registers()
+            .map(|r| (r.name().to_lowercase(), (r.id(), r.size_in_bits() as u32)))
+            .collect();
+        for (alias, reg) in [
+            ("pc", core.program_counter()),
+            ("sp", core.stack_pointer()),
+            ("lr", core.return_address()),
+            ("fp", core.frame_pointer()),
+        ] {
+            map.entry(alias.to_string())
+                .or_insert((reg.id(), reg.size_in_bits() as u32));
+        }
+        *slot = Some(map);
+        Ok(())
     }
 }

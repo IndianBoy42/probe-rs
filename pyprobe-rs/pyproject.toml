@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyprobe-rs"
-version = "0.31.0"
+dynamic = ["version"]
 description = "Python bindings for the probe-rs embedded debugging toolkit"
 requires-python = ">=3.8"
 license = { text = "MIT OR Apache-2.0" }

@@ -4,8 +4,8 @@ use crate::error::to_py_err;
 use crate::session::Session;
 use pyo3::prelude::*;
 use probe_rs::flashing::{
-    DownloadOptions as RsDownloadOptions, FlashProgress, FlashLoader as RsFlashLoader,
-    ProgressEvent as RsProgressEvent,
+    BinLoader, BinOptions, DownloadOptions as RsDownloadOptions, FlashProgress,
+    FlashLoader as RsFlashLoader, ImageLoader, ProgressEvent as RsProgressEvent,
 };
 
 /// Options for a flash download operation.
@@ -123,6 +123,71 @@ fn event_to_py(e: &RsProgressEvent) -> ProgressEvent {
     }
 }
 
+/// Wire a Python callable into a `FlashProgress` handler.
+///
+/// The callback runs synchronously while the operation holds the Session
+/// mutably borrowed, so it must not call back into pyprobe-rs session/core
+/// APIs. Exceptions it raises cannot abort the operation (the handler API is
+/// infallible); they are printed to stderr instead of being swallowed.
+fn flash_progress(callback: Py<PyAny>) -> FlashProgress<'static> {
+    FlashProgress::new(move |e: RsProgressEvent| {
+        Python::attach(|py| {
+            let event = event_to_py(&e);
+            if let Err(err) = callback.call1(py, (event,)) {
+                err.print(py);
+            }
+        })
+    })
+}
+
+/// Map Python DownloadOptions onto the Rust struct, attaching the progress
+/// callback when provided.
+fn rs_download_options(
+    opts: &DownloadOptions,
+    progress: Option<Py<PyAny>>,
+) -> RsDownloadOptions<'static> {
+    let mut rs_opts = RsDownloadOptions::default();
+    rs_opts.keep_unwritten_bytes = opts.keep_unwritten_bytes;
+    rs_opts.dry_run = opts.dry_run;
+    rs_opts.do_chip_erase = opts.do_chip_erase;
+    rs_opts.skip_erase = opts.skip_erase;
+    rs_opts.preverify = opts.preverify;
+    rs_opts.verify = opts.verify;
+    rs_opts.disable_double_buffering = opts.disable_double_buffering;
+    rs_opts.preferred_algos = opts.preferred_algos.clone();
+    if let Some(cb) = progress {
+        rs_opts.progress = flash_progress(cb);
+    }
+    rs_opts
+}
+
+/// Build the image loader for `format`. `base_address`/`skip` position a raw
+/// `bin` image and are rejected for other formats.
+fn build_image_loader(
+    format: &str,
+    base_address: Option<u64>,
+    skip: u32,
+) -> PyResult<Box<dyn ImageLoader>> {
+    if (base_address.is_some() || skip != 0)
+        && !matches!(format.to_lowercase().as_str(), "bin" | "binary")
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "base_address/skip only apply to the 'bin' image format",
+        ));
+    }
+    if matches!(format.to_lowercase().as_str(), "bin" | "binary") {
+        return Ok(Box::new(BinLoader(BinOptions {
+            base_address,
+            skip,
+        })));
+    }
+    probe_rs::flashing::image_format(format)
+        .map(|fmt| fmt.create_loader(None))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown image format: {format}"))
+        })
+}
+
 /// FlashLoader wrapper for staged flash writes.
 #[pyclass(unsendable)]
 pub struct FlashLoader {
@@ -143,92 +208,56 @@ impl FlashLoader {
         progress: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         let opts = options.unwrap_or_default();
+        let rs_opts = rs_download_options(&opts, progress);
         let sess = session
             .inner
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
-        let mut rs_opts = RsDownloadOptions::default();
-        rs_opts.keep_unwritten_bytes = opts.keep_unwritten_bytes;
-        rs_opts.dry_run = opts.dry_run;
-        rs_opts.do_chip_erase = opts.do_chip_erase;
-        rs_opts.skip_erase = opts.skip_erase;
-        rs_opts.preverify = opts.preverify;
-        rs_opts.verify = opts.verify;
-        rs_opts.disable_double_buffering = opts.disable_double_buffering;
-        rs_opts.preferred_algos = opts.preferred_algos.clone();
-
-        match progress {
-            Some(cb) => {
-                let fp = FlashProgress::new(move |e: RsProgressEvent| {
-                    let _ = Python::attach(|py| {
-                        let event = event_to_py(&e);
-                        let _ = cb.call1(py, (event,));
-                    });
-                });
-                rs_opts.progress = fp;
-            }
-            None => {}
-        }
-
         self.inner.commit(sess, rs_opts).map_err(to_py_err)
     }
 }
 
 /// Download a firmware file to the target's flash.
+///
+/// `base_address`/`skip` position a raw `bin` image and are rejected for
+/// other formats. `progress`, when given, receives ProgressEvent objects; it
+/// must not touch the session and its exceptions are printed to stderr.
 #[pyfunction]
-#[pyo3(signature = (session, path, format, options=None, progress=None))]
+#[pyo3(signature = (session, path, format, options=None, progress=None, *, base_address=None, skip=0))]
 pub fn download_file(
     session: &mut Session,
     path: &str,
     format: &str,
     options: Option<DownloadOptions>,
     progress: Option<Py<PyAny>>,
+    base_address: Option<u64>,
+    skip: u32,
 ) -> PyResult<()> {
-    let fmt = probe_rs::flashing::image_format(format).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!("unknown image format: {format}"))
-    })?;
-    let loader = fmt.create_loader(None);
+    let loader = build_image_loader(format, base_address, skip)?;
     let opts = options.unwrap_or_default();
+    let rs_opts = rs_download_options(&opts, progress);
     let sess = session
         .inner
         .as_mut()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
-
-    let mut rs_opts = RsDownloadOptions::default();
-    rs_opts.keep_unwritten_bytes = opts.keep_unwritten_bytes;
-    rs_opts.dry_run = opts.dry_run;
-    rs_opts.do_chip_erase = opts.do_chip_erase;
-    rs_opts.skip_erase = opts.skip_erase;
-    rs_opts.preverify = opts.preverify;
-    rs_opts.verify = opts.verify;
-    rs_opts.disable_double_buffering = opts.disable_double_buffering;
-    rs_opts.preferred_algos = opts.preferred_algos.clone();
-
-    match progress {
-        Some(cb) => {
-            let fp = FlashProgress::new(move |e: RsProgressEvent| {
-                let _ = Python::attach(|py| {
-                    let event = event_to_py(&e);
-                    let _ = cb.call1(py, (event,));
-                });
-            });
-            rs_opts.progress = fp;
-        }
-        None => {}
-    }
-
     probe_rs::flashing::download_file_with_options(sess, path, loader, rs_opts)
         .map_err(to_py_err)
 }
 
 /// Build a FlashLoader for a session + image.
+///
+/// `base_address`/`skip` position a raw `bin` image and are rejected for
+/// other formats.
 #[pyfunction]
-#[pyo3(signature = (session, path, format))]
-pub fn build_loader(session: &mut Session, path: &str, format: &str) -> PyResult<FlashLoader> {
-    let fmt = probe_rs::flashing::image_format(format).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!("unknown image format: {format}"))
-    })?;
-    let loader = fmt.create_loader(None);
+#[pyo3(signature = (session, path, format, *, base_address=None, skip=0))]
+pub fn build_loader(
+    session: &mut Session,
+    path: &str,
+    format: &str,
+    base_address: Option<u64>,
+    skip: u32,
+) -> PyResult<FlashLoader> {
+    let loader = build_image_loader(format, base_address, skip)?;
     let sess = session
         .inner
         .as_mut()

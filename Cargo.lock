@@ -3385,7 +3385,7 @@ dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3397,12 +3397,12 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "pyprobe-rs"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "probe-rs",
  "probe-rs-espressif",

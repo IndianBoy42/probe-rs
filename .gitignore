@@ -17,3 +17,9 @@
 *.json.gz
 
 .venv
+
+# Python build artifacts (pyprobe-rs)
+__pycache__/
+*.pyc
+*.so
+uv.lock

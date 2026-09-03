@@ -1,9 +1,11 @@
 //! CoreDump support.
 
 use crate::error::to_py_err;
+use crate::session::Session;
 use pyo3::prelude::*;
 use probe_rs::CoreDump as RsCoreDump;
 use std::collections::HashMap;
+use std::ops::Range;
 
 #[pyclass(unsendable)]
 pub struct CoreDump {
@@ -17,6 +19,35 @@ impl CoreDump {
     pub fn load(path: &str) -> PyResult<Self> {
         let data = RsCoreDump::load(std::path::Path::new(path)).map_err(to_py_err)?;
         Ok(Self { inner: Some(data) })
+    }
+
+    /// Capture a core dump from a live session core.
+    ///
+    /// `ranges` are inclusive-exclusive (start, end) memory ranges to record.
+    #[staticmethod]
+    pub fn capture(
+        session: &mut Session,
+        core_index: usize,
+        ranges: Vec<(u64, u64)>,
+    ) -> PyResult<Self> {
+        let ranges: Vec<Range<u64>> = ranges
+            .into_iter()
+            .map(|(start, end)| {
+                if end < start {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid memory range: {start:#x}..{end:#x}"
+                    )));
+                }
+                Ok(start..end)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let sess = session
+            .inner
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let mut core = sess.core(core_index).map_err(to_py_err)?;
+        let dump = RsCoreDump::dump_core(&mut core, ranges).map_err(to_py_err)?;
+        Ok(Self { inner: Some(dump) })
     }
 
     /// Save the core dump to a file.
