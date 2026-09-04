@@ -3,16 +3,12 @@
 use crate::error::to_py_err;
 use crate::session::Session;
 use crate::types::ChannelModeProxy;
-use pyo3::prelude::*;
 use probe_rs::rtt::Rtt as RsRtt;
+use pyo3::prelude::*;
 use std::cell::RefCell;
 
 /// Attach to RTT on a session's core, optionally at a specific pointer.
-pub fn attach(
-    slf: &Bound<'_, Session>,
-    core_index: usize,
-    ptr: Option<u64>,
-) -> PyResult<Rtt> {
+pub fn attach(slf: &Bound<'_, Session>, core_index: usize, ptr: Option<u64>) -> PyResult<Rtt> {
     let _py = slf.py();
     let session_ref: Py<Session> = slf.clone().unbind();
     let mut sess = slf.borrow_mut();
@@ -56,7 +52,7 @@ pub fn attach(
     })
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ChannelInfo {
     #[pyo3(get)]

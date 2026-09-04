@@ -7,14 +7,14 @@
 
 use crate::error::to_py_err;
 use crate::session::Session;
-use pyo3::prelude::*;
 use probe_rs::flashing::{
-    BinLoader, BinOptions, DownloadOptions as RsDownloadOptions, FlashProgress,
-    FlashLoader as RsFlashLoader, ImageLoader, ProgressEvent as RsProgressEvent,
+    BinLoader, BinOptions, DownloadOptions as RsDownloadOptions, FlashLoader as RsFlashLoader,
+    FlashProgress, ImageLoader, ProgressEvent as RsProgressEvent,
 };
+use pyo3::prelude::*;
 
 /// Options for a flash download operation.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct DownloadOptions {
     #[pyo3(get, set)]
@@ -59,7 +59,7 @@ impl Default for DownloadOptions {
 }
 
 /// Flash progress event forwarded to Python callbacks.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ProgressEvent {
     #[pyo3(get)]
@@ -75,56 +75,37 @@ pub struct ProgressEvent {
 }
 
 fn event_to_py(e: &RsProgressEvent) -> ProgressEvent {
-    match e {
-        RsProgressEvent::FlashLayoutReady { .. } => ProgressEvent {
-            kind: "FlashLayoutReady".into(),
-            operation: "layout".into(),
-            size: 0,
-            total: None,
-            time_s: 0.0,
-        },
-        RsProgressEvent::AddProgressBar { operation, total } => ProgressEvent {
-            kind: "AddProgressBar".into(),
-            operation: format!("{:?}", operation),
-            size: 0,
-            total: *total,
-            time_s: 0.0,
-        },
-        RsProgressEvent::Started(op) => ProgressEvent {
-            kind: "Started".into(),
-            operation: format!("{:?}", op),
-            size: 0,
-            total: None,
-            time_s: 0.0,
-        },
-        RsProgressEvent::Progress { operation, size, time } => ProgressEvent {
-            kind: "Progress".into(),
-            operation: format!("{:?}", operation),
-            size: *size,
-            total: None,
-            time_s: time.as_secs_f32(),
-        },
-        RsProgressEvent::Finished(op) => ProgressEvent {
-            kind: "Finished".into(),
-            operation: format!("{:?}", op),
-            size: 0,
-            total: None,
-            time_s: 0.0,
-        },
-        RsProgressEvent::Failed(op) => ProgressEvent {
-            kind: "Failed".into(),
-            operation: format!("{:?}", op),
-            size: 0,
-            total: None,
-            time_s: 0.0,
-        },
-        RsProgressEvent::DiagnosticMessage { message } => ProgressEvent {
-            kind: "DiagnosticMessage".into(),
-            operation: message.clone(),
-            size: 0,
-            total: None,
-            time_s: 0.0,
-        },
+    let (kind, operation, size, total, time_s) = match e {
+        RsProgressEvent::FlashLayoutReady { .. } => {
+            ("FlashLayoutReady", "layout".into(), 0, None, 0.0)
+        }
+        RsProgressEvent::AddProgressBar { operation, total } => {
+            ("AddProgressBar", format!("{operation:?}"), 0, *total, 0.0)
+        }
+        RsProgressEvent::Started(op) => ("Started", format!("{op:?}"), 0, None, 0.0),
+        RsProgressEvent::Progress {
+            operation,
+            size,
+            time,
+        } => (
+            "Progress",
+            format!("{operation:?}"),
+            *size,
+            None,
+            time.as_secs_f32(),
+        ),
+        RsProgressEvent::Finished(op) => ("Finished", format!("{op:?}"), 0, None, 0.0),
+        RsProgressEvent::Failed(op) => ("Failed", format!("{op:?}"), 0, None, 0.0),
+        RsProgressEvent::DiagnosticMessage { message } => {
+            ("DiagnosticMessage", message.clone(), 0, None, 0.0)
+        }
+    };
+    ProgressEvent {
+        kind: kind.into(),
+        operation,
+        size,
+        total,
+        time_s,
     }
 }
 
@@ -173,18 +154,14 @@ fn build_image_loader(
     base_address: Option<u64>,
     skip: u32,
 ) -> PyResult<Box<dyn ImageLoader>> {
-    if (base_address.is_some() || skip != 0)
-        && !matches!(format.to_lowercase().as_str(), "bin" | "binary")
-    {
+    let positioned = base_address.is_some() || skip != 0;
+    if matches!(format.to_lowercase().as_str(), "bin" | "binary") {
+        return Ok(Box::new(BinLoader(BinOptions { base_address, skip })));
+    }
+    if positioned {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "base_address/skip only apply to the 'bin' image format",
         ));
-    }
-    if matches!(format.to_lowercase().as_str(), "bin" | "binary") {
-        return Ok(Box::new(BinLoader(BinOptions {
-            base_address,
-            skip,
-        })));
     }
     probe_rs::flashing::image_format(format)
         .map(|fmt| fmt.create_loader(None))
@@ -241,8 +218,7 @@ pub fn download_file(
     let opts = options.unwrap_or_default();
     let rs_opts = rs_download_options(&opts, progress);
     let sess = &mut session.inner;
-    probe_rs::flashing::download_file_with_options(sess, path, loader, rs_opts)
-        .map_err(to_py_err)
+    probe_rs::flashing::download_file_with_options(sess, path, loader, rs_opts).map_err(to_py_err)
 }
 
 /// Build a FlashLoader for a session + image.

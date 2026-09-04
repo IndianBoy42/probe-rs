@@ -45,8 +45,9 @@ fn error_kind<E: std::fmt::Display + 'static>(e: &E) -> String {
             | probe_rs::Error::RegisterAddressOutOfBounds(_)
             | probe_rs::Error::WriteRegister { .. }
             | probe_rs::Error::ReadRegister { .. } => "Register",
-            probe_rs::Error::MemoryNotAligned(_)
-            | probe_rs::Error::InvalidDataLength(_) => "Memory",
+            probe_rs::Error::MemoryNotAligned(_) | probe_rs::Error::InvalidDataLength(_) => {
+                "Memory"
+            }
             probe_rs::Error::BreakpointOperation(_) => "Breakpoint",
         }
         .into();

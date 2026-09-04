@@ -4,9 +4,6 @@
 //! target attach, memory/register access, flashing, RTT, trace, and core dumps)
 //! as a Python extension module built with PyO3.
 
-// PyO3 0.29 deprecates the automatic FromPyObject impl for Clone pyclasses.
-// We rely on it for passing pyclasses as function arguments (e.g. Permissions).
-#![allow(deprecated)]
 mod core_;
 mod coredump_;
 mod error;
@@ -20,7 +17,7 @@ use pyo3::prelude::*;
 
 use crate::core_::{CoreHandle, CoreRegisterInfo};
 use crate::coredump_::CoreDump;
-use crate::flashing::{build_loader, download_file, DownloadOptions, FlashLoader, ProgressEvent};
+use crate::flashing::{DownloadOptions, FlashLoader, ProgressEvent, build_loader, download_file};
 use crate::probe_::{DebugProbeSelectorPy, FakeProbePy, ListerPy, ProbeInfo, ProbePy};
 use crate::rtt_::{ChannelInfo, DownChannel, Rtt, UpChannel};
 use crate::session::{Permissions, RegistryPy, Session, SessionConfig, Target};
@@ -74,7 +71,10 @@ fn _pyprobe_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceSinkProxy>()?;
     m.add_class::<CoreStatusProxy>()?;
     m.add_class::<HaltReasonProxy>()?;
-    m.add("ProbeRsError", m.py().get_type::<crate::error::ProbeRsError>())?;
+    m.add(
+        "ProbeRsError",
+        m.py().get_type::<crate::error::ProbeRsError>(),
+    )?;
 
     // ── Probe ────────────────────────────────────────────────────────
     m.add_class::<ListerPy>()?;

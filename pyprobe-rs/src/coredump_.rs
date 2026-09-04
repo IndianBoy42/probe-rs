@@ -2,8 +2,8 @@
 
 use crate::error::to_py_err;
 use crate::session::Session;
-use pyo3::prelude::*;
 use probe_rs::CoreDump as RsCoreDump;
+use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
 

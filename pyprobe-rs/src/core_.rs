@@ -3,10 +3,10 @@
 use crate::error::to_py_err;
 use crate::session::Session;
 use crate::types::*;
-use pyo3::prelude::*;
 use probe_rs::MemoryInterface;
 use probe_rs::{Core, CoreInterface, RegisterId, RegisterValue};
 use probe_rs_target::MemoryRegion;
+use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -41,7 +41,7 @@ impl CoreHandle {
 }
 
 /// Info about a single register.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct CoreRegisterInfo {
     #[pyo3(get)]
@@ -94,7 +94,9 @@ impl CoreHandle {
 
     fn halt(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<u64> {
         self.with_core(py, |core| {
-            let info = core.halt(Duration::from_millis(timeout_ms)).map_err(to_py_err)?;
+            let info = core
+                .halt(Duration::from_millis(timeout_ms))
+                .map_err(to_py_err)?;
             Ok(info.pc)
         })
     }
@@ -314,7 +316,9 @@ impl CoreHandle {
     }
 
     fn clear_all_hw_breakpoints(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_core(py, |core| core.clear_all_hw_breakpoints().map_err(to_py_err))
+        self.with_core(py, |core| {
+            core.clear_all_hw_breakpoints().map_err(to_py_err)
+        })
     }
 
     fn enable_vector_catch(
@@ -435,8 +439,7 @@ impl CoreHandle {
         self.ensure_register_map(py)?;
         let map = self.register_map.borrow();
         let map = map.as_ref().unwrap();
-        map
-            .get(&name.to_lowercase())
+        map.get(&name.to_lowercase())
             .map(|(id, bits)| (*id, Some(*bits)))
             .ok_or_else(|| {
                 let mut known: Vec<&str> = map.keys().map(String::as_str).collect();

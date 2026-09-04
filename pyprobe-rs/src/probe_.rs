@@ -2,8 +2,8 @@
 
 use crate::error::to_py_err;
 use crate::session::{Permissions, Session};
+use probe_rs::probe::{DebugProbeInfo, Probe, WireProtocol, list::Lister};
 use pyo3::prelude::*;
-use probe_rs::probe::{list::Lister, DebugProbeInfo, Probe, WireProtocol};
 use std::str::FromStr;
 
 use crate::types::WireProtocolProxy;
@@ -35,25 +35,21 @@ impl ListerPy {
     /// Open a probe by selector string ("VID:PID[:SN]") or by a
     /// DebugProbeSelector(vid, pid, serial) instance.
     pub fn open(&self, selector: &Bound<'_, PyAny>) -> PyResult<ProbePy> {
-        let sel: probe_rs::probe::DebugProbeSelector =
-            if let Ok(s) = selector.extract::<String>() {
-                probe_rs::probe::DebugProbeSelector::from_str(&s).map_err(to_py_err)?
-            } else if let Ok(p) = selector.extract::<DebugProbeSelectorPy>() {
-                probe_rs::probe::DebugProbeSelector {
-                    vendor_id: p.vid,
-                    product_id: p.pid,
-                    interface: None,
-                    serial_number: p.serial,
-                }
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "selector must be a 'VID:PID[:SN]' string or a DebugProbeSelector",
-                ));
-            };
-        self.lister
-            .open(sel)
-            .map(ProbePy::from)
-            .map_err(to_py_err)
+        let sel: probe_rs::probe::DebugProbeSelector = if let Ok(s) = selector.extract::<String>() {
+            probe_rs::probe::DebugProbeSelector::from_str(&s).map_err(to_py_err)?
+        } else if let Ok(p) = selector.extract::<DebugProbeSelectorPy>() {
+            probe_rs::probe::DebugProbeSelector {
+                vendor_id: p.vid,
+                product_id: p.pid,
+                interface: None,
+                serial_number: p.serial,
+            }
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "selector must be a 'VID:PID[:SN]' string or a DebugProbeSelector",
+            ));
+        };
+        self.lister.open(sel).map(ProbePy::from).map_err(to_py_err)
     }
 }
 
@@ -124,11 +120,7 @@ impl From<Probe> for ProbePy {
 impl ProbePy {
     /// Attach to a target by name.
     #[pyo3(signature = (target, permissions=None))]
-    pub fn attach(
-        &mut self,
-        target: &str,
-        permissions: Option<Permissions>,
-    ) -> PyResult<Session> {
+    pub fn attach(&mut self, target: &str, permissions: Option<Permissions>) -> PyResult<Session> {
         let perms = permissions.unwrap_or_default().inner;
         let probe = self
             .inner
@@ -322,7 +314,7 @@ impl FakeProbePy {
 }
 
 /// A debug probe selector (VID:PID[:SN]).
-#[pyclass(name = "DebugProbeSelector")]
+#[pyclass(name = "DebugProbeSelector", from_py_object)]
 #[derive(Clone)]
 pub struct DebugProbeSelectorPy {
     #[pyo3(get)]

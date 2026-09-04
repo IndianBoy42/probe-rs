@@ -1,20 +1,18 @@
 //! PyO3 enum proxies mirroring probe-rs / probe-rs-target enums.
 
-use pyo3::prelude::*;
-use probe_rs::{
-    BreakpointCause, CoreStatus, HaltReason, VectorCatchCondition,
-};
+use probe_rs::{BreakpointCause, CoreStatus, HaltReason, VectorCatchCondition};
 use probe_rs_target::{Architecture, CoreType, Endian, InstructionSet};
+use pyo3::prelude::*;
 
 /// Wire protocol for debug probe communication.
-#[pyclass(name = "WireProtocol", eq, eq_int)]
+#[pyclass(name = "WireProtocol", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WireProtocolProxy {
     Swd = 0,
     Jtag = 1,
 }
 
-#[pyclass(name = "Architecture", eq, eq_int)]
+#[pyclass(name = "Architecture", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArchitectureProxy {
     Arm = 0,
@@ -22,7 +20,7 @@ pub enum ArchitectureProxy {
     Xtensa = 2,
 }
 
-#[pyclass(name = "CoreType", eq, eq_int)]
+#[pyclass(name = "CoreType", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CoreTypeProxy {
     Armv6m = 0,
@@ -37,7 +35,7 @@ pub enum CoreTypeProxy {
     Xtensa = 9,
 }
 
-#[pyclass(name = "InstructionSet", eq, eq_int)]
+#[pyclass(name = "InstructionSet", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InstructionSetProxy {
     Thumb2 = 0,
@@ -50,7 +48,7 @@ pub enum InstructionSetProxy {
     Xtensa = 7,
 }
 
-#[pyclass(name = "Endian", eq, eq_int)]
+#[pyclass(name = "Endian", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EndianProxy {
     Little = 0,
@@ -58,7 +56,7 @@ pub enum EndianProxy {
 }
 
 /// RTT channel buffering mode.
-#[pyclass(name = "ChannelMode", eq, eq_int)]
+#[pyclass(name = "ChannelMode", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChannelModeProxy {
     NoBlockSkip = 0,
@@ -66,7 +64,7 @@ pub enum ChannelModeProxy {
     BlockIfFull = 2,
 }
 
-#[pyclass(name = "VectorCatchCondition", eq, eq_int)]
+#[pyclass(name = "VectorCatchCondition", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VectorCatchConditionProxy {
     HardFault = 0,
@@ -80,7 +78,7 @@ pub enum VectorCatchConditionProxy {
 // ── Payload-carrying status proxies ────────────────────────────────
 
 /// Core run state, from `CoreStatus.state`.
-#[pyclass(name = "CoreState", eq, eq_int)]
+#[pyclass(name = "CoreState", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CoreStateProxy {
     Running = 0,
@@ -91,7 +89,7 @@ pub enum CoreStateProxy {
 }
 
 /// Category of the most recent halt, from `CoreStatus.halt_reason.kind`.
-#[pyclass(name = "HaltKind", eq, eq_int)]
+#[pyclass(name = "HaltKind", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HaltKindProxy {
     Breakpoint = 0,
@@ -105,7 +103,7 @@ pub enum HaltKindProxy {
 }
 
 /// Why the core last halted.
-#[pyclass(name = "HaltReason")]
+#[pyclass(name = "HaltReason", from_py_object)]
 #[derive(Clone)]
 pub struct HaltReasonProxy {
     #[pyo3(get)]
@@ -116,7 +114,7 @@ pub struct HaltReasonProxy {
 }
 
 /// Snapshot of a core's run state.
-#[pyclass(name = "CoreStatus")]
+#[pyclass(name = "CoreStatus", from_py_object)]
 #[derive(Clone)]
 pub struct CoreStatusProxy {
     #[pyo3(get)]
@@ -130,7 +128,7 @@ pub struct CoreStatusProxy {
 }
 
 /// Where trace data is collected from, for `Session.setup_tracing`.
-#[pyclass(name = "TraceSink", eq, eq_int)]
+#[pyclass(name = "TraceSink", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TraceSinkProxy {
     Swo = 0,
@@ -225,7 +223,6 @@ pub fn endian_to_py(e: Endian) -> EndianProxy {
         Endian::Big => EndianProxy::Big,
     }
 }
-
 
 pub fn py_to_vector_catch(v: VectorCatchConditionProxy) -> VectorCatchCondition {
     match v {

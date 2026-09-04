@@ -2,16 +2,16 @@
 
 use crate::error::to_py_err;
 use crate::types::*;
-use pyo3::prelude::*;
-use probe_rs::config::{
-    Registry as RsRegistry, Target as RsTarget,
+use probe_rs::config::{Registry as RsRegistry, Target as RsTarget};
+use probe_rs::{
+    Permissions as RsPermissions, Session as RsSession, SessionConfig as RsSessionConfig,
 };
-use probe_rs::{Permissions as RsPermissions, Session as RsSession, SessionConfig as RsSessionConfig};
 use probe_rs_target::MemoryRegion;
+use pyo3::prelude::*;
 use std::io::Read;
 
 /// Session configuration.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct SessionConfig {
     #[pyo3(get, set)]
@@ -69,7 +69,7 @@ impl SessionConfig {
 }
 
 /// Permissions granted to a debug session.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Permissions {
     pub(crate) inner: RsPermissions,
@@ -97,7 +97,7 @@ impl Default for Permissions {
 }
 
 /// Target specification (read-only from Python).
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Target {
     pub(crate) inner: RsTarget,
@@ -230,7 +230,10 @@ impl Session {
             )));
         }
         drop(borrow);
-        Ok(crate::core_::CoreHandle::new(slf.clone().unbind(), core_index))
+        Ok(crate::core_::CoreHandle::new(
+            slf.clone().unbind(),
+            core_index,
+        ))
     }
 
     /// List available cores as (index, CoreType) tuples.
@@ -256,29 +259,22 @@ impl Session {
 
     /// Clear all hardware breakpoints across all cores.
     pub fn clear_all_hw_breakpoints(&mut self) -> PyResult<()> {
-        self.get_mut()
-            .clear_all_hw_breakpoints()
-            .map_err(to_py_err)
+        self.get_mut().clear_all_hw_breakpoints().map_err(to_py_err)
     }
 
     /// Resume all cores.
     pub fn resume_all_cores(&mut self) -> PyResult<()> {
-        self.get_mut()
-            .resume_all_cores()
-            .map_err(to_py_err)
+        self.get_mut().resume_all_cores().map_err(to_py_err)
     }
 
     /// Check if the debug sequence supports erase-all.
     pub fn has_sequence_erase_all(&mut self) -> PyResult<bool> {
-        Ok(self.get_mut()
-            .has_sequence_erase_all())
+        Ok(self.get_mut().has_sequence_erase_all())
     }
 
     /// Run the erase-all sequence.
     pub fn sequence_erase_all(&mut self) -> PyResult<()> {
-        self.get_mut()
-            .sequence_erase_all()
-            .map_err(to_py_err)
+        self.get_mut().sequence_erase_all().map_err(to_py_err)
     }
 
     // ── SWO / Trace ────────────────────────────────────────────────
@@ -300,9 +296,7 @@ impl Session {
 
     /// Disable SWV for a core.
     pub fn disable_swv(&mut self, core_index: usize) -> PyResult<()> {
-        self.get_mut()
-            .disable_swv(core_index)
-            .map_err(to_py_err)
+        self.get_mut().disable_swv(core_index).map_err(to_py_err)
     }
 
     /// Add a SWV data trace unit.
@@ -321,8 +315,7 @@ impl Session {
 
     /// Read available trace/SWO data.
     pub fn read_trace_data(&mut self) -> PyResult<Vec<u8>> {
-        let sess = self
-            .get_mut();
+        let sess = self.get_mut();
         let mut buf = Vec::new();
         let mut reader = sess.swo_reader().map_err(to_py_err)?;
         reader.read_to_end(&mut buf).map_err(to_py_err)?;
@@ -337,8 +330,7 @@ impl Session {
     /// Erase all flash: the vendor erase-all sequence when the target provides
     /// one, otherwise a full chip erase performed through the flash loader.
     pub fn erase_all(&mut self) -> PyResult<()> {
-        let sess = self
-            .get_mut();
+        let sess = self.get_mut();
         if sess.has_sequence_erase_all() {
             sess.sequence_erase_all().map_err(to_py_err)
         } else {
