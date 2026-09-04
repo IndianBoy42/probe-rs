@@ -1,4 +1,9 @@
 //! Flashing: download_file, FlashLoader, DownloadOptions, progress callbacks.
+//!
+//! All flashing operations run with the Python interpreter blocked (the GIL is
+//! held for the whole call): probe-rs's `FlashProgress` handler is not `Send`,
+//! so the operation cannot be moved out from under pyo3's `allow_threads`.
+//! A long flash therefore freezes interactive loops (e.g. Jupyter) until done.
 
 use crate::error::to_py_err;
 use crate::session::Session;
@@ -27,7 +32,7 @@ pub struct DownloadOptions {
     #[pyo3(get, set)]
     pub disable_double_buffering: bool,
     #[pyo3(get, set)]
-    pub preferred_algos: Vec<String>,
+    pub ram_chunk_size: Option<u64>,
 }
 
 #[pymethods]
@@ -42,7 +47,7 @@ impl DownloadOptions {
             preverify: false,
             verify: true,
             disable_double_buffering: false,
-            preferred_algos: Vec::new(),
+            ram_chunk_size: None,
         }
     }
 }
@@ -154,7 +159,7 @@ fn rs_download_options(
     rs_opts.preverify = opts.preverify;
     rs_opts.verify = opts.verify;
     rs_opts.disable_double_buffering = opts.disable_double_buffering;
-    rs_opts.preferred_algos = opts.preferred_algos.clone();
+    rs_opts.ram_chunk_size = opts.ram_chunk_size;
     if let Some(cb) = progress {
         rs_opts.progress = flash_progress(cb);
     }
@@ -209,10 +214,7 @@ impl FlashLoader {
     ) -> PyResult<()> {
         let opts = options.unwrap_or_default();
         let rs_opts = rs_download_options(&opts, progress);
-        let sess = session
-            .inner
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let sess = &mut session.inner;
         self.inner.commit(sess, rs_opts).map_err(to_py_err)
     }
 }
@@ -222,6 +224,8 @@ impl FlashLoader {
 /// `base_address`/`skip` position a raw `bin` image and are rejected for
 /// other formats. `progress`, when given, receives ProgressEvent objects; it
 /// must not touch the session and its exceptions are printed to stderr.
+///
+/// Blocks the Python interpreter for the duration of the flash (see module docs).
 #[pyfunction]
 #[pyo3(signature = (session, path, format, options=None, progress=None, *, base_address=None, skip=0))]
 pub fn download_file(
@@ -236,10 +240,7 @@ pub fn download_file(
     let loader = build_image_loader(format, base_address, skip)?;
     let opts = options.unwrap_or_default();
     let rs_opts = rs_download_options(&opts, progress);
-    let sess = session
-        .inner
-        .as_mut()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+    let sess = &mut session.inner;
     probe_rs::flashing::download_file_with_options(sess, path, loader, rs_opts)
         .map_err(to_py_err)
 }
@@ -258,10 +259,7 @@ pub fn build_loader(
     skip: u32,
 ) -> PyResult<FlashLoader> {
     let loader = build_image_loader(format, base_address, skip)?;
-    let sess = session
-        .inner
-        .as_mut()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+    let sess = &mut session.inner;
     let rs_loader =
         probe_rs::flashing::build_loader(sess, path, loader, None).map_err(to_py_err)?;
     Ok(FlashLoader { inner: rs_loader })

@@ -14,14 +14,6 @@ pub enum WireProtocolProxy {
     Jtag = 1,
 }
 
-/// How to attach to a target.
-#[pyclass(name = "AttachMethod", eq, eq_int)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AttachMethodProxy {
-    Normal = 0,
-    UnderReset = 1,
-}
-
 #[pyclass(name = "Architecture", eq, eq_int)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArchitectureProxy {
@@ -87,27 +79,48 @@ pub enum VectorCatchConditionProxy {
 
 // ── Payload-carrying status proxies ────────────────────────────────
 
+/// Core run state, from `CoreStatus.state`.
+#[pyclass(name = "CoreState", eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CoreStateProxy {
+    Running = 0,
+    Halted = 1,
+    LockedUp = 2,
+    Sleeping = 3,
+    Unknown = 4,
+}
+
+/// Category of the most recent halt, from `CoreStatus.halt_reason.kind`.
+#[pyclass(name = "HaltKind", eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HaltKindProxy {
+    Breakpoint = 0,
+    Watchpoint = 1,
+    Step = 2,
+    Request = 3,
+    External = 4,
+    Exception = 5,
+    Multiple = 6,
+    Unknown = 7,
+}
+
+/// Why the core last halted.
 #[pyclass(name = "HaltReason")]
 #[derive(Clone)]
 pub struct HaltReasonProxy {
     #[pyo3(get)]
-    pub reason: String,
+    pub kind: HaltKindProxy,
+    /// Human-readable detail, e.g. "hardware", "semihosting: ...".
     #[pyo3(get)]
-    pub kind: String,
+    pub detail: String,
 }
 
-#[pyclass(name = "BreakpointCause")]
-#[derive(Clone)]
-pub struct BreakpointCauseProxy {
-    #[pyo3(get)]
-    pub cause: String,
-}
-
+/// Snapshot of a core's run state.
 #[pyclass(name = "CoreStatus")]
 #[derive(Clone)]
 pub struct CoreStatusProxy {
     #[pyo3(get)]
-    pub status: String,
+    pub state: CoreStateProxy,
     #[pyo3(get)]
     pub is_halted: bool,
     #[pyo3(get)]
@@ -116,63 +129,43 @@ pub struct CoreStatusProxy {
     pub halt_reason: Option<HaltReasonProxy>,
 }
 
-#[pyclass(name = "ProgressEvent")]
-#[derive(Clone)]
-pub struct ProgressEventPy {
-    #[pyo3(get)]
-    pub kind: String,
-    #[pyo3(get)]
-    pub operation: String,
-    #[pyo3(get)]
-    pub size: u64,
-    #[pyo3(get)]
-    pub total: Option<u64>,
-    #[pyo3(get)]
-    pub time_s: f32,
+/// Where trace data is collected from, for `Session.setup_tracing`.
+#[pyclass(name = "TraceSink", eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TraceSinkProxy {
+    Swo = 0,
+    Tpiu = 1,
+    TraceMemory = 2,
 }
 
 // ── Conversion helpers ─────────────────────────────────────────────
 
 pub fn core_status_to_py(s: CoreStatus) -> CoreStatusProxy {
-    match s {
-        CoreStatus::Running => CoreStatusProxy {
-            status: "Running".into(),
-            is_halted: false,
-            is_running: true,
-            halt_reason: None,
-        },
-        CoreStatus::Halted(reason) => CoreStatusProxy {
-            status: "Halted".into(),
-            is_halted: true,
-            is_running: false,
-            halt_reason: Some(halt_reason_to_py(reason)),
-        },
-        CoreStatus::LockedUp => CoreStatusProxy {
-            status: "LockedUp".into(),
-            is_halted: false,
-            is_running: false,
-            halt_reason: None,
-        },
-        CoreStatus::Sleeping => CoreStatusProxy {
-            status: "Sleeping".into(),
-            is_halted: false,
-            is_running: false,
-            halt_reason: None,
-        },
-        CoreStatus::Unknown => CoreStatusProxy {
-            status: "Unknown".into(),
-            is_halted: false,
-            is_running: false,
-            halt_reason: None,
-        },
+    let (state, is_halted, is_running, halt_reason) = match s {
+        CoreStatus::Running => (CoreStateProxy::Running, false, true, None),
+        CoreStatus::Halted(reason) => (
+            CoreStateProxy::Halted,
+            true,
+            false,
+            Some(halt_reason_to_py(reason)),
+        ),
+        CoreStatus::LockedUp => (CoreStateProxy::LockedUp, false, false, None),
+        CoreStatus::Sleeping => (CoreStateProxy::Sleeping, false, false, None),
+        CoreStatus::Unknown => (CoreStateProxy::Unknown, false, false, None),
+    };
+    CoreStatusProxy {
+        state,
+        is_halted,
+        is_running,
+        halt_reason,
     }
 }
 
 pub fn halt_reason_to_py(r: HaltReason) -> HaltReasonProxy {
-    let (kind, reason) = match r {
-        HaltReason::Multiple => ("Multiple".into(), "multiple reasons".into()),
+    let (kind, detail) = match r {
+        HaltReason::Multiple => (HaltKindProxy::Multiple, "multiple reasons".into()),
         HaltReason::Breakpoint(cause) => (
-            "Breakpoint".into(),
+            HaltKindProxy::Breakpoint,
             match cause {
                 BreakpointCause::Hardware => "hardware".into(),
                 BreakpointCause::Software => "software".into(),
@@ -180,14 +173,14 @@ pub fn halt_reason_to_py(r: HaltReason) -> HaltReasonProxy {
                 BreakpointCause::Semihosting(cmd) => format!("semihosting: {:?}", cmd),
             },
         ),
-        HaltReason::Exception => ("Exception".into(), "exception".into()),
-        HaltReason::Watchpoint => ("Watchpoint".into(), "watchpoint".into()),
-        HaltReason::Step => ("Step".into(), "step".into()),
-        HaltReason::Request => ("Request".into(), "request".into()),
-        HaltReason::External => ("External".into(), "external".into()),
-        HaltReason::Unknown => ("Unknown".into(), "unknown".into()),
+        HaltReason::Exception => (HaltKindProxy::Exception, "exception".into()),
+        HaltReason::Watchpoint => (HaltKindProxy::Watchpoint, "watchpoint".into()),
+        HaltReason::Step => (HaltKindProxy::Step, "step".into()),
+        HaltReason::Request => (HaltKindProxy::Request, "request".into()),
+        HaltReason::External => (HaltKindProxy::External, "external".into()),
+        HaltReason::Unknown => (HaltKindProxy::Unknown, "unknown".into()),
     };
-    HaltReasonProxy { reason, kind }
+    HaltReasonProxy { kind, detail }
 }
 
 pub fn architecture_to_py(a: Architecture) -> ArchitectureProxy {
@@ -250,5 +243,13 @@ pub fn channel_mode_to_py(m: probe_rs::rtt::ChannelMode) -> ChannelModeProxy {
         probe_rs::rtt::ChannelMode::NoBlockSkip => ChannelModeProxy::NoBlockSkip,
         probe_rs::rtt::ChannelMode::NoBlockTrim => ChannelModeProxy::NoBlockTrim,
         probe_rs::rtt::ChannelMode::BlockIfFull => ChannelModeProxy::BlockIfFull,
+    }
+}
+
+pub fn py_to_channel_mode(m: ChannelModeProxy) -> probe_rs::rtt::ChannelMode {
+    match m {
+        ChannelModeProxy::NoBlockSkip => probe_rs::rtt::ChannelMode::NoBlockSkip,
+        ChannelModeProxy::NoBlockTrim => probe_rs::rtt::ChannelMode::NoBlockTrim,
+        ChannelModeProxy::BlockIfFull => probe_rs::rtt::ChannelMode::BlockIfFull,
     }
 }

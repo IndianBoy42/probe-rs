@@ -9,7 +9,7 @@ use std::str::FromStr;
 use crate::types::WireProtocolProxy;
 
 /// A registry of available debug probes on the system.
-#[pyclass(unsendable)]
+#[pyclass(unsendable, name = "Lister")]
 pub struct ListerPy {
     lister: Lister,
 }
@@ -32,10 +32,24 @@ impl ListerPy {
             .collect()
     }
 
-    /// Open a probe by selector string ("VID:PID[:SN]").
-    pub fn open(&self, selector: &str) -> PyResult<ProbePy> {
-        let sel =
-            probe_rs::probe::DebugProbeSelector::from_str(selector).map_err(to_py_err)?;
+    /// Open a probe by selector string ("VID:PID[:SN]") or by a
+    /// DebugProbeSelector(vid, pid, serial) instance.
+    pub fn open(&self, selector: &Bound<'_, PyAny>) -> PyResult<ProbePy> {
+        let sel: probe_rs::probe::DebugProbeSelector =
+            if let Ok(s) = selector.extract::<String>() {
+                probe_rs::probe::DebugProbeSelector::from_str(&s).map_err(to_py_err)?
+            } else if let Ok(p) = selector.extract::<DebugProbeSelectorPy>() {
+                probe_rs::probe::DebugProbeSelector {
+                    vendor_id: p.vid,
+                    product_id: p.pid,
+                    interface: None,
+                    serial_number: p.serial,
+                }
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "selector must be a 'VID:PID[:SN]' string or a DebugProbeSelector",
+                ));
+            };
         self.lister
             .open(sel)
             .map(ProbePy::from)

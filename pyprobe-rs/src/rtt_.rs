@@ -16,10 +16,7 @@ pub fn attach(
     let _py = slf.py();
     let session_ref: Py<Session> = slf.clone().unbind();
     let mut sess = slf.borrow_mut();
-    let sess_ref = sess
-        .inner
-        .as_mut()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+    let sess_ref = &mut sess.inner;
     let mut core = sess_ref.core(core_index).map_err(to_py_err)?;
     let rtt = match ptr {
         Some(addr) => RsRtt::attach_at(&mut core, addr),
@@ -70,6 +67,10 @@ pub struct ChannelInfo {
     pub buffer_size: usize,
 }
 
+/// Handle to an attached RTT control block.
+///
+/// Channel names/sizes are a snapshot from attach time; if the target
+/// re-initializes RTT, attach again via `Session.attach_rtt()` to rescan.
 #[pyclass(unsendable)]
 pub struct Rtt {
     session: Py<Session>,
@@ -136,10 +137,7 @@ fn with_core_and_rtt<R>(
 
     let sess_bound = session_clone.bind(py);
     let mut sess = sess_bound.borrow_mut();
-    let sess_ref = sess
-        .inner
-        .as_mut()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+    let sess_ref = &mut sess.inner;
     let mut core = sess_ref.core(core_index).map_err(to_py_err)?;
     let mut rtt_ref = rtt_guard.rtt.borrow_mut();
     f(&mut rtt_ref, &mut core)
@@ -170,11 +168,6 @@ impl UpChannel {
     fn read_str(&self, py: Python<'_>, count: usize) -> PyResult<String> {
         let data = self.read(py, count)?;
         Ok(String::from_utf8_lossy(&data).into_owned())
-    }
-
-    #[pyo3(signature = (count=4096))]
-    fn poll(&self, py: Python<'_>, count: usize) -> PyResult<Vec<u8>> {
-        self.read(py, count)
     }
 
     fn number(&self) -> usize {
@@ -209,6 +202,17 @@ impl UpChannel {
             Ok(crate::types::channel_mode_to_py(mode))
         })
     }
+
+    /// Set the buffering mode for this channel.
+    fn set_mode(&self, py: Python<'_>, mode: ChannelModeProxy) -> PyResult<()> {
+        with_core_and_rtt(&self.rtt, py, |rtt, core| {
+            let chan = rtt
+                .up_channel(self.channel_number)
+                .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("channel not found"))?;
+            chan.set_mode(core, crate::types::py_to_channel_mode(mode))
+                .map_err(to_py_err)
+        })
+    }
 }
 
 #[pyclass(unsendable)]
@@ -228,9 +232,10 @@ impl DownChannel {
         })
     }
 
-    fn write_str(&self, py: Python<'_>, s: &str) -> PyResult<()> {
-        self.write(py, s.as_bytes())?;
-        Ok(())
+    /// Write a string to the channel. Returns the number of bytes accepted —
+    /// depending on the channel's mode, writes can be partial.
+    fn write_str(&self, py: Python<'_>, s: &str) -> PyResult<usize> {
+        self.write(py, s.as_bytes())
     }
 
     fn number(&self) -> usize {

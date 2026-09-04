@@ -63,18 +63,18 @@ fn _pyprobe_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Enums / value proxies ───────────────────────────────────────
     m.add_class::<WireProtocolProxy>()?;
-    m.add_class::<AttachMethodProxy>()?;
     m.add_class::<ArchitectureProxy>()?;
     m.add_class::<CoreTypeProxy>()?;
     m.add_class::<InstructionSetProxy>()?;
     m.add_class::<EndianProxy>()?;
     m.add_class::<ChannelModeProxy>()?;
     m.add_class::<VectorCatchConditionProxy>()?;
-
-    m.add_class::<HaltReasonProxy>()?;
-    m.add_class::<BreakpointCauseProxy>()?;
+    m.add_class::<CoreStateProxy>()?;
+    m.add_class::<HaltKindProxy>()?;
+    m.add_class::<TraceSinkProxy>()?;
     m.add_class::<CoreStatusProxy>()?;
-    m.add_class::<ProgressEvent>()?;
+    m.add_class::<HaltReasonProxy>()?;
+    m.add("ProbeRsError", m.py().get_type::<crate::error::ProbeRsError>())?;
 
     // ── Probe ────────────────────────────────────────────────────────
     m.add_class::<ListerPy>()?;
@@ -96,6 +96,7 @@ fn _pyprobe_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Flashing ─────────────────────────────────────────────────────
     m.add_class::<DownloadOptions>()?;
+    m.add_class::<ProgressEvent>()?;
     m.add_class::<FlashLoader>()?;
     m.add_function(wrap_pyfunction!(download_file, m)?)?;
     m.add_function(wrap_pyfunction!(build_loader, m)?)?;

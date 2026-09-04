@@ -34,10 +34,7 @@ impl CoreHandle {
         f: impl FnOnce(&mut Core<'_>) -> PyResult<R>,
     ) -> PyResult<R> {
         let mut sess = self.session.borrow_mut(py);
-        let sess_ref = sess
-            .inner
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let sess_ref = &mut sess.inner;
         let mut core = sess_ref.core(self.core_index).map_err(to_py_err)?;
         f(&mut core)
     }
@@ -403,16 +400,14 @@ impl CoreHandle {
     fn memory_regions(&self, py: Python<'_>) -> Vec<(String, u64, u64)> {
         let sess = self.session.borrow(py);
         let mut result = Vec::new();
-        if let Some(s) = sess.inner.as_ref() {
-            let target = s.target();
-            for region in &target.memory_map {
-                let (kind, start, end) = match region {
-                    MemoryRegion::Nvm(r) => ("nvm", r.range.start, r.range.end),
-                    MemoryRegion::Ram(r) => ("ram", r.range.start, r.range.end),
-                    MemoryRegion::Generic(r) => ("generic", r.range.start, r.range.end),
-                };
-                result.push((kind.to_string(), start, end));
-            }
+        let target = sess.inner.target();
+        for region in &target.memory_map {
+            let (kind, start, end) = match region {
+                MemoryRegion::Nvm(r) => ("nvm", r.range.start, r.range.end),
+                MemoryRegion::Ram(r) => ("ram", r.range.start, r.range.end),
+                MemoryRegion::Generic(r) => ("generic", r.range.start, r.range.end),
+            };
+            result.push((kind.to_string(), start, end));
         }
         result
     }
@@ -462,10 +457,7 @@ impl CoreHandle {
             return Ok(());
         }
         let mut sess = self.session.borrow_mut(py);
-        let sess_ref = sess
-            .inner
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let sess_ref = &mut sess.inner;
         let core = sess_ref.core(self.core_index).map_err(to_py_err)?;
         let mut map: HashMap<String, (RegisterId, u32)> = core
             .registers()

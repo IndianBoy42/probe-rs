@@ -32,10 +32,10 @@ def test_fake_probe_attach_and_core():
     assert core is not None
     core.halt(1000)
     status = core.status()
-    assert status.is_halted, f"Expected halted, got {status.status}"
+    assert status.is_halted, f"Expected halted, got {status.state}"
     core.run()
     status = core.status()
-    assert status.is_running, f"Expected running, got {status.status}"
+    assert status.is_running, f"Expected running, got {status.state}"
 
 
 def test_memory_round_trip():
@@ -52,7 +52,7 @@ def test_memory_round_trip():
 
 
 def test_registry():
-    reg = pr.RegistryPy.from_builtin_families()
+    reg = pr.Registry.from_builtin_families()
     families = reg.families()
     assert len(families) > 0
 
@@ -60,6 +60,48 @@ def test_registry():
 def test_get_target_by_name():
     t = pr.get_target_by_name("Cortex-M4")
     assert t.name == "Cortex-M4"
+
+
+def test_status_enum():
+    fp = pr.FakeProbe.with_mocked_core()
+    probe = pr.Probe.from_fake(fp)
+    sess = probe.attach("Cortex-M4", pr.Permissions())
+    core = sess.core(0)
+    core.halt(1000)
+    status = core.status()
+    assert status.state == pr.CoreState.Halted
+    assert not status.is_running
+
+
+def test_target_cores_typed():
+    t = pr.get_target_by_name("Cortex-M4")
+    assert t.cores[0][1] == pr.CoreType.Armv7em
+
+
+def test_error_taxonomy():
+    fp = pr.FakeProbe.with_mocked_core()
+    probe = pr.Probe.from_fake(fp)
+    sess = probe.attach("Cortex-M4", pr.Permissions())
+    with pytest.raises(pr.ProbeRsError) as excinfo:
+        sess.attach_rtt(0)
+    assert excinfo.value.kind == "Rtt", excinfo.value.kind
+
+
+def test_download_options_ram_chunk_size():
+    opts = pr.DownloadOptions()
+    assert opts.ram_chunk_size is None
+    opts.ram_chunk_size = 4096
+    assert opts.ram_chunk_size == 4096
+
+
+def test_setup_tracing_takes_trace_sink():
+    fp = pr.FakeProbe.with_mocked_core()
+    probe = pr.Probe.from_fake(fp)
+    sess = probe.attach("Cortex-M4", pr.Permissions())
+    # The mock DAP aborts on real trace setup, so only exercise the argument
+    # contract: magic strings are no longer accepted, the enum is required.
+    with pytest.raises(TypeError):
+        sess.setup_tracing(0, "swo")
 
 
 def test_register_lookup_and_width():
@@ -123,6 +165,16 @@ if __name__ == "__main__":
     print("✓ registry")
     test_get_target_by_name()
     print("✓ get_target_by_name")
+    test_status_enum()
+    print("✓ status enum")
+    test_target_cores_typed()
+    print("✓ target cores typed")
+    test_error_taxonomy()
+    print("✓ error taxonomy")
+    test_download_options_ram_chunk_size()
+    print("✓ download options ram_chunk_size")
+    test_setup_tracing_takes_trace_sink()
+    print("✓ setup_tracing TraceSink")
     test_register_lookup_and_width()
     print("✓ register lookup + width")
     test_bin_base_address_rejected_for_elf(tmp)

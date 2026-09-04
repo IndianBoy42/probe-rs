@@ -41,10 +41,7 @@ impl CoreDump {
                 Ok(start..end)
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let sess = session
-            .inner
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+        let sess = &mut session.inner;
         let mut core = sess.core(core_index).map_err(to_py_err)?;
         let dump = RsCoreDump::dump_core(&mut core, ranges).map_err(to_py_err)?;
         Ok(Self { inner: Some(dump) })

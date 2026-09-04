@@ -116,11 +116,11 @@ impl Target {
     }
 
     #[getter]
-    fn cores(&self) -> Vec<(String, String)> {
+    fn cores(&self) -> Vec<(String, CoreTypeProxy)> {
         self.inner
             .cores
             .iter()
-            .map(|c| (c.name.clone(), format!("{:?}", c.core_type)))
+            .map(|c| (c.name.clone(), core_type_to_py(c.core_type)))
             .collect()
     }
 
@@ -149,7 +149,7 @@ impl Target {
 }
 
 /// Target registry: lookup targets by name/family.
-#[pyclass]
+#[pyclass(name = "Registry")]
 pub struct RegistryPy {
     inner: RsRegistry,
 }
@@ -192,18 +192,18 @@ impl RegistryPy {
 
 #[pyclass(unsendable)]
 pub struct Session {
-    pub(crate) inner: Option<RsSession>,
+    pub(crate) inner: RsSession,
 }
 
 impl From<RsSession> for Session {
     fn from(s: RsSession) -> Self {
-        Self { inner: Some(s) }
+        Self { inner: s }
     }
 }
 
 impl Session {
-    pub(crate) fn get_mut(&mut self) -> Option<&mut RsSession> {
-        self.inner.as_mut()
+    pub(crate) fn get_mut(&mut self) -> &mut RsSession {
+        &mut self.inner
     }
 }
 
@@ -222,7 +222,7 @@ impl Session {
     /// Get a CoreHandle for the core at `core_index`.
     pub fn core(slf: &Bound<'_, Self>, core_index: usize) -> PyResult<crate::core_::CoreHandle> {
         let borrow = slf.borrow();
-        let cores = borrow.inner.as_ref().map(|s| s.list_cores()).unwrap_or_default();
+        let cores = borrow.inner.list_cores();
         if core_index >= cores.len() {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                 "core index {core_index} out of range (have {} cores)",
@@ -236,36 +236,27 @@ impl Session {
     /// List available cores as (index, CoreType) tuples.
     pub fn list_cores(&self) -> Vec<(usize, CoreTypeProxy)> {
         self.inner
-            .as_ref()
-            .map(|s| {
-                s.list_cores()
-                    .into_iter()
-                    .map(|(i, ct)| (i, core_type_to_py(ct)))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .list_cores()
+            .into_iter()
+            .map(|(i, ct)| (i, core_type_to_py(ct)))
+            .collect()
     }
 
     /// Get the target specification.
     pub fn target(&self) -> PyResult<Target> {
-        self.inner
-            .as_ref()
-            .map(|s| Target { inner: s.target().clone() })
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))
+        Ok(Target {
+            inner: self.inner.target().clone(),
+        })
     }
 
     /// Get the target architecture.
     pub fn architecture(&self) -> PyResult<ArchitectureProxy> {
-        self.inner
-            .as_ref()
-            .map(|s| architecture_to_py(s.architecture()))
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))
+        Ok(architecture_to_py(self.inner.architecture()))
     }
 
     /// Clear all hardware breakpoints across all cores.
     pub fn clear_all_hw_breakpoints(&mut self) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .clear_all_hw_breakpoints()
             .map_err(to_py_err)
     }
@@ -273,7 +264,6 @@ impl Session {
     /// Resume all cores.
     pub fn resume_all_cores(&mut self) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .resume_all_cores()
             .map_err(to_py_err)
     }
@@ -281,14 +271,12 @@ impl Session {
     /// Check if the debug sequence supports erase-all.
     pub fn has_sequence_erase_all(&mut self) -> PyResult<bool> {
         Ok(self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .has_sequence_erase_all())
     }
 
     /// Run the erase-all sequence.
     pub fn sequence_erase_all(&mut self) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .sequence_erase_all()
             .map_err(to_py_err)
     }
@@ -296,22 +284,16 @@ impl Session {
     // ── SWO / Trace ────────────────────────────────────────────────
 
     /// Set up tracing for a core.
-    #[pyo3(signature = (core_index, destination="swo"))]
-    pub fn setup_tracing(&mut self, core_index: usize, destination: &str) -> PyResult<()> {
+    #[pyo3(signature = (core_index, sink))]
+    pub fn setup_tracing(&mut self, core_index: usize, sink: TraceSinkProxy) -> PyResult<()> {
         use probe_rs::architecture::arm::component::TraceSink;
         use probe_rs::architecture::arm::swo::SwoConfig;
-        let sink = match destination.to_lowercase().as_str() {
-            "swo" => TraceSink::Swo(SwoConfig::new(0)),
-            "tpiu" | "parallel" => TraceSink::Tpiu(SwoConfig::new(0)),
-            "tracefunnel" | "tracememory" => TraceSink::TraceMemory,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown trace destination: {other}"
-                )))
-            }
+        let sink = match sink {
+            TraceSinkProxy::Swo => TraceSink::Swo(SwoConfig::new(0)),
+            TraceSinkProxy::Tpiu => TraceSink::Tpiu(SwoConfig::new(0)),
+            TraceSinkProxy::TraceMemory => TraceSink::TraceMemory,
         };
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .setup_tracing(core_index, sink)
             .map_err(to_py_err)
     }
@@ -319,7 +301,6 @@ impl Session {
     /// Disable SWV for a core.
     pub fn disable_swv(&mut self, core_index: usize) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .disable_swv(core_index)
             .map_err(to_py_err)
     }
@@ -327,7 +308,6 @@ impl Session {
     /// Add a SWV data trace unit.
     pub fn add_swv_data_trace(&mut self, unit: usize, addr: u64) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .add_swv_data_trace(unit, addr as u32)
             .map_err(to_py_err)
     }
@@ -335,7 +315,6 @@ impl Session {
     /// Remove a SWV data trace unit.
     pub fn remove_swv_data_trace(&mut self, unit: usize) -> PyResult<()> {
         self.get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?
             .remove_swv_data_trace(unit)
             .map_err(to_py_err)
     }
@@ -343,8 +322,7 @@ impl Session {
     /// Read available trace/SWO data.
     pub fn read_trace_data(&mut self) -> PyResult<Vec<u8>> {
         let sess = self
-            .get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+            .get_mut();
         let mut buf = Vec::new();
         let mut reader = sess.swo_reader().map_err(to_py_err)?;
         reader.read_to_end(&mut buf).map_err(to_py_err)?;
@@ -356,17 +334,16 @@ impl Session {
         self.read_trace_data()
     }
 
-    /// Erase all flash (vendor sequence or chip erase).
+    /// Erase all flash: the vendor erase-all sequence when the target provides
+    /// one, otherwise a full chip erase performed through the flash loader.
     pub fn erase_all(&mut self) -> PyResult<()> {
         let sess = self
-            .get_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Session consumed"))?;
+            .get_mut();
         if sess.has_sequence_erase_all() {
             sess.sequence_erase_all().map_err(to_py_err)
         } else {
-            Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "erase_all fallback not available for this target",
-            ))
+            let mut progress = probe_rs::flashing::FlashProgress::empty();
+            probe_rs::flashing::erase_all(sess, &mut progress, false).map_err(to_py_err)
         }
     }
 
@@ -383,9 +360,6 @@ impl Session {
     }
 
     fn __repr__(&self) -> String {
-        match &self.inner {
-            Some(s) => format!("Session(target={})", s.target().name),
-            None => "Session(consumed)".into(),
-        }
+        format!("Session(target={})", self.inner.target().name)
     }
 }
