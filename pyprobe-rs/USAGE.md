@@ -41,9 +41,10 @@ The `espressif` chip-support plugin is enabled by default
 Three rules explain every surprising behavior:
 
 1. **Consuming calls.** `Probe.attach()` / `Probe.attach_under_reset()` consume the
-   probe (Rust move semantics); using the probe afterwards raises `ValueError:
-   Probe consumed`. Same for `FakeProbe` once converted with `Probe.from_fake()` /
-   `FakeProbe.into_probe()`.
+   probe (Rust move semantics) — **including when the call fails**, so a retry
+   needs a freshly opened `Probe` (pattern in [Probes](#probes)). Using a consumed
+   probe raises `ValueError: Probe consumed`. Same for `FakeProbe` once converted
+   with `Probe.from_fake()` / `FakeProbe.into_probe()`.
 2. **Lending handles.** `sess.core(i)`, `sess.attach_rtt(...)`, `rtt.up_channel(n)`
    return handles that re-borrow the underlying session on every call. Handles keep
    the session alive; there is no lifetime juggling on the Python side.
@@ -53,6 +54,11 @@ Three rules explain every surprising behavior:
    heartbeats — until it finishes. Keep flashes out of hot loops or run them in a
    worker process/thread (the GIL is released for other threads only *between*
    probe operations, not during them).
+4. **Release by drop.** A `Session` owns the probe; there is no explicit close.
+   The probe is released when the `Session` is dropped — deterministic in CPython
+   on the last reference (`sess = None`, then `gc.collect()` if other references
+   may linger). `Probe.detach()` only applies to a `Probe` that has not been
+   attached.
 
 ## Probes
 
@@ -84,11 +90,25 @@ probe.target_reset_deassert()              # ... release it
 probe.detach()
 ```
 
+`get_name()` returns the debug-formatted descriptor of the underlying probe — a
+long USB dump on CMSIS-DAP probes. Use `ProbeInfo.identifier` for a short name.
+Probes without voltage sensing return `None` from `get_target_voltage()`.
+
 Attach (consuming):
 
 ```python
 sess = probe.attach("nrf52840_xxaa", pr.Permissions())
 sess = probe.attach_under_reset("nrf52840_xxaa", pr.Permissions().allow_erase_all())
+```
+
+`attach()` consumes `probe` even when it fails — re-open before retrying:
+
+```python
+try:
+    sess = probe.attach(chip, pr.Permissions())
+except pr.ProbeRsError:
+    probe = pr.list_probes()[0].open()   # the old `probe` is consumed
+    sess = probe.attach_under_reset(chip, pr.Permissions())
 ```
 
 ## Sessions and configuration
@@ -153,6 +173,11 @@ st.halt_reason        # HaltReason | None
     # .detail -> str (e.g. "hardware", "software", "semihosting: ...")
 ```
 
+Run/halt transitions on a freely running target can sporadically raise an
+ARM-specific error on some probes (seen with CMSIS-DAP V2). The reliable pattern
+is `halt()` → do the work → `run()`, polling `core_halted()` in a loop rather
+than relying on one blocking `wait_for_core_halted()` call.
+
 ## Memory access
 
 Rust API: `probe_rs::MemoryInterface`. Addresses are raw bus addresses.
@@ -166,13 +191,24 @@ core.read_word_64(0x2000_0000)         # -> int
 core.write_word_8(0x2000_0000, 0xFF)
 core.write_word_32(0x2000_0000, 0xDEADBEEF)
 
-core.read_32(0x2000_0000, 16)          # -> list[int], 16 u32 words
 core.read_8(0x2000_0000, 64)           # -> list[int]
+core.read_16(0x2000_0000, 32)          # -> list[int]
+core.read_32(0x2000_0000, 16)          # -> list[int]
+core.read_64(0x2000_0000, 8)           # -> list[int]
+
 core.write_8(0x2000_0000, bytes(64))   # accepts any bytes-like list[int]
+core.write_16(0x2000_0000, [0x1234, 0xF00D])
+core.write_32(0x2000_0000, [0xDEAD, 0xBEEF])
+core.write_64(0x2000_0000, [0x1122334455667788])
 
 data = core.read(0x2000_0000, 128)     # generic byte read -> bytes
 core.write(0x2000_0000, b"\x00" * 16)  # generic byte write
 ```
+
+Width matters for speed: byte and 16-bit transactions move a fraction of the data
+per probe round-trip. Dumping 128 KiB of RAM took 1.7 s with `read_32` vs 6.7 s
+with `read_8` (Cortex-M7, CMSIS-DAP V2). Prefer the widest width your alignment
+allows, and batch with the block methods instead of `read_word_*` loops.
 
 ## Core registers
 
@@ -263,13 +299,20 @@ Rust API: [`probe_rs::flashing`](https://docs.rs/probe-rs/latest/probe_rs/flashi
 `FlashProgress`.
 
 ```python
-opts = pr.DownloadOptions()        # defaults: verify=True, keep_unwritten_bytes=True
+opts = pr.DownloadOptions()        # defaults: verify=True, keep_unwritten_bytes=True;
+                                   # everything else False, ram_chunk_size=None
 opts.dry_run = True                # everything except the actual write
-opts.do_chip_erase = True
+opts.do_chip_erase = True          # erase the whole chip, not just used sectors
+opts.skip_erase = True             # no erase pass at all (pre-erased targets)
+opts.preverify = True              # verify contents before programming
+opts.disable_double_buffering = True
 opts.ram_chunk_size = 4096         # None = upstream default chunking
 
 pr.download_file(sess, "fw.elf", "elf", opts)
 ```
+
+Flashing leaves the core halted. Boot the new image afterwards with
+`sess.core(0).reset()` (system reset and run) or `core.run()`.
 
 Formats: `elf`, `hex` / `ihex` / `intelhex`, `bin` / `binary`, `uf2`.
 Raw `bin` images have no address information — position them explicitly:
@@ -346,6 +389,17 @@ Caveats:
 - `write`/`write_str` may write **partially** depending on the channel mode
   (`NoBlockSkip`/`NoBlockTrim` drop data when the target isn't reading) — check the
   returned count.
+- channel handles stay valid across core halt/run cycles (each call re-borrows
+  the session); re-attach only when the control block itself changes;
+- a target can host **several RTT control blocks** (bootloader + app, or a
+  transport library instantiating its own), and scan mode returns the first match
+  in RAM — not necessarily the block your console uses. The magic also survives
+  warm resets (SEGGER's init-once idiom), so a stale block still looks live.
+  Wrong-block symptoms: down-channel writes get no reaction and up-channel data
+  never advances while the target is clearly logging elsewhere. Fingerprint the
+  live console by its channel names — an abandoned block decays into garbage
+  names (fragments of unrelated strings) instead of e.g. `"Terminal"` — or attach
+  explicitly with `sess.attach_rtt(0, ptr)`.
 
 ## SWO / SWV tracing
 
@@ -454,7 +508,7 @@ the fake aborts the process (mock DAP limitation) — don't call it here.
 | `sess.core(i)` | `Session::core(i)` |
 | `core.halt/run/reset/step` | `Core::halt/run/reset/step` |
 | `core.read_word_32(...)` etc. | `MemoryInterface::read_word_32` etc. |
-| `core.read_32 / write_8 / read / write` | `MemoryInterface` block methods |
+| `core.read_8/16/32/64`, `core.write_8/16/32/64`, `core.read`, `core.write` | `MemoryInterface` block methods |
 | `core.read_core_reg / write_core_reg` | `CoreInterface::read_core_reg / write_core_reg` |
 | `core.read_pc()` | `CoreInterface::program_counter()` + `read_core_reg` |
 | `core.set_hw_breakpoint()` | `CoreInterface::set_hw_breakpoint` |
