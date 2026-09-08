@@ -523,6 +523,14 @@ impl CoreHandle {
         py.detach(|| rpc_call(deadline, op, f(core_if))).map_err(to_bridge_err)
     }
 
+    /// Re-apply this core's tracked hardware breakpoints (after ops that
+    /// clear the FP comparators server-side: reset, reset_and_halt, flash).
+    fn reapply_tracked_breakpoints(&self, py: Python<'_>) -> PyResult<()> {
+        let conn = self.conn.clone();
+        let core = self.core;
+        py.detach(|| reapply_breakpoints(&conn, core)).map_err(to_bridge_err)
+    }
+
     /// Same as [`Self::rpc`] for calls that address the session rather than
     /// a single core (target metadata, stepping, disassembly).
     fn rpc_session<T, F>(
@@ -681,13 +689,34 @@ impl CoreHandle {
     }
 
     fn reset(&self, py: Python<'_>) -> PyResult<()> {
-        self.rpc(py, "reset core", |c| async move { c.reset().await })
+        self.rpc(py, "reset core", |c| async move { c.reset().await })?;
+        // armv7m `reset()` issues SYSRESETREQ without clearing DHCSR.C_HALT,
+        // which lives in the debug domain and survives the system reset — so a
+        // core halted before the reset (e.g. by `step()`) boots halted again.
+        // The API contract is "reset, then execute": resume when the core
+        // reports halted or sleeping (running is the common case; this costs
+        // one extra status round-trip).
+        self.rpc(py, "resume after reset", |c| async move {
+            // The server caches `Unknown` right after a reset, so anything
+            // that is not demonstrably Running gets an explicit resume;
+            // running an (unhalted) sleeping core is harmless, and this
+            // covers the cached-status case without a second round-trip.
+            match c.status().await? {
+                WireCoreStatus::Running => Ok(()),
+                _ => c.run().await,
+            }
+        })?;
+        self.reapply_tracked_breakpoints(py)
     }
     fn reset_and_halt(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<u64> {
         let deadline = Duration::from_millis(timeout_ms) + BRIDGE_SLACK;
         let info = self.rpc_with_deadline(py, deadline, "reset and halt core", |c| async move {
             c.reset_and_halt(Duration::from_millis(timeout_ms)).await
         })?;
+        // A system reset clears the FP comparators; the tracked set is the
+        // debugger's intent and must survive run-control like it survives
+        // flashing.
+        self.reapply_tracked_breakpoints(py)?;
         Ok(info.pc)
     }
 

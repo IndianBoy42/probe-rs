@@ -202,6 +202,63 @@ pub struct Session {
     pub(crate) meta: WireSessionTargetMetadata,
 }
 
+/// One attach attempt, plus the stale-session heal retry.
+///
+/// The `AttachGuard` is scoped to the attempt: while it is held, the
+/// idle-server heal is suppressed because a granted-but-unregistered lease
+/// looks exactly like a stale session. A `ProbeBusy` outcome means the
+/// attempt was REFUSED and holds no lease, so the guard is dropped before
+/// the heal decision runs and `own_server_idle()` can actually fire — the
+/// restart also picks up a rebuilt server binary after a code change.
+#[allow(clippy::too_many_arguments)]
+fn attach_with_heal(
+    py: Python<'_>,
+    target: &str,
+    cfg: &SessionConfig,
+    selector: Option<WireProbeSelector>,
+    allow_erase: bool,
+    dry_run: bool,
+    wait: Option<Duration>,
+    connect_under_reset: bool,
+    deadline: Duration,
+) -> Result<Connection, BridgeError> {
+    let mut outcome = {
+        let _inflight = open_state::AttachGuard::new();
+        attach_with(
+            py,
+            target,
+            cfg,
+            selector.clone(),
+            allow_erase,
+            dry_run,
+            wait,
+            connect_under_reset,
+            deadline,
+        )
+    };
+    // Stale-session healing: on a server pyprobe-rs spawned with no live
+    // connections, a lingering previous-kernel session is the only
+    // plausible ProbeBusy cause; restart the server once and retry.
+    if matches!(&outcome, Err(BridgeError::ProbeBusy(_))) && open_state::own_server_idle() {
+        eprintln!(
+            "pyprobe-rs: probe busy on our own idle server; restarting it to clear a stale session"
+        );
+        py.detach(open_state::heal_restart)?;
+        outcome = attach_with(
+            py,
+            target,
+            cfg,
+            selector,
+            allow_erase,
+            dry_run,
+            wait,
+            connect_under_reset,
+            deadline,
+        );
+    }
+    outcome
+}
+
 impl Session {
     /// Connection accessor; fails fast after `close()` or `close_all()`.
     pub(crate) fn conn(&self) -> PyResult<Arc<Connection>> {
@@ -240,20 +297,19 @@ impl Session {
             };
             let wait = wait_for_probe.map(Duration::from_secs_f64);
             let deadline = wait.unwrap_or_default() + ATTACH_MARGIN;
-            let conn = Arc::new(
-                attach_with(
-                    py,
-                    target,
-                    &cfg,
-                    selector,
-                    allow_erase_all,
-                    dry_run,
-                    wait,
-                    connect_under_reset,
-                    deadline,
-                )
-                .map_err(to_bridge_err)?,
-            );
+            let conn = attach_with_heal(
+                py,
+                target,
+                &cfg,
+                selector,
+                allow_erase_all,
+                dry_run,
+                wait,
+                connect_under_reset,
+                deadline,
+            )
+            .map_err(to_bridge_err)?;
+            let conn = Arc::new(conn);
             let meta = py
                 .detach(|| {
                     rpc_call(
@@ -303,9 +359,7 @@ impl Session {
         let allow_erase = cfg.allow_erase_all();
         let wait = wait_for_probe.map(Duration::from_secs_f64);
         let deadline = wait.unwrap_or_default() + ATTACH_MARGIN;
-        // Disable the automatic heal while this attach holds its lease.
-        let _inflight = open_state::AttachGuard::new();
-        let mut outcome = attach_with(
+        let conn = attach_with_heal(
             py,
             target,
             &cfg,
@@ -315,28 +369,9 @@ impl Session {
             wait,
             connect_under_reset,
             deadline,
-        );
-        // Stale-session healing: on a server pyprobe-rs spawned with no live
-        // connections, a lingering previous-kernel session is the only
-        // plausible ProbeBusy cause; restart the server once and retry.
-        if matches!(&outcome, Err(BridgeError::ProbeBusy(_))) && open_state::own_server_idle() {
-            eprintln!(
-                "pyprobe-rs: probe busy on our own idle server; restarting it to clear a stale session"
-            );
-            py.detach(open_state::heal_restart).map_err(to_bridge_err)?;
-            outcome = attach_with(
-                py,
-                target,
-                &cfg,
-                None,
-                allow_erase,
-                dry_run,
-                wait,
-                connect_under_reset,
-                deadline,
-            );
-        }
-        let conn = Arc::new(outcome.map_err(to_bridge_err)?);
+        )
+        .map_err(to_bridge_err)?;
+        let conn = Arc::new(conn);
         let meta = py.detach(|| {
             rpc_call(
                 DEFAULT_TIMEOUT,
@@ -592,6 +627,7 @@ impl Session {
                         ("value", jv(py, v.value)?),
                         ("type", jv(py, v.type_)?),
                         ("variables_reference", jv(py, v.variables_reference)?),
+                        ("memory_reference", jv(py, v.memory_reference)?),
                     ],
                 )
             })

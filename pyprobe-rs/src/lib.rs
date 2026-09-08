@@ -85,10 +85,11 @@ fn open(py: Python<'_>, host: Option<String>, token: Option<String>) -> PyResult
     }
 }
 
-/// Stop the server pyprobe-rs spawned; refused for servers it did not spawn.
-#[pyfunction]
-fn shutdown_server() -> PyResult<()> {
-    open_state::shutdown_server().map_err(error::to_bridge_err)
+/// Stop the local server. `force=True` also stops an adopted server after
+/// verifying the pidfile points at a live `probe-rs serve` process.
+#[pyfunction(signature = (force=false))]
+fn shutdown_server(force: bool) -> PyResult<()> {
+    open_state::shutdown_server(force).map_err(error::to_bridge_err)
 }
 
 /// Ring buffer of the spawned server's stdout/stderr.

@@ -121,22 +121,35 @@ pub(crate) fn server_active() -> bool {
     state().lock().manager.socket_connectable()
 }
 
-/// Kill the spawned server. Refused for foreign servers and in remote mode.
-pub(crate) fn shutdown_server() -> Result<(), BridgeError> {
+/// Kill the local server. Refused for servers pyprobe-rs did not spawn
+/// unless `force` is set (then only after verifying the pidfile points at a
+/// live `probe-rs serve` process). Always refused in remote mode.
+pub(crate) fn shutdown_server(force: bool) -> Result<(), BridgeError> {
     let mut s = state().lock();
     if s.host.is_some() {
         return Err(BridgeError::Connection(
             "pyprobe-rs is in remote mode; there is no local server to shut down".into(),
         ));
     }
-    if !s.manager.spawned_by_us() {
-        return Err(BridgeError::Connection(
-            "refusing to shut down a server pyprobe-rs did not spawn; stop that process yourself"
-                .into(),
-        ));
+    if s.manager.spawned_by_us() {
+        s.manager.kill();
+        return Ok(());
     }
-    s.manager.kill();
-    Ok(())
+    if force {
+        // Adopted-server recovery: a stranded spawned endpoint (design §11.3)
+        // keeps the probe lease after its client died; the only fix is
+        // killing that server. The pidfile gate in the manager keeps this
+        // from touching anything but a `probe-rs serve` process.
+        s.manager
+            .kill_by_pidfile()
+            .map_err(BridgeError::Connection)
+    } else {
+        Err(BridgeError::Connection(
+            "refusing to shut down a server pyprobe-rs did not spawn; \
+             call shutdown_server(force=True) to restart it anyway"
+                .into(),
+        ))
+    }
 }
 
 /// Ring-buffer snapshot of the spawned server's stdout/stderr.

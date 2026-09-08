@@ -152,8 +152,9 @@ impl Connection {
                 "the probe is claimed by another session on this server; close \
                  that session first (pyprobe_rs.close_all() closes every session \
                  this process holds; a stale session on a server pyprobe-rs \
-                 spawned is restarted automatically on the next attach)"
-                    .into(),
+                 spawned is restarted automatically on the next attach; if the \
+                 server was adopted, pr.shutdown_server(force=True) restarts it)"
+                    .to_string(),
             )),
             AttachResult::ProbeNotFound => Err(BridgeError::Attach(
                 "no debug probe found; connect one and check pyprobe_rs.list_probes()".into(),

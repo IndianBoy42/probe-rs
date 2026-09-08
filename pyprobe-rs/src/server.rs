@@ -242,6 +242,47 @@ impl ServerManager {
         let _ = std::fs::remove_file(self.pidfile_path());
     }
 
+    /// Force-kill an ADOPTED server recorded in our pidfile. Safety gate: the
+    /// pid must be a live `probe-rs serve` process before any signal is sent,
+    /// so a stale or forged pidfile can never kill an unrelated process.
+    /// Returns an error when there is no pidfile (a server not spawned by any
+    /// pyprobe-rs manager) or the pid is not a probe-rs serve process.
+    pub(crate) fn kill_by_pidfile(&mut self) -> Result<(), String> {
+        let text = std::fs::read_to_string(self.pidfile_path())
+            .map_err(|_| "no server pidfile: this server was not spawned by pyprobe-rs".to_string())?;
+        let pid: u32 = text
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .ok_or_else(|| "server pidfile is malformed".to_string())?;
+        let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .map_err(|_| format!("pid {pid} from the server pidfile no longer exists"))?;
+        let argv: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
+        let is_serve = argv.iter().any(|a| a.ends_with("probe-rs"))
+            && argv.contains(&"serve");
+        if !is_serve {
+            return Err(format!(
+                "pid {pid} from the server pidfile is not a `probe-rs serve` process; \
+                 refusing to kill it"
+            ));
+        }
+        Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("failed to signal pid {pid}: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.spawned_by_us = false;
+        let _ = std::fs::remove_file(self.pidfile_path());
+        let _ = std::fs::remove_file(self.socket_path());
+        Ok(())
+    }
+
     fn log_path(&self) -> PathBuf {
         self.dir.join("serve.log")
     }
