@@ -19,6 +19,7 @@ use probe_rs_rpc::{FlashLoader as FlashLoaderKey, Key};
 use pyo3::prelude::*;
 
 use crate::error::{BridgeError, to_bridge_err};
+use crate::events::Pump;
 use crate::rpc::{Connection, DEFAULT_TIMEOUT, rpc_call};
 use crate::session::Session;
 
@@ -141,22 +142,43 @@ fn event_to_py(e: &WireProgressEvent) -> ProgressEvent {
     }
 }
 
-/// Progress sink for one streamed RPC call. Events arrive while the GIL is
-/// released; `Python::attach` re-acquires it per event. Callback exceptions
-/// are printed to stderr, never propagated: the RPC stream has no error
-/// channel, and a misbehaving callback must not kill a flash.
-fn progress_sink(progress: &Option<Py<PyAny>>) -> impl AsyncFnMut(WireProgressEvent) + '_ {
+/// Spawn the progress pump for one flash call, if a callback was given.
+///
+/// Events are delivered from a dedicated pump thread: the callback runs
+/// outside the flash future's poll context, so it may call back into
+/// pyprobe_rs (halt, memory reads, RTT writes) without nesting `block_on`
+/// inside the entered runtime and panicking.
+fn progress_pump(progress: Option<Py<PyAny>>) -> Option<Pump<WireProgressEvent>> {
+    progress.map(|callback| {
+        Pump::spawn(move |event: WireProgressEvent| deliver_progress(&callback, event))
+    })
+}
+
+/// Forwarder handed to the streamed RPC calls: non-blocking enqueue.
+fn progress_forward(
+    pump: Option<&Pump<WireProgressEvent>>,
+) -> impl AsyncFnMut(WireProgressEvent) + '_ {
     async move |event: WireProgressEvent| {
-        let Some(callback) = progress.as_ref() else {
-            return;
-        };
+        if let Some(pump) = pump {
+            pump.send(event);
+        }
+    }
+}
+
+/// Convert and deliver one progress event to the Python callback.
+/// Exceptions are printed to stderr, never propagated: the RPC stream has
+/// no error channel, and a misbehaving callback must not kill a flash.
+fn deliver_progress(callback: &Py<PyAny>, event: WireProgressEvent) {
+    // Python::attach panics during interpreter finalization (pyo3, Py 3.13+);
+    // the pump thread must never take the process down at shutdown.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         Python::attach(|py| {
             let event = event_to_py(&event);
             if let Err(err) = callback.call1(py, (event,)) {
                 err.print(py);
             }
         });
-    }
+    }));
 }
 
 /// Map the Python `format` string and bin positioning onto the wire
@@ -184,11 +206,20 @@ fn wire_format_options(
 }
 
 /// Map the Python options onto the wire struct. `dry_run` has no
-/// per-download wire form — the server derives it from the attached session —
-/// and `preverify` is implemented client-side via `SessionInterface::verify`
-/// (skip the write when the image already matches flash).
-fn wire_download_options(opts: &DownloadOptions) -> WireDownloadOptions {
-    WireDownloadOptions {
+/// per-download wire form — the server derives it from the attached
+/// session — so a user-set `dry_run` is rejected loudly rather than
+/// silently ignored on a destructive operation. `preverify` is implemented
+/// client-side via `SessionInterface::verify` (skip the write when the
+/// image already matches flash).
+fn wire_download_options(opts: &DownloadOptions) -> PyResult<WireDownloadOptions> {
+    if opts.dry_run {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "DownloadOptions.dry_run is no longer a per-download switch; \
+             attach a hardwareless session with \
+             Session.auto_attach(..., dry_run=True) instead",
+        ));
+    }
+    Ok(WireDownloadOptions {
         keep_unwritten_bytes: opts.keep_unwritten_bytes,
         do_chip_erase: opts.do_chip_erase,
         skip_erase: opts.skip_erase,
@@ -196,7 +227,7 @@ fn wire_download_options(opts: &DownloadOptions) -> WireDownloadOptions {
         disable_double_buffering: opts.disable_double_buffering,
         preferred_algos: Vec::new(),
         ram_chunk_size: opts.ram_chunk_size,
-    }
+    })
 }
 
 /// Flash `path` over `conn`: resolve → build → (pre-verify) → program → boot.
@@ -211,19 +242,20 @@ fn flash_image(
     wire: WireDownloadOptions,
     preverify: bool,
     run: bool,
-    progress: &Option<Py<PyAny>>,
+    progress: Option<Py<PyAny>>,
 ) -> Result<(), BridgeError> {
     // Localhost resolves the path in place (zero copy); a remote server gets
     // the image via its temp-file upload path.
     let upload = rpc_call(
         BUILD_TIMEOUT,
         "resolve upload",
-        conn.session().resolve_upload(Path::new(path)),
+        conn.session()?.resolve_upload(Path::new(path)),
     )?;
+    let pump = progress_pump(progress);
     let built = rpc_call(
         BUILD_TIMEOUT,
         "build flash loader",
-        conn.session()
+        conn.session()?
             .build_flash_loader_resolved(&upload, format, None, false, None),
     )?;
 
@@ -233,8 +265,8 @@ fn flash_image(
             rpc_call(
                 FLASH_TIMEOUT,
                 "pre-verify flash",
-                conn.session()
-                    .verify(built.loader, progress_sink(progress)),
+                conn.session()?
+                    .verify(built.loader, progress_forward(pump.as_ref())),
             )?,
             VerifyResult::Mismatch
         );
@@ -243,35 +275,39 @@ fn flash_image(
         rpc_call(
             FLASH_TIMEOUT,
             "flash",
-            conn.session()
-                .flash(wire, built.loader, progress_sink(progress)),
+            conn.session()?
+                .flash(wire, built.loader, progress_forward(pump.as_ref())),
         )?;
     }
-
-    rpc_call(
-        DEFAULT_TIMEOUT,
-        "boot",
-        async {
-            if run {
-                conn.session().boot(built.boot_info, 0).await
-            } else {
-                conn.session().prepare_boot(built.boot_info, 0).await
-            }
-        },
-    )?;
+    // A dry-run session's boot sequence times out on the mocked core; the
+    // dry run ends with the cores halted.
+    if conn.dry_run {
+        return Ok(());
+    }
+    // The two boot futures are distinct opaque types, so each branch runs
+    // its own bridge call instead of unifying into one.
+    let session = conn.session()?;
+    if run {
+        rpc_call(DEFAULT_TIMEOUT, "boot", session.boot(built.boot_info, 0))?;
+    } else {
+        rpc_call(DEFAULT_TIMEOUT, "boot", session.prepare_boot(built.boot_info, 0))?;
+    }
     Ok(())
 }
 
 /// Re-apply tracked hardware breakpoints on every core that has them. A
 /// failure is logged, not raised: the flash itself succeeded, and the next
-/// successful iteration restores the breakpoints.
-fn reapply_breakpoints(conn: &Arc<Connection>) {
+/// successful iteration restores the breakpoints. The GIL is released for
+/// the round-trips like every other blocking bridge call.
+fn reapply_breakpoints(py: Python<'_>, conn: &Arc<Connection>) {
     let cores: Vec<u32> = conn.breakpoints.lock().keys().copied().collect();
-    for core in cores {
-        if let Err(err) = crate::core_::reapply_breakpoints(conn, core) {
-            eprintln!("pyprobe-rs: failed to re-apply breakpoints on core {core}: {err}");
+    py.detach(|| {
+        for core in cores {
+            if let Err(err) = crate::core_::reapply_breakpoints(conn, core) {
+                eprintln!("pyprobe-rs: failed to re-apply breakpoints on core {core}: {err}");
+            }
         }
-    }
+    });
 }
 
 /// Download a firmware file to the target's flash and run it.
@@ -279,8 +315,8 @@ fn reapply_breakpoints(conn: &Arc<Connection>) {
 /// `base_address`/`skip` position a raw `bin` image and are rejected for
 /// other formats. `options.preverify` skips programming entirely when the
 /// server reports the image already matches flash. `progress`, when given,
-/// receives ProgressEvent objects; it must not touch the session and its
-/// exceptions are printed to stderr.
+/// receives ProgressEvent objects on a dedicated callback thread (it may
+/// call session/core/RTT APIs) and its exceptions are printed to stderr.
 ///
 /// The GIL is released for the RPC traffic, so interactive Python loops stay
 /// responsive while the flash runs.
@@ -302,10 +338,11 @@ pub fn download_file(
     let conn = session.conn()?;
     let format_opts = wire_format_options(format, base_address, skip)?;
     let opts = options.unwrap_or_default();
-    let wire = wire_download_options(&opts);
-    py.detach(|| flash_image(&conn, path, format_opts, wire, opts.preverify, true, &progress))
+    let wire = wire_download_options(&opts)?;
+    let conn2 = Arc::clone(&conn);
+    py.detach(move || flash_image(&conn2, path, format_opts, wire, opts.preverify, true, progress))
     .map_err(to_bridge_err)?;
-    reapply_breakpoints(&conn);
+    reapply_breakpoints(py, &conn);
     Ok(())
 }
 
@@ -339,9 +376,10 @@ pub(crate) fn flash_and_run(
         binary_format: FormatKind::Target,
         ..FormatOptions::default()
     };
-    py.detach(|| flash_image(&conn, path, format, wire, verify, run, &progress))
+    let conn2 = Arc::clone(&conn);
+    py.detach(move || flash_image(&conn2, path, format, wire, verify, run, progress))
         .map_err(to_bridge_err)?;
-    reapply_breakpoints(&conn);
+    reapply_breakpoints(py, &conn);
     Ok(())
 }
 
@@ -382,17 +420,18 @@ impl FlashLoader {
     ) -> PyResult<()> {
         let conn = session.conn()?;
         let opts = options.unwrap_or_default();
-        let wire = wire_download_options(&opts);
+        let wire = wire_download_options(&opts)?;
         let key = self.key;
         let boot_info = self.boot_info.clone();
         let segments = std::mem::take(&mut self.segments);
+        let pump = progress_pump(progress);
         py.detach(|| {
             // Stage the add_data patches before the image goes down.
             for (addr, data) in &segments {
                 rpc_call(
                     FLASH_TIMEOUT,
                     "stage flash data",
-                    conn.session().load_region(key, *addr, data.clone()),
+                    conn.session()?.load_region(key, *addr, data.clone()),
                 )?;
             }
             let mut program = true;
@@ -401,9 +440,9 @@ impl FlashLoader {
                     rpc_call(
                         FLASH_TIMEOUT,
                         "pre-verify flash",
-                        conn.session()
-                            .verify(key, progress_sink(&progress)),
-                    )?,
+                    conn.session()?
+                        .verify(key, progress_forward(pump.as_ref())),
+                )?,
                     VerifyResult::Mismatch
                 );
             }
@@ -411,15 +450,18 @@ impl FlashLoader {
                 rpc_call(
                     FLASH_TIMEOUT,
                     "flash",
-                    conn.session()
-                        .flash(wire, key, progress_sink(&progress)),
+                    conn.session()?
+                        .flash(wire, key, progress_forward(pump.as_ref())),
                 )?;
             }
-            rpc_call(DEFAULT_TIMEOUT, "boot", conn.session().boot(boot_info, 0))?;
+            // A dry-run session's boot sequence times out on the mocked core.
+            if !conn.dry_run {
+                rpc_call(DEFAULT_TIMEOUT, "boot", conn.session()?.boot(boot_info, 0))?;
+            }
             Ok(())
         })
         .map_err(to_bridge_err)?;
-        reapply_breakpoints(&conn);
+        reapply_breakpoints(py, &conn);
         Ok(())
     }
 }
@@ -447,12 +489,12 @@ pub fn build_loader(
             let upload = rpc_call(
                 BUILD_TIMEOUT,
                 "resolve upload",
-                conn.session().resolve_upload(Path::new(path)),
+                conn.session()?.resolve_upload(Path::new(path)),
             )?;
             rpc_call(
                 BUILD_TIMEOUT,
                 "build flash loader",
-                conn.session()
+                conn.session()?
                     .build_flash_loader_resolved(&upload, format_opts, None, false, None),
             )
         })

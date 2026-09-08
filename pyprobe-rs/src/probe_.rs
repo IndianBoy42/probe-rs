@@ -55,6 +55,8 @@ impl ListerPy {
             inner: Some(probe),
             selector: Some(sel),
             dry_run: false,
+            speed_khz: None,
+            protocol: None,
         })
     }
 }
@@ -161,6 +163,8 @@ impl ProbeInfo {
                 interface: None,
             }),
             dry_run: false,
+            speed_khz: None,
+            protocol: None,
         })
     }
 
@@ -186,6 +190,10 @@ pub struct ProbePy {
     /// dry-run session (mocked core, no probe lease) so hardware-less
     /// tests keep working through the RPC facade.
     pub(crate) dry_run: bool,
+    /// Locally applied probe settings; forwarded into the attach request
+    /// because the server owns the real probe handle after attach.
+    pub(crate) speed_khz: Option<u32>,
+    pub(crate) protocol: Option<WireProtocolProxy>,
 }
 
 impl From<Probe> for ProbePy {
@@ -194,6 +202,8 @@ impl From<Probe> for ProbePy {
             inner: Some(p),
             selector: None,
             dry_run: false,
+            speed_khz: None,
+            protocol: None,
         }
     }
 }
@@ -224,7 +234,9 @@ impl ProbePy {
             .inner
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
-        probe.set_speed(khz).map_err(to_py_err)
+        probe.set_speed(khz).map_err(to_py_err)?;
+        self.speed_khz = Some(khz);
+        Ok(khz)
     }
 
     pub fn select_protocol(&mut self, protocol: WireProtocolProxy) -> PyResult<()> {
@@ -236,7 +248,9 @@ impl ProbePy {
             .inner
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
-        probe.select_protocol(wp).map_err(to_py_err)
+        probe.select_protocol(wp).map_err(to_py_err)?;
+        self.protocol = Some(protocol);
+        Ok(())
     }
 
     pub fn protocol(&self) -> PyResult<Option<WireProtocolProxy>> {
@@ -341,6 +355,8 @@ impl ProbePy {
             inner: Some(inner.into_probe()),
             selector: None,
             dry_run: true,
+            speed_khz: None,
+            protocol: None,
         })
     }
 
@@ -374,6 +390,8 @@ impl ProbePy {
         crate::session::Session::attach_selected(
             target,
             selector,
+            self.speed_khz,
+            self.protocol,
             allow_erase,
             self.dry_run,
             connect_under_reset,
@@ -417,6 +435,8 @@ impl FakeProbePy {
             inner: Some(fp.into_probe()),
             selector: None,
             dry_run: true,
+            speed_khz: None,
+            protocol: None,
         })
     }
 }

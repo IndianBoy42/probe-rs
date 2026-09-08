@@ -485,9 +485,9 @@ impl CoreHandle {
         }
     }
 
-    /// CoreInterface for this handle's core.
-    fn core_if(&self) -> CoreInterface {
-        self.conn.session().core(self.core as usize)
+    /// CoreInterface for this handle's core. Fails once the session is closed.
+    fn core_if(&self) -> Result<CoreInterface, BridgeError> {
+        Ok(self.conn.session()?.core(self.core as usize))
     }
 
     /// Run `f` over this core's `CoreInterface` on the bridge runtime with
@@ -519,7 +519,7 @@ impl CoreHandle {
         F: Future<Output = Result<T, ClientError>>,
         T: Send,
     {
-        let core_if = self.core_if();
+        let core_if = self.core_if().map_err(to_bridge_err)?;
         py.detach(|| rpc_call(deadline, op, f(core_if))).map_err(to_bridge_err)
     }
 
@@ -535,7 +535,7 @@ impl CoreHandle {
         F: Future<Output = Result<T, ClientError>>,
         T: Send,
     {
-        let session = self.conn.session().clone();
+        let session = self.conn.session().map_err(to_bridge_err)?.clone();
         py.detach(|| rpc_call(DEFAULT_TIMEOUT, op, f(session))).map_err(to_bridge_err)
     }
 
@@ -647,7 +647,7 @@ pub(crate) fn reapply_breakpoints(conn: &Arc<Connection>, core: u32) -> Result<(
     if addresses.is_empty() {
         return Ok(());
     }
-    let session = conn.session().clone();
+    let session = conn.session()?.clone();
     let results = Bridge::global()?.wait(
         DEFAULT_TIMEOUT,
         "reapply breakpoints",
@@ -723,12 +723,13 @@ impl CoreHandle {
         let core = self.core;
         py.detach(move || {
             let bridge = Bridge::global()?;
+            let session = conn.session()?.clone();
             bridge
                 .wait(
                     deadline,
                     "wait for core halted",
                     async move {
-                        let core_if = conn.session().core(core as usize);
+                        let core_if = session.core(core as usize);
                         loop {
                             match core_if.status().await {
                                 Ok(WireCoreStatus::Halted(_)) => return Ok(()),

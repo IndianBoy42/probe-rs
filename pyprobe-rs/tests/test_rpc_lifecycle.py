@@ -7,6 +7,7 @@ PYPROBE_RS_BIN or the workspace target dir — no probe hardware required).
 """
 
 import asyncio
+import gc
 
 import pytest
 
@@ -97,17 +98,38 @@ def test_close_makes_calls_fail_fast(server):
     assert excinfo.value.kind == "Connection"
 
 
-def test_close_all_marks_sessions_closed(server):
+def test_close_all_severs_handles_immediately(server):
+    """close_all() must release the probe lease even while CoreHandle
+    objects are still referenced: post-close handle calls fail fast with
+    kind Connection instead of issuing real RPCs."""
     s1 = _dry_session()
     s2 = _dry_session()
+    core = s1.core(0)
     try:
         pr.close_all()
         for s in (s1, s2):
             with pytest.raises(pr.ProbeRsError) as excinfo:
                 s.core(0)
             assert excinfo.value.kind == "Connection"
+        with pytest.raises(pr.ProbeRsError) as excinfo:
+            core.status()
+        assert excinfo.value.kind == "Connection"
+        assert pr.sessions() == []
     finally:
         pr.close_all()
+
+
+def test_drop_without_close_releases_session(server):
+    """The stale-cell scenario: a session dropped without close() releases
+    its server-side session on disconnect, so a fresh attach converges."""
+    s1 = _dry_session()
+    del s1
+    gc.collect()
+    s2 = _dry_session()
+    try:
+        assert len(s2.list_cores()) >= 1
+    finally:
+        s2.close()
 
 
 def test_unsupported_width_panic_is_server_gone(server):
@@ -174,6 +196,53 @@ def test_aio_namespace_runs_in_executor(server):
 
     a, b = asyncio.run(flow())
     assert isinstance(a, int) and isinstance(b, int)
+
+
+def test_dry_run_download_option_is_rejected(server, tmp_path):
+    """dry_run moved to the attach request; setting it per-download must be
+    loud, not silently ignored on a destructive operation."""
+    sess = _dry_session()
+    try:
+        img = tmp_path / "blink.bin"
+        img.write_bytes(bytes([0x01]))
+        opts = pr.DownloadOptions()
+        opts.dry_run = True
+        with pytest.raises(ValueError, match="dry_run"):
+            pr.download_file(sess, str(img), "bin", options=opts, base_address=0x08000000)
+    finally:
+        sess.close()
+
+
+def test_flash_pipeline_dry_run(server, tmp_path):
+    """Full flash pipeline on a dry-run session: upload, loader build,
+    program (dry), boot. Progress events are delivered on the pump thread,
+    so the callback may call back into pyprobe_rs (the reentrancy that used
+    to panic)."""
+    sess = pr.Session.auto_attach("stm32wb55ccux", dry_run=True)
+    try:
+        img = tmp_path / "blink.bin"
+        img.write_bytes(bytes([0x01, 0x02, 0x03, 0x04]))
+
+        results = []
+
+        def progress(event):
+            try:
+                # P0 regression: a facade call from inside the callback
+                # must not hit the nested-runtime panic.
+                status = sess.core(0).status()
+                results.append(("ok", str(status)))
+            except BaseException as exc:  # noqa: BLE001 - recorded on purpose
+                results.append(("err", type(exc).__name__))
+
+        loader = pr.build_loader(sess, str(img), "bin", base_address=0x08000000)
+        loader.add_data(0x08000010, bytes([0xAA, 0xBB]))
+        loader.commit(sess, progress=progress)
+        # No PanicException may surface, whatever the event count was.
+        assert all(kind == "ok" for kind, _ in results), results
+        # The session survives the flash and stays usable.
+        assert len(sess.list_cores()) >= 1
+    finally:
+        sess.close()
 
 
 if __name__ == "__main__":

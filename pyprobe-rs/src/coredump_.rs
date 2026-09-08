@@ -8,19 +8,24 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use probe_rs::CoreDump as RsCoreDump;
 use pyo3::prelude::*;
 
 use crate::core_::{wire_core_type_to_local, wire_instruction_set_to_local, wire_register_value_to_local};
 use crate::error::{to_bridge_err, to_py_err};
-use crate::rpc::{rpc_call, Connection, DEFAULT_TIMEOUT};
+use crate::rpc::{rpc_call, Connection};
 use crate::session::Session;
 
 #[pyclass]
 pub struct CoreDump {
     inner: Option<RsCoreDump>,
 }
+
+/// Core dumps read every requested RAM range in one RPC — minutes-class on
+/// slow probes, so this gets the flash-class budget instead of the default.
+const DUMP_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[pymethods]
 impl CoreDump {
@@ -56,9 +61,9 @@ impl CoreDump {
         let wire = py
             .detach(|| {
                 rpc_call(
-                    DEFAULT_TIMEOUT,
+                    DUMP_TIMEOUT,
                     "core dump",
-                    conn.session().core(core_index).dump_core(ranges),
+                    conn.session()?.core(core_index).dump_core(ranges),
                 )
             })
             .map_err(to_bridge_err)?;

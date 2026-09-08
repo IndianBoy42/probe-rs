@@ -21,6 +21,9 @@ struct OpenState {
     manager: ServerManager,
     host: Option<String>,
     token: Option<String>,
+    /// Attaches holding a granted-but-unregistered lease — the automatic
+    /// heal must not fire under them.
+    attach_inflight: usize,
 }
 
 static STATE: OnceLock<Mutex<OpenState>> = OnceLock::new();
@@ -32,35 +35,61 @@ fn state() -> &'static Mutex<OpenState> {
             manager: ServerManager::new(),
             host: None,
             token: None,
+            attach_inflight: 0,
         })
     })
 }
 
 /// Remember a live connection with its target name for `sessions()`/`close_all()`.
 pub(crate) fn register(conn: &Arc<Connection>, target: String) {
-    SESSIONS
-        .lock()
-        .push((Arc::downgrade(conn), target));
+    let mut reg = SESSIONS.lock();
+    prune(&mut reg);
+    reg.push((Arc::downgrade(conn), target));
 }
 
 /// Prune dead entries and describe the remaining live connections.
 pub(crate) fn session_list() -> Vec<String> {
     let mut reg = SESSIONS.lock();
-    reg.retain(|(w, _)| w.upgrade().is_some());
+    prune(&mut reg);
     reg.iter()
         .map(|(_, target)| format!("Session(target={target})"))
         .collect()
 }
 
-/// Mark every live connection closed so their next call fails fast, then
-/// forget them. The transports themselves close when the Python objects are
-/// collected; the server also releases probes when clients disconnect.
+/// Sever every live connection — the transports drop immediately, so the
+/// server releases every probe lease even while Session objects (and their
+/// handles) are still referenced.
 pub(crate) fn close_all() {
     let mut reg = SESSIONS.lock();
-    for (weak, _) in reg.drain(..) {
+    for (weak, _) in reg.iter() {
         if let Some(conn) = weak.upgrade() {
-            conn.mark_closed();
+            conn.sever();
         }
+    }
+    prune(&mut reg);
+}
+
+/// Drop registry entries whose connection is gone or severed.
+fn prune(reg: &mut Vec<(Weak<Connection>, String)>) {
+    reg.retain(|(w, _)| w.upgrade().is_some_and(|c| !c.is_closed()));
+}
+
+/// Marks one attach as in flight. While any guard is alive the automatic
+/// heal is disabled: a granted-but-unregistered lease looks exactly like a
+/// stale session to [`own_server_idle`].
+pub(crate) struct AttachGuard;
+
+impl AttachGuard {
+    pub(crate) fn new() -> Self {
+        state().lock().attach_inflight += 1;
+        Self
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        let mut s = state().lock();
+        s.attach_inflight = s.attach_inflight.saturating_sub(1);
     }
 }
 
@@ -70,6 +99,12 @@ pub(crate) fn set_remote(host: Option<String>, token: Option<String>) {
     let mut s = state().lock();
     s.host = host;
     s.token = token;
+}
+
+/// The active remote configuration, for restoring it after a failed `open()`.
+pub(crate) fn remote_config() -> (Option<String>, Option<String>) {
+    let s = state().lock();
+    (s.host.clone(), s.token.clone())
 }
 
 /// The configured remote host, if remote mode is active.
@@ -137,18 +172,28 @@ fn connect_local() -> Result<RpcClient, BridgeError> {
         s.manager.socket_url()
     };
     let bridge = Bridge::global()?;
-    match bridge
-        .wait(CONNECT_TIMEOUT, "connect", Connection::connect(&url, None))
-        .and_then(|inner| inner)
-    {
+    let attempt = || {
+        bridge
+            .wait(CONNECT_TIMEOUT, "connect", Connection::connect(&url, None))
+            .and_then(|inner| inner)
+    };
+    match attempt() {
         Ok(client) => Ok(client),
         Err(e @ BridgeError::ServerVersion(_)) => {
             // A schema mismatch on a server we spawned means a stale binary
             // from an older build; restarting picks up the current one.
             if heal_restart().is_ok() {
-                bridge
-                    .wait(CONNECT_TIMEOUT, "connect", Connection::connect(&url, None))
-                    .and_then(|inner| inner)
+                attempt()
+            } else {
+                Err(e)
+            }
+        }
+        // A server that answered the readiness probe can die before the
+        // first RPC lands (adopt-vs-connect race): converge with one
+        // respawn + retry instead of failing the idempotent open().
+        Err(e @ (BridgeError::Connection(_) | BridgeError::ServerGone(_))) => {
+            if state().lock().manager.ensure_running().is_ok() {
+                attempt().map_err(|_| e)
             } else {
                 Err(e)
             }
@@ -172,15 +217,17 @@ pub(crate) fn heal_restart() -> Result<(), BridgeError> {
     Ok(())
 }
 
-/// True when the running server was spawned by this crate and no live
-/// connection exists — the preconditions for automatic stale-session healing.
+/// True when the running server was spawned by this crate, no attach is in
+/// flight, and no live connection exists — the preconditions for automatic
+/// stale-session healing.
 pub(crate) fn own_server_idle() -> bool {
     let s = state().lock();
-    if !s.manager.spawned_by_us() {
+    if !s.manager.spawned_by_us() || s.attach_inflight > 0 {
         return false;
     }
-    let reg = SESSIONS.lock();
-    reg.iter().all(|(w, _)| w.upgrade().is_none())
+    let mut reg = SESSIONS.lock();
+    prune(&mut reg);
+    reg.is_empty()
 }
 
 /// Map a server-manager failure onto the bridge taxonomy.
@@ -195,5 +242,40 @@ fn manager_err(e: ManagerError) -> BridgeError {
             "probe-rs serve did not become ready in time; inspect pyprobe_rs.server_logs()".into(),
         ),
         M::Config(e) => BridgeError::Connection(format!("failed to write the server config: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::test_support::for_tests;
+
+    #[test]
+    fn registry_prunes_dead_and_severed_entries() {
+        SESSIONS.lock().clear();
+        let live = for_tests();
+        register(&live, "chip-a".into());
+        let severed = for_tests();
+        register(&severed, "chip-b".into());
+        severed.sever();
+        let list = session_list();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].contains("chip-a"));
+        // Dropping the last Arc prunes on the next registry touch.
+        let weak = Arc::downgrade(&live);
+        drop(live);
+        assert!(weak.upgrade().is_none());
+        assert!(session_list().is_empty());
+        SESSIONS.lock().clear();
+    }
+
+    #[test]
+    fn attach_guard_blocks_the_idle_heal_decision() {
+        let before = state().lock().attach_inflight;
+        {
+            let _guard = AttachGuard::new();
+            assert_eq!(state().lock().attach_inflight, before + 1);
+        }
+        assert_eq!(state().lock().attach_inflight, before);
     }
 }

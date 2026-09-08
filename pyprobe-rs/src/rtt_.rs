@@ -93,13 +93,14 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
                 DEFAULT_TIMEOUT,
                 "rtt attach",
                 conn.session()
+                    .map_err(rtt_err)?
                     .create_rtt_client(scan, Vec::new(), default_config),
             )
             .map_err(rtt_err)?;
             let channels = rpc_call(
                 DEFAULT_TIMEOUT,
                 "rtt channels",
-                conn.session().get_rtt_channels(data.handle),
+                conn.session().map_err(rtt_err)?.get_rtt_channels(data.handle),
             )
             .map_err(rtt_err)?;
             Ok((data.handle, channels))
@@ -321,7 +322,7 @@ impl UpChannel {
                 rpc_call(
                     READ_TIMEOUT,
                     "rtt poll",
-                    conn.session().poll_rtt_up(rtt, vec![channel]),
+                    conn.session()?.poll_rtt_up(rtt, vec![channel]),
                 )
             })
             .map_err(rtt_err)?;
@@ -419,7 +420,7 @@ impl DownChannel {
                 rpc_call(
                     WRITE_TIMEOUT,
                     "rtt write",
-                    conn.session().send_to_rtt(
+                    conn.session()?.send_to_rtt(
                         client,
                         channel,
                         data.to_vec(),

@@ -73,10 +73,16 @@ fn get_target_by_name(name: &str) -> PyResult<Target> {
 #[pyfunction]
 #[pyo3(signature = (host=None, token=None))]
 fn open(py: Python<'_>, host: Option<String>, token: Option<String>) -> PyResult<()> {
+    let prev = open_state::remote_config();
     open_state::set_remote(host, token);
-    py.detach(open_state::ensure_server_client)
-        .map(|_| ())
-        .map_err(error::to_bridge_err)
+    match py.detach(open_state::ensure_server_client) {
+        Ok(_) => Ok(()),
+        // A failed open() must not strand the module in remote mode.
+        Err(e) => {
+            open_state::set_remote(prev.0, prev.1);
+            Err(error::to_bridge_err(e))
+        }
+    }
 }
 
 /// Stop the server pyprobe-rs spawned; refused for servers it did not spawn.

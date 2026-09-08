@@ -92,6 +92,56 @@ pub(crate) struct SubscribedChannel {
     pub(crate) ring: Arc<ChannelRing>,
 }
 
+/// Delivers payloads to Python from a dedicated non-runtime thread.
+///
+/// Facade calls made from inside a callback would nest `Bridge::wait`'s
+/// `block_on` inside an already-entered runtime context (this poller task,
+/// or the flash future's poll) and panic. A pump thread is a plain thread,
+/// so those calls `block_on` legally. The thread exits when `stop` is set
+/// or every sender is dropped.
+pub(crate) struct Pump<T> {
+    tx: std::sync::mpsc::Sender<T>,
+}
+
+impl<T: Send + 'static> Pump<T> {
+    /// Spawn a pump with its own stop flag.
+    pub(crate) fn spawn(on_item: impl Fn(T) + Send + 'static) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        Self::spawn_on(stop, on_item)
+    }
+
+    /// Spawn a pump sharing an existing stop flag (poller lifecycle).
+    pub(crate) fn spawn_on(
+        stop: Arc<AtomicBool>,
+        on_item: impl Fn(T) + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_stop = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("pyprobe-rs-callback".into())
+            .spawn(move || {
+                while let Ok(item) = rx.recv() {
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    on_item(item);
+                }
+            });
+        if spawned.is_err() {
+            // No thread: callbacks are silently dropped; ring data still
+            // accumulates. A detached tx makes every send fail harmlessly.
+            eprintln!("pyprobe-rs: failed to spawn the callback pump thread");
+            let (tx, _) = std::sync::mpsc::channel();
+            return Self { tx };
+        }
+        Self { tx }
+    }
+
+    pub(crate) fn send(&self, item: T) {
+        let _ = self.tx.send(item);
+    }
+}
+
 /// Handle for the background RTT poller of one attached RTT client.
 ///
 /// The task polls all subscribed up channels in one request per tick, pushes
@@ -114,6 +164,14 @@ impl RttPoller {
     ) -> PyResult<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        // The pump owns the callback and delivers from a plain thread so the
+        // callback may call facade APIs; invoking it on this runtime task
+        // would nest `block_on` and panic.
+        let pump = callback.map(|callback| {
+            Pump::spawn_on(Arc::clone(&stop), move |(channel, data): (u32, Vec<u8>)| {
+                deliver(&callback, channel, &data)
+            })
+        });
         Bridge::global()
             .map_err(to_bridge_err)?
             .spawn(poll_loop(
@@ -121,7 +179,7 @@ impl RttPoller {
                 rtt,
                 channels,
                 interval,
-                callback,
+                pump,
                 stop.clone(),
                 running.clone(),
             ));
@@ -141,12 +199,15 @@ impl RttPoller {
 }
 
 /// Poll every subscribed channel once per `interval` until asked to stop.
+///
+/// Chunks land in the channel rings here; Python callbacks are forwarded to
+/// the pump thread, never invoked on this runtime task.
 async fn poll_loop(
     conn: Arc<Connection>,
     rtt: Key<RttClient>,
     channels: Vec<SubscribedChannel>,
     interval: Duration,
-    callback: Option<Py<PyAny>>,
+    pump: Option<Pump<(u32, Vec<u8>)>>,
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) {
@@ -164,12 +225,17 @@ async fn poll_loop(
         }
         let numbers: Vec<u32> = channels.iter().map(|c| c.number).collect();
         // `rpc_call` block_on's the bridge runtime, which this task is
-        // running on — await the same deadline directly instead.
-        let poll = conn.session().poll_rtt_up(rtt, numbers);
+        // running on — await the same deadline directly instead. The owned
+        // session clone keeps the future `Send` (no guard across `.await`).
+        let session = match conn.session() {
+            Ok(s) => s.clone(),
+            Err(_) => break,
+        };
+        let poll = session.poll_rtt_up(rtt, numbers);
         match timeout(deadline, poll).await {
             Ok(Ok(results)) => {
                 last_warn = None;
-                for result in results {
+                'results: for result in results {
                     let Ok(data) = result.result else {
                         // Per-channel failure: the server already logged it.
                         continue;
@@ -182,8 +248,13 @@ async fn poll_loop(
                         continue;
                     };
                     channel.ring.push(&data);
-                    if let Some(callback) = &callback {
-                        deliver(callback, result.channel, &data);
+                    // Re-check after the await: stop_streaming()/close() must
+                    // not be followed by new deliveries.
+                    if stop.load(Ordering::SeqCst) || conn.is_closed() {
+                        break 'results;
+                    }
+                    if let Some(pump) = &pump {
+                        pump.send((result.channel, data));
                     }
                 }
             }
@@ -209,12 +280,17 @@ async fn poll_loop(
 /// Forward one chunk to the Python callback. Exceptions are printed and
 /// never propagated: a misbehaving callback must not kill the poller.
 fn deliver(callback: &Py<PyAny>, channel: u32, data: &[u8]) {
-    Python::attach(|py| {
-        let chunk = PyBytes::new(py, data);
-        if let Err(err) = callback.call1(py, (channel, chunk)) {
-            err.print(py);
-        }
-    });
+    // Python::attach panics during interpreter finalization (pyo3, Py 3.13+);
+    // a pump thread must never take the process down at shutdown.
+    let chunk = data.to_vec();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        Python::attach(|py| {
+            let chunk = PyBytes::new(py, &chunk);
+            if let Err(err) = callback.call1(py, (channel, chunk)) {
+                err.print(py);
+            }
+        });
+    }));
 }
 
 /// Print a poller warning at most once per [`WARN_INTERVAL`].
@@ -223,5 +299,36 @@ fn warn_later(last_warn: &mut Option<Instant>, msg: String) {
     if last_warn.is_none_or(|t| now.duration_since(t) > WARN_INTERVAL) {
         eprintln!("pyprobe-rs: {msg}");
         *last_warn = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn pump_shared_stop_flag_ends_delivery() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&counter);
+        let pump =
+            Pump::spawn_on(Arc::clone(&stop), move |_: usize| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+        for i in 0..8 {
+            pump.send(i);
+        }
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) == 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
+        stop.store(true, Ordering::SeqCst);
+        pump.send(99);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
     }
 }

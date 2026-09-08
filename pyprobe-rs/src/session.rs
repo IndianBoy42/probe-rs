@@ -219,10 +219,14 @@ impl Session {
     }
 
     /// Attach preferring `selector` (None = first accessible probe). Used by
-    /// `Probe.attach` to hand a locally-chosen probe to the server flow.
+    /// `Probe.attach` to hand a locally-chosen probe (and its locally
+    /// applied speed/protocol) to the server flow.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_selected(
         target: &str,
         selector: Option<WireProbeSelector>,
+        speed: Option<u32>,
+        protocol: Option<WireProtocolProxy>,
         allow_erase_all: bool,
         dry_run: bool,
         connect_under_reset: bool,
@@ -230,8 +234,8 @@ impl Session {
     ) -> PyResult<Session> {
         Python::attach(|py| {
             let cfg = SessionConfig {
-                speed: None,
-                protocol: None,
+                speed,
+                protocol,
                 permissions: None,
             };
             let wait = wait_for_probe.map(Duration::from_secs_f64);
@@ -255,7 +259,7 @@ impl Session {
                     rpc_call(
                         DEFAULT_TIMEOUT,
                         "target metadata",
-                        conn.session().target_metadata(),
+                        conn.session()?.target_metadata(),
                     )
                 })
                 .map_err(to_bridge_err)?;
@@ -299,6 +303,8 @@ impl Session {
         let allow_erase = cfg.allow_erase_all();
         let wait = wait_for_probe.map(Duration::from_secs_f64);
         let deadline = wait.unwrap_or_default() + ATTACH_MARGIN;
+        // Disable the automatic heal while this attach holds its lease.
+        let _inflight = open_state::AttachGuard::new();
         let mut outcome = attach_with(
             py,
             target,
@@ -317,7 +323,7 @@ impl Session {
             eprintln!(
                 "pyprobe-rs: probe busy on our own idle server; restarting it to clear a stale session"
             );
-            open_state::heal_restart().map_err(to_bridge_err)?;
+            py.detach(open_state::heal_restart).map_err(to_bridge_err)?;
             outcome = attach_with(
                 py,
                 target,
@@ -335,7 +341,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "target metadata",
-                conn.session().target_metadata(),
+                conn.session()?.target_metadata(),
             )
         })
             .map_err(to_bridge_err)?;
@@ -396,7 +402,7 @@ impl Session {
                 rpc_call(
                     DEFAULT_TIMEOUT,
                     "clear breakpoints",
-                    conn.session()
+                    conn.session()?
                         .core(*core as usize)
                         .clear_hw_breakpoints(addresses.clone()),
                 )?;
@@ -413,7 +419,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "resume all cores",
-                conn.session().resume_all_cores(),
+                conn.session()?.resume_all_cores(),
             )
         })
         .map_err(to_bridge_err)
@@ -466,7 +472,7 @@ impl Session {
             rpc_call(
                 ERASE_TIMEOUT,
                 "erase all",
-                conn.session().erase_all(false, async |_| {}),
+                conn.session()?.erase_all(false, async |_| {}),
             )
         })
         .map_err(to_bridge_err)
@@ -501,7 +507,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "load debug info",
-                conn.session()
+                conn.session()?
                     .load_debug_info(std::path::PathBuf::from(path)),
             )
         })
@@ -518,7 +524,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "stack trace",
-                conn.session().take_rich_stack_trace(Some(core), limit),
+                conn.session()?.take_rich_stack_trace(Some(core), limit),
             )
         })
             .map_err(to_bridge_err)?;
@@ -537,7 +543,7 @@ impl Session {
     pub fn scopes(&self, py: Python<'_>, core: u32, frame: u32) -> PyResult<Vec<PyObject>> {
         let conn = self.conn()?;
         let scopes = py
-            .detach(|| rpc_call(DEFAULT_TIMEOUT, "scopes", conn.session().scopes(core, frame)))
+            .detach(|| rpc_call(DEFAULT_TIMEOUT, "scopes", conn.session()?.scopes(core, frame)))
             .map_err(to_bridge_err)?;
         scopes
             .into_iter()
@@ -572,7 +578,7 @@ impl Session {
                 rpc_call(
                     DEFAULT_TIMEOUT,
                     "variables",
-                    conn.session().variables(core, variables_reference, filter),
+                    conn.session()?.variables(core, variables_reference, filter),
                 )
             })
             .map_err(to_bridge_err)?;
@@ -608,7 +614,7 @@ impl Session {
                 rpc_call(
                     DEFAULT_TIMEOUT,
                     "evaluate",
-                    conn.session().evaluate(core, frame, expression.to_string()),
+                    conn.session()?.evaluate(core, frame, expression.to_string()),
                 )
             })
             .map_err(to_bridge_err)?;
@@ -624,23 +630,17 @@ impl Session {
     }
 
     /// Load a CMSIS-SVD file for peripheral register names on `core`
-    /// (or `None` to clear); resolves/uploads the file via the server.
+    /// (or `None` to clear). The client uploads the file for remote servers
+    /// and reads it in place for local ones — never hand a server-side path
+    /// back through this API.
     #[pyo3(signature = (path, core=0))]
     pub fn load_svd(&self, py: Python<'_>, path: &str, core: u32) -> PyResult<()> {
         let conn = self.conn()?;
-        let resolved = py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "resolve upload",
-                conn.client().resolve_upload(std::path::Path::new(path)),
-            )
-        })
-            .map_err(to_bridge_err)?;
         py.detach(|| {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "load svd",
-                conn.session().load_svd(core, Some(resolved.remote_path)),
+                conn.session()?.load_svd(core, Some(std::path::PathBuf::from(path))),
             )
         })
         .map_err(to_bridge_err)
@@ -668,7 +668,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "resolve breakpoints",
-                conn.session().resolve_source_breakpoints(locations),
+                conn.session()?.resolve_source_breakpoints(locations),
             )
         })
             .map_err(to_bridge_err)?;
@@ -703,7 +703,7 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "clear debug state",
-                conn.session().clear_core_debug_state(core),
+                conn.session()?.clear_core_debug_state(core),
             )
         })
         .map_err(to_bridge_err)
@@ -727,7 +727,7 @@ impl Session {
     /// drops (immediately when no handles are alive).
     pub fn close(&mut self) {
         if let Some(conn) = self.conn.take() {
-            conn.mark_closed();
+            conn.sever();
         }
     }
 

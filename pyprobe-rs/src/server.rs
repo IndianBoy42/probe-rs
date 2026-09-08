@@ -12,14 +12,11 @@
 
 #![cfg(unix)]
 
-use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-
+use std::os::unix::process::CommandExt;
 /// Lines kept in the child-output ring; older lines drop first.
 const LOG_RING_LINES: usize = 200;
 /// Poll interval while waiting for the server socket to open.
@@ -81,10 +78,9 @@ pub(crate) struct ServerManager {
     /// Our child, when we spawned it in this process instance; adopted
     /// (foreign or orphaned) servers have no handle here.
     child: Option<Child>,
-    /// The private runtime dir holding the generated config, socket and pidfile.
+    /// The private runtime dir holding the generated config, socket,
+    /// pidfile and server log.
     dir: PathBuf,
-    /// Child stdout+stderr lines, drop-oldest, surfaced by [`Self::logs`].
-    ring: Arc<Mutex<VecDeque<String>>>,
     /// Whether the current child is one we spawned ourselves.
     spawned_by_us: bool,
 }
@@ -98,7 +94,6 @@ impl ServerManager {
         Self {
             child: None,
             dir,
-            ring: Arc::new(Mutex::new(VecDeque::new())),
             spawned_by_us: false,
         }
     }
@@ -134,7 +129,7 @@ impl ServerManager {
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(
             self.dir.join(".probe-rs.toml"),
-            format!("[server]\naddress = \"{}\"\n", self.socket_url()),
+            config_toml(&self.socket_url()),
         )
     }
 
@@ -247,17 +242,26 @@ impl ServerManager {
         let _ = std::fs::remove_file(self.pidfile_path());
     }
 
-    /// Snapshot of the child's stdout+stderr lines, oldest first.
+    fn log_path(&self) -> PathBuf {
+        self.dir.join("serve.log")
+    }
+
+    /// Tail of the server log, oldest first.
+    ///
+    /// The log is a file, not pipes to this process: an orphaned server
+    /// whose parent died keeps writing safely, and the next kernel can read
+    /// what happened while nobody was attached.
     pub(crate) fn logs(&self) -> Vec<String> {
-        self.log_ring().iter().cloned().collect()
+        let Ok(text) = std::fs::read_to_string(self.log_path()) else {
+            return Vec::new();
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let skip = lines.len().saturating_sub(LOG_RING_LINES);
+        lines.iter().skip(skip).map(|s| s.to_string()).collect()
     }
 
     pub(crate) fn spawned_by_us(&self) -> bool {
         self.spawned_by_us
-    }
-
-    fn log_ring(&self) -> MutexGuard<'_, VecDeque<String>> {
-        self.ring.lock().expect("server log ring poisoned")
     }
 
     fn wait_ready(&self, budget: Duration) -> bool {
@@ -274,6 +278,13 @@ impl ServerManager {
     fn spawn(&mut self) -> Result<(), ManagerError> {
         let bin = Self::resolve_binary().ok_or(ManagerError::BinaryNotFound)?;
         self.write_config().map_err(ManagerError::Config)?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(self.log_path())
+            .map_err(ManagerError::Config)?;
+        let err_log = log.try_clone().map_err(ManagerError::Config)?;
         let mut cmd = Command::new(bin);
         cmd.arg("serve")
             .current_dir(&self.dir)
@@ -287,15 +298,16 @@ impl ServerManager {
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()),
             )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(ManagerError::Spawn)?;
-        if let Some(out) = child.stdout.take() {
-            spawn_log_reader(Arc::clone(&self.ring), out);
-        }
-        if let Some(err) = child.stderr.take() {
-            spawn_log_reader(Arc::clone(&self.ring), err);
-        }
+            // Never inherit the parent's stdio: a dead parent's pipes turn
+            // server-side output into EPIPE for the orphan's whole lifetime.
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
+            // Own process group: the server must survive its parent (and
+            // process-group kills from kernel runners like `uv run`) so the
+            // next kernel can adopt it.
+            .process_group(0);
+        let child = cmd.spawn().map_err(ManagerError::Spawn)?;
         // Bookkeeping only: a failed pidfile degrades the heal decision, not
         // the server itself.
         let _ = std::fs::write(
@@ -317,21 +329,6 @@ impl Drop for ServerManager {
             let _ = child.try_wait();
         }
     }
-}
-
-/// Feeds one child output stream into the drop-oldest log ring.
-fn spawn_log_reader(ring: Arc<Mutex<VecDeque<String>>>, stream: impl Read + Send + 'static) {
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let mut q = ring.lock().expect("server log ring poisoned");
-            if q.len() >= LOG_RING_LINES {
-                q.pop_front();
-            }
-            q.push_back(line);
-        }
-    });
 }
 
 fn current_uid() -> String {
@@ -367,6 +364,7 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::{Mutex, MutexGuard};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -374,8 +372,9 @@ mod tests {
     /// global, and the stub children inherit it.
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        LOCK.lock()
     }
+
 
     /// One isolated env + dir sandbox per test. Created and dropped while the
     /// env lock is held.
@@ -682,5 +681,26 @@ mod tests {
         assert_eq!(m.ensure_running().unwrap(), EnsureOutcome::Spawned);
         assert!(m.socket_connectable());
         m.kill();
+    }
+}
+
+/// The generated `[server]` table. TOML basic strings escape `\` and `"` —
+/// the socket path comes from the environment and can contain either.
+fn config_toml(socket_url: &str) -> String {
+    let url = socket_url.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[server]\naddress = \"{url}\"\n")
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::config_toml;
+
+    #[test]
+    fn config_escapes_quotes_and_backslashes() {
+        let toml = config_toml("socket:///tmp/w\"eird\\path/serve.sock");
+        assert_eq!(
+            toml,
+            "[server]\naddress = \"socket:///tmp/w\\\"eird\\\\path/serve.sock\"\n"
+        );
     }
 }

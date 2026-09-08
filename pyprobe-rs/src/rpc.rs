@@ -7,7 +7,7 @@
 //! forever otherwise.
 
 use std::collections::HashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -89,18 +89,30 @@ where
         .and_then(|r| r.map_err(|e| BridgeError::from_client(e, Phase::Call)))
 }
 
-/// One RPC connection with an attached session. Dropping it closes the
-/// transport, which makes the server release the probe lease.
+/// One RPC connection with an attached session. Severing the inner
+/// transport ([`Connection::sever`]) or dropping the last `Arc` closes the
+/// wire, which makes the server release the probe lease.
 pub(crate) struct Connection {
-    client: RpcClient,
-    session: SessionInterface,
+    /// Transport + attached session; `None` once severed. Handles keep
+    /// `Arc<Connection>` alive after `close()`, so the transport must be
+    /// droppable independently of this struct's lifetime.
+    inner: Mutex<Option<ConnectionInner>>,
     /// Hardware breakpoints set through the facade, per core index. The flash
     /// path re-applies them after a reflash because a reset can clear the
     /// debug unit while our session stays alive.
     pub(crate) breakpoints: Mutex<HashMap<u32, Vec<u64>>>,
-    /// Set by `Session.close()`/`close_all()`; makes later calls fail fast
-    /// even while other Arc clones keep the transport alive.
+    /// Set by [`Connection::sever`]; makes later calls fail fast even while
+    /// other Arc clones keep this object alive.
     pub(crate) closed: AtomicBool,
+    /// Attach-time dry_run: the session runs on a mocked core, so the flash
+    /// path skips the boot step (a boot sequence just times out on it).
+    pub(crate) dry_run: bool,
+}
+
+/// Transport and session, dropped as a unit by `sever`. The client lives
+/// only inside the `SessionInterface`; nothing reads it separately.
+struct ConnectionInner {
+    session: SessionInterface,
 }
 impl Connection {
     pub(crate) async fn connect(
@@ -121,6 +133,7 @@ impl Connection {
         client: RpcClient,
         request: AttachRequest,
     ) -> Result<Self, BridgeError> {
+        let dry_run = request.dry_run;
         let result = client
             .attach_probe(request)
             .await
@@ -129,17 +142,17 @@ impl Connection {
             AttachResult::Success(sessid) => {
                 let session = SessionInterface::new(client.clone(), sessid);
                 Ok(Self {
-                    client,
-                    session,
+                    inner: Mutex::new(Some(ConnectionInner { session })),
                     breakpoints: Mutex::new(HashMap::new()),
                     closed: AtomicBool::new(false),
+                    dry_run,
                 })
             }
             AttachResult::ProbeInUse => Err(BridgeError::ProbeBusy(
                 "the probe is claimed by another session on this server; close \
-                 that session (pyprobe_rs.close_all() closes ours, \
-                 pyprobe_rs.shutdown_server() restarts a server pyprobe-rs \
-                 spawned), then attach again"
+                 that session first (pyprobe_rs.close_all() closes every session \
+                 this process holds; a stale session on a server pyprobe-rs \
+                 spawned is restarted automatically on the next attach)"
                     .into(),
             )),
             AttachResult::ProbeNotFound => Err(BridgeError::Attach(
@@ -167,20 +180,86 @@ impl Connection {
         }
     }
 
-    pub(crate) fn session(&self) -> &SessionInterface {
-        &self.session
+    /// Borrow the live transport's session. Errors once the connection is
+    /// severed; the borrow keeps the transport alive for the call's duration.
+    pub(crate) fn session(&self) -> Result<SessionRef<'_>, BridgeError> {
+        Ok(SessionRef(live_inner(self)?))
     }
 
-    pub(crate) fn client(&self) -> &RpcClient {
-        &self.client
-    }
-
-    /// Mark this connection unusable; later calls fail with a clear message.
-    pub(crate) fn mark_closed(&self) {
-        self.closed.store(true, Ordering::Relaxed);
+    /// Sever the transport: later calls fail fast and the server releases
+    /// the probe lease (the RPC session drops with the connection) even
+    /// while handles keep this `Arc` alive. Idempotent.
+    pub(crate) fn sever(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.inner.lock().take();
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+/// Borrow the inner transport or classify a severed connection.
+fn live_inner<'a>(
+    conn: &'a Connection,
+) -> Result<MutexGuard<'a, Option<ConnectionInner>>, BridgeError> {
+    let guard = conn.inner.lock();
+    if guard.is_none() {
+        return Err(BridgeError::Connection(
+            "this session is closed (Session.close() or pyprobe_rs.close_all() \
+             ran); attach a new session"
+                .into(),
+        ));
+    }
+    Ok(guard)
+}
+
+/// Borrow of the transport valid for one call's duration.
+pub(crate) struct SessionRef<'a>(MutexGuard<'a, Option<ConnectionInner>>);
+impl std::ops::Deref for SessionRef<'_> {
+    type Target = SessionInterface;
+    fn deref(&self) -> &SessionInterface {
+        &self.0.as_ref().expect("checked at construction").session
+    }
+}
+
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Arc;
+    pub(crate) fn for_tests() -> Arc<Connection> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let _enter = rt.enter();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let client = RpcClient::new_local_from_wire(tx, rx);
+        let session = SessionInterface::new(client, probe_rs_rpc::Key::new());
+        Arc::new(Connection {
+            inner: Mutex::new(Some(ConnectionInner { session })),
+            breakpoints: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            dry_run: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::for_tests;
+
+    #[test]
+    fn severed_connection_fails_fast_with_connection_kind() {
+        let conn = for_tests();
+        assert!(conn.session().is_ok());
+        conn.sever();
+        assert!(conn.is_closed());
+        // Severing twice must stay idempotent.
+        conn.sever();
+        let Err(err) = conn.session() else {
+            panic!("severed connection must fail session()");
+        };
+        assert_eq!(err.kind(), "Connection");
     }
 }
