@@ -3404,10 +3404,14 @@ dependencies = [
 name = "pyprobe-rs"
 version = "0.32.0"
 dependencies = [
+ "parking_lot",
  "probe-rs",
  "probe-rs-espressif",
+ "probe-rs-rpc",
+ "probe-rs-rpc-client",
  "probe-rs-target",
  "pyo3",
+ "tokio",
 ]
 
 [[package]]

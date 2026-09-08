@@ -63,3 +63,127 @@ fn error_kind<E: std::fmt::Display + 'static>(e: &E) -> String {
         .unwrap_or("Error")
         .into()
 }
+
+// ---------------------------------------------------------------------------
+// RPC bridge errors
+
+use probe_rs_rpc_client::ClientError;
+
+/// Which side of a client call failed; decides Connection vs ServerGone.
+#[derive(Clone, Copy)]
+pub(crate) enum Phase {
+    /// Establishing the transport or the schema handshake.
+    Connect,
+    /// An established connection failed mid-call.
+    Call,
+}
+
+/// Failure of the bridge layer (transport, server lifecycle, attach policy),
+/// classified for the Python `.kind` attribute. Every variant's message
+/// states the one-line fix.
+#[derive(Debug)]
+pub(crate) enum BridgeError {
+    /// The server could not be reached.
+    Connection(String),
+    /// The server answered but speaks a different RPC schema. The payload is
+    /// unused because the fix message is version-independent.
+    ServerVersion(#[allow(dead_code)] String),
+    /// An established connection was lost (server crash, panic, transport closed).
+    ServerGone(String),
+    /// The probe is claimed by another session.
+    ProbeBusy(String),
+    /// Attach failed for a reason other than busy-ness; carries the Python kind.
+    Attach(String, &'static str),
+    /// A bridge call exceeded its deadline.
+    Timeout(String),
+    /// The server reported a target-level failure.
+    Rpc(String),
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(msg) => write!(
+                f,
+                "could not connect to the probe-rs server ({msg}); run \
+                 pyprobe_rs.open() to start or verify it, or fix the host URL \
+                 (ws://host:port, ssh://[user@]host, socket:///path)"
+            ),
+            Self::ServerVersion(_) => write!(
+                f,
+                "the probe-rs server uses a different RPC schema than this \
+                 client; use the matching probe-rs version for both (point \
+                 PYPROBE_RS_BIN at the matching binary or update the server)"
+            ),
+            Self::ServerGone(msg) => write!(
+                f,
+                "the connection to the probe-rs server was lost ({msg}); call \
+                 pyprobe_rs.open() and attach again — restarting the server \
+                 releases its probe"
+            ),
+            Self::ProbeBusy(msg) => write!(f, "{msg}"),
+            Self::Attach(msg, _) => write!(f, "{msg}"),
+            Self::Timeout(msg) => write!(
+                f,
+                "{msg}; pass a larger timeout or check that the target responds"
+            ),
+            Self::Rpc(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl BridgeError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Connection(_) => "Connection",
+            Self::ServerVersion(_) => "ServerVersion",
+            Self::ServerGone(_) => "ServerGone",
+            Self::ProbeBusy(_) => "ProbeBusy",
+            Self::Attach(_, kind) => kind,
+            Self::Timeout(_) => "Timeout",
+            Self::Rpc(_) => "Rpc",
+        }
+    }
+
+    /// Map a client-crate failure by phase: transport trouble while
+    /// connecting is a Connection error, mid-call it means the server is gone.
+    pub(crate) fn from_client(e: ClientError, phase: Phase) -> Self {
+        use ClientError as E;
+        match e {
+            E::IncompatibleServer | E::UnknownEndpoint => {
+                Self::ServerVersion("schema mismatch".into())
+            }
+            E::InvalidRemoteHost => Self::Connection(
+                "invalid host URL; expected ws://host:port, wss://host:port, \
+                 ssh://[user@]host[:port], or socket:///path"
+                    .into(),
+            ),
+            E::SshSpawn(e) => Self::Connection(format!("could not start the ssh tunnel: {e}")),
+            E::FileRead(path, e) => Self::Rpc(format!("could not read {}: {e}", path.display())),
+            E::Remote(e) => Self::Rpc(e.to_string()),
+            E::Transport(t) => {
+                let msg = t.to_string();
+                match phase {
+                    Phase::Connect => Self::Connection(msg),
+                    Phase::Call => Self::ServerGone(msg),
+                }
+            }
+            _ => Self::Rpc(e.to_string()),
+        }
+    }
+}
+
+/// Build a ProbeRsError with an explicit kind for bridge-layer failures.
+pub(crate) fn to_bridge_err(e: BridgeError) -> PyErr {
+    py_err_with_kind(e.to_string(), e.kind())
+}
+
+/// Build a ProbeRsError carrying `kind` so scripts can branch without
+/// string matching.
+pub(crate) fn py_err_with_kind(msg: String, kind: &str) -> PyErr {
+    Python::attach(|py| {
+        let err = ProbeRsError::new_err(msg);
+        let _ = err.value(py).setattr("kind", kind);
+        err
+    })
+}

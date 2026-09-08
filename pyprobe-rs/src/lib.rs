@@ -7,9 +7,13 @@
 mod core_;
 mod coredump_;
 mod error;
+mod events;
 mod flashing;
+mod open_state;
 mod probe_;
+mod rpc;
 mod rtt_;
+mod server;
 mod session;
 mod types;
 
@@ -23,10 +27,22 @@ use crate::rtt_::{ChannelInfo, DownChannel, Rtt, UpChannel};
 use crate::session::{Permissions, RegistryPy, Session, SessionConfig, Target};
 use crate::types::*;
 
-/// List all detected debug probes.
+/// List debug probes. Uses the probe-rs server when remote mode is active or
+/// a server is already running; otherwise lists locally without starting one.
 #[pyfunction]
-fn list_probes() -> Vec<ProbeInfo> {
-    ListerPy::new().list_all()
+fn list_probes(py: Python<'_>) -> PyResult<Vec<ProbeInfo>> {
+    if open_state::server_active() {
+        let entries = py.detach(|| {
+            crate::rpc::rpc_call(
+                crate::rpc::DEFAULT_TIMEOUT,
+                "probe list",
+                open_state::ensure_server_client()?.list_probes(),
+            )
+        })
+        .map_err(error::to_bridge_err)?;
+        return Ok(entries.iter().map(ProbeInfo::from_entry).collect());
+    }
+    Ok(ListerPy::new().list_all())
 }
 
 /// List all built-in target names.
@@ -46,6 +62,45 @@ fn get_target_by_name(name: &str) -> PyResult<Target> {
     reg.get_target_by_name(name)
         .map(|t| Target { inner: t })
         .map_err(error::to_py_err)
+}
+
+/// Ensure a probe-rs server is running and reachable.
+///
+/// With no `host`, starts (or adopts) a private local `probe-rs serve` on a
+/// user-owned unix socket. With `host`, verifies a remote server
+/// (`ws(s)://host:port`, `ssh://[user@]host`, or `socket:///path`).
+/// Repeated calls are no-ops; sessions call this implicitly.
+#[pyfunction]
+#[pyo3(signature = (host=None, token=None))]
+fn open(py: Python<'_>, host: Option<String>, token: Option<String>) -> PyResult<()> {
+    open_state::set_remote(host, token);
+    py.detach(open_state::ensure_server_client)
+        .map(|_| ())
+        .map_err(error::to_bridge_err)
+}
+
+/// Stop the server pyprobe-rs spawned; refused for servers it did not spawn.
+#[pyfunction]
+fn shutdown_server() -> PyResult<()> {
+    open_state::shutdown_server().map_err(error::to_bridge_err)
+}
+
+/// Ring buffer of the spawned server's stdout/stderr.
+#[pyfunction]
+fn server_logs() -> Vec<String> {
+    open_state::server_logs()
+}
+
+/// Describe the sessions this process currently holds open.
+#[pyfunction]
+fn sessions() -> Vec<String> {
+    open_state::session_list()
+}
+
+/// Close every live session created by this process (later calls fail fast).
+#[pyfunction]
+fn close_all() {
+    open_state::close_all()
 }
 
 #[pymodule]
@@ -114,6 +169,11 @@ fn _pyprobe_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_probes, m)?)?;
     m.add_function(wrap_pyfunction!(list_targets, m)?)?;
     m.add_function(wrap_pyfunction!(get_target_by_name, m)?)?;
+    m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_server, m)?)?;
+    m.add_function(wrap_pyfunction!(server_logs, m)?)?;
+    m.add_function(wrap_pyfunction!(sessions, m)?)?;
+    m.add_function(wrap_pyfunction!(close_all, m)?)?;
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
