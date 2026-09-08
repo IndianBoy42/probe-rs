@@ -1,9 +1,13 @@
 # pyprobe-rs
 
 Python bindings for the [probe-rs](https://github.com/probe-rs/probe-rs) embedded
-debugging toolkit, for dynamic scripting sessions with hardware in the loop:
-flashing, halting, memory/register access, RTT, SWO, and core dumps — all from
-a REPL or notebook.
+debugging toolkit, built for long-lived scripting sessions with hardware in the
+loop: flashing, halting, memory/register access, RTT streaming, DWARF-based
+debugging, and core dumps — from a REPL, notebook, or AI agent.
+
+All operations run over RPC against a managed `probe-rs serve` process, so the
+Python kernel never holds the probe: stale cells, kernel restarts, and leaked
+handles cannot block your hardware.
 
 > Full API reference with Rust-API mapping: [USAGE.md](USAGE.md)
 
@@ -17,57 +21,122 @@ maturin develop --release           # inside pyprobe-rs/, into the active venv
 # or: maturin build --release && pip install target/wheels/pyprobe_rs-*.whl
 ```
 
+The `probe-rs` CLI (the RPC server) is resolved automatically: `PYPROBE_RS_BIN`
+env var → this workspace's `target/{debug,release}/probe-rs` → `PATH`.
+
 ## Quick start
 
 ```python
 import pyprobe_rs as pr
 
-# pr.list_probes()  ==  probe_rs::probe::Lister::new().list_all()
-probes = pr.list_probes()
-probe = probes[0].open()                       # probe_rs::DebugProbeInfo::open()
+# Attach through the managed probe-rs server (started automatically on a
+# private unix socket; repeated pr.open() / Session.auto_attach() converge).
+sess = pr.Session.auto_attach("nrf52840_xxaa")
 
-# probe.attach(target, perms)  ==  probe_rs::Probe::attach(target, permissions)
-sess = probe.attach("nrf52840_xxaa", pr.Permissions())
-
-# sess.core(0)  ==  probe_rs::Session::core(0)  (lending handle, see USAGE.md)
 core = sess.core(0)
-
-core.halt(1000)                                # Core::halt → returns PC
+core.halt(1000)                                # → PC
 core.write_word_32(0x2000_0000, 0xDEADBEEF)    # MemoryInterface::write_word_32
-val = core.read_word_32(0x2000_0000)           # MemoryInterface::read_word_32
-print(f"RAM[0x2000_0000] = {val:#010x}")
-
+print(f"RAM = {core.read_word_32(0x2000_0000):#010x}")
 pc = core.read_pc()                            # CoreInterface::read_core_reg(PC)
-core.run()                                     # Core::run
+core.run()
 ```
 
-Flash a firmware image:
+## The reflash loop
+
+One call does resolve → build → flash → boot → hardware-breakpoint re-apply:
 
 ```python
-pr.download_file(sess, "firmware.hex", "hex")  # probe_rs::flashing::download_file_with_options
+sess.flash("target/thumbv7em-none-eabihf/release/app")   # run=True, verify=False
 ```
 
-Stream RTT logs:
+RTT keeps streaming while your code does other things (background poller on the
+RPC runtime, 1 MiB drop-oldest ring per channel):
 
 ```python
-rtt = sess.attach_rtt(0)                       # probe_rs::rtt::Rtt::attach
-up = rtt.up_channel(0)
-print(up.read_str())                           # non-blocking read of pending data
+rtt = sess.attach_rtt(0)
+rtt.start_streaming(callback=lambda ch, data: print(data.decode(errors="replace"), end=""))
+# ... other cells run; nothing is lost ...
+chunks = rtt.up_channel(0).pop(4096)     # drain what arrived meanwhile
+rtt.stop_streaming()
 ```
 
-Every failure raises `pr.ProbeRsError` with a `.kind` attribute
-(`"Timeout"`, `"Rtt"`, `"Flash"`, `"Probe"`, …).
+## Debugging without DAP/GDB
+
+The RPC surface carries full server-side DWARF support — the agent-grade
+replacement for a heavyweight debug adapter:
+
+```python
+sess.load_debug_info("target/.../app")            # publish ELF DWARF to the server
+sess.stack_trace(0)                               # frames with function/pc/file:line
+scopes = sess.scopes(0, frame_id=0)
+vars = sess.variables(scopes[0]["variables_reference"])
+sess.evaluate(0, "&config.clock_rate")            # DWARF expression evaluation
+sess.resolve_source_breakpoints("src/main.rs", [12, 40])
+core.disassemble(0x1000, 32)
+```
+
+## Long-lived kernels and stale cells
+
+The probe is owned by the spawned `probe-rs serve` process, never by the
+Python kernel. A kernel restart or an abandoned cell cannot hold the probe:
+idle sessions release their lease on disconnect, and a server we spawned
+self-heals (restart + reattach) if a previous kernel's session is still
+lingering. Lifecycle handles:
+
+```python
+pr.sessions()          # live sessions of this process
+pr.close_all()         # close them all (later calls fail fast)
+pr.server_logs()       # ring buffer of the spawned server's output
+pr.shutdown_server()   # stop the server we spawned (refused for foreign ones)
+```
+
+## Remote probes
+
+The same API drives a probe on another machine — `open()` with a host binds to
+an existing server instead of spawning one:
+
+```python
+pr.open(host="ws://rpi.local:3000", token="...")
+# or: pr.open(host="ssh://user@rpi.local")
+sess = pr.Session.auto_attach("nRF52840_xxAA")     # unchanged
+```
+
+(Prefer `ssh://` or trusted networks: upstream `wss://` does not verify TLS
+certificates yet.)
+Caveat: in current probe-rs dev builds the websocket transport's schema
+handshake is unreliable upstream — the same binary pair fails its own
+compatibility check over `ws://` while `socket://` works; remote hosts need
+an upstream fix. pyprobe-rs surfaces it as a clean `ServerVersion` error
+instead of hanging.
+
+## Asyncio
+Every blocking call releases the GIL. `pr.aio(obj)` (or `obj.aio` where
+available) mirrors any facade method as an awaitable for background-style
+workflows:
+
+```python
+await pr.aio(sess).flash("app.elf")
+```
+
+## Errors
+
+Every failure raises `pr.ProbeRsError` with a `.kind` attribute and a message
+that states the one-line fix: `"ProbeBusy"`, `"ServerGone"`, `"Connection"`,
+`"ServerVersion"`, `"Timeout"`, `"Flash"`, `"Rtt"`, `"Register"`, …
 
 ## Testing without hardware
 
 ```python
 probe = pr.Probe.from_fake(pr.FakeProbe.with_mocked_core())
-sess = probe.attach("Cortex-M4", pr.Permissions())
+sess = probe.attach("Cortex-M4", pr.Permissions())   # server-side dry run
 ```
 
+The no-hardware suite: `uv run pytest tests/` (spawns a real server, dry-run
+sessions; see `tests/test_rpc_lifecycle.py`).
+
 See [USAGE.md](USAGE.md) for the complete guide: configuration, registers,
-breakpoints, flashing options and progress callbacks, RTT channel modes, SWO,
-core dumps, and error handling.
+breakpoints, flashing options and progress callbacks, RTT streaming, the DWARF
+debug surface, core dumps, and error handling.
 
 ## License
 

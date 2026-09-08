@@ -13,3 +13,12 @@ license = { text = "MIT OR Apache-2.0" }
 module-name = "pyprobe_rs._pyprobe_rs"
 features = ["espressif"]
 python-source = "python"
+
+[tool.pytest.ini_options]
+markers = [
+    # Hardware-in-the-loop suite (tests/test_hil.py): skipped without
+    # PYPROBE_RS_PY_HIL_CONFIG; select explicitly with `-m hil`.
+    "hil: hardware-in-the-loop tests; need a DUT TOML (PYPROBE_RS_PY_HIL_CONFIG) and real probe hardware",
+    # Also gated by PYPROBE_RS_PY_FLASH_WEAR=1 inside the test itself.
+    "wear: consumes real flash erase/program cycles on the DUT",
+]
