@@ -1,7 +1,6 @@
 //! PyO3 enum proxies mirroring probe-rs / probe-rs-target enums.
 
-use probe_rs::{BreakpointCause, CoreStatus, HaltReason, VectorCatchCondition};
-use probe_rs_target::{Architecture, CoreType, Endian, InstructionSet};
+use probe_rs_target::{Architecture, CoreType, InstructionSet};
 use pyo3::prelude::*;
 
 /// Wire protocol for debug probe communication.
@@ -138,49 +137,6 @@ pub enum TraceSinkProxy {
 
 // ── Conversion helpers ─────────────────────────────────────────────
 
-pub fn core_status_to_py(s: CoreStatus) -> CoreStatusProxy {
-    let (state, is_halted, is_running, halt_reason) = match s {
-        CoreStatus::Running => (CoreStateProxy::Running, false, true, None),
-        CoreStatus::Halted(reason) => (
-            CoreStateProxy::Halted,
-            true,
-            false,
-            Some(halt_reason_to_py(reason)),
-        ),
-        CoreStatus::LockedUp => (CoreStateProxy::LockedUp, false, false, None),
-        CoreStatus::Sleeping => (CoreStateProxy::Sleeping, false, false, None),
-        CoreStatus::Unknown => (CoreStateProxy::Unknown, false, false, None),
-    };
-    CoreStatusProxy {
-        state,
-        is_halted,
-        is_running,
-        halt_reason,
-    }
-}
-
-pub fn halt_reason_to_py(r: HaltReason) -> HaltReasonProxy {
-    let (kind, detail) = match r {
-        HaltReason::Multiple => (HaltKindProxy::Multiple, "multiple reasons".into()),
-        HaltReason::Breakpoint(cause) => (
-            HaltKindProxy::Breakpoint,
-            match cause {
-                BreakpointCause::Hardware => "hardware".into(),
-                BreakpointCause::Software => "software".into(),
-                BreakpointCause::Unknown => "unknown".into(),
-                BreakpointCause::Semihosting(cmd) => format!("semihosting: {:?}", cmd),
-            },
-        ),
-        HaltReason::Exception => (HaltKindProxy::Exception, "exception".into()),
-        HaltReason::Watchpoint => (HaltKindProxy::Watchpoint, "watchpoint".into()),
-        HaltReason::Step => (HaltKindProxy::Step, "step".into()),
-        HaltReason::Request => (HaltKindProxy::Request, "request".into()),
-        HaltReason::External => (HaltKindProxy::External, "external".into()),
-        HaltReason::Unknown => (HaltKindProxy::Unknown, "unknown".into()),
-    };
-    HaltReasonProxy { kind, detail }
-}
-
 pub fn architecture_to_py(a: Architecture) -> ArchitectureProxy {
     match a {
         Architecture::Arm => ArchitectureProxy::Arm,
@@ -217,36 +173,3 @@ pub fn instruction_set_to_py(i: InstructionSet) -> InstructionSetProxy {
     }
 }
 
-pub fn endian_to_py(e: Endian) -> EndianProxy {
-    match e {
-        Endian::Little => EndianProxy::Little,
-        Endian::Big => EndianProxy::Big,
-    }
-}
-
-pub fn py_to_vector_catch(v: VectorCatchConditionProxy) -> VectorCatchCondition {
-    match v {
-        VectorCatchConditionProxy::HardFault => VectorCatchCondition::HardFault,
-        VectorCatchConditionProxy::CoreReset => VectorCatchCondition::CoreReset,
-        VectorCatchConditionProxy::SecureFault => VectorCatchCondition::SecureFault,
-        VectorCatchConditionProxy::All => VectorCatchCondition::All,
-        VectorCatchConditionProxy::Svc => VectorCatchCondition::Svc,
-        VectorCatchConditionProxy::Hlt => VectorCatchCondition::Hlt,
-    }
-}
-
-pub fn channel_mode_to_py(m: probe_rs::rtt::ChannelMode) -> ChannelModeProxy {
-    match m {
-        probe_rs::rtt::ChannelMode::NoBlockSkip => ChannelModeProxy::NoBlockSkip,
-        probe_rs::rtt::ChannelMode::NoBlockTrim => ChannelModeProxy::NoBlockTrim,
-        probe_rs::rtt::ChannelMode::BlockIfFull => ChannelModeProxy::BlockIfFull,
-    }
-}
-
-pub fn py_to_channel_mode(m: ChannelModeProxy) -> probe_rs::rtt::ChannelMode {
-    match m {
-        ChannelModeProxy::NoBlockSkip => probe_rs::rtt::ChannelMode::NoBlockSkip,
-        ChannelModeProxy::NoBlockTrim => probe_rs::rtt::ChannelMode::NoBlockTrim,
-        ChannelModeProxy::BlockIfFull => probe_rs::rtt::ChannelMode::BlockIfFull,
-    }
-}

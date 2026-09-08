@@ -1,13 +1,23 @@
 //! CoreDump support.
+//!
+//! The dump is taken server-side via the `core/dump` endpoint and
+//! reconstructed into a local `probe_rs::CoreDump` (every field is public,
+//! so the wire round-trip loses nothing). `store`/`load` then work exactly
+//! like the direct-probe implementation, including the ELFcoredump format.
 
-use crate::error::to_py_err;
-use crate::session::Session;
-use probe_rs::CoreDump as RsCoreDump;
-use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
-#[pyclass(unsendable)]
+use probe_rs::CoreDump as RsCoreDump;
+use pyo3::prelude::*;
+
+use crate::core_::{wire_core_type_to_local, wire_instruction_set_to_local, wire_register_value_to_local};
+use crate::error::{to_bridge_err, to_py_err};
+use crate::rpc::{rpc_call, Connection, DEFAULT_TIMEOUT};
+use crate::session::Session;
+
+#[pyclass]
 pub struct CoreDump {
     inner: Option<RsCoreDump>,
 }
@@ -26,6 +36,7 @@ impl CoreDump {
     /// `ranges` are inclusive-exclusive (start, end) memory ranges to record.
     #[staticmethod]
     pub fn capture(
+        py: Python<'_>,
         session: &mut Session,
         core_index: usize,
         ranges: Vec<(u64, u64)>,
@@ -41,10 +52,19 @@ impl CoreDump {
                 Ok(start..end)
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let sess = &mut session.inner;
-        let mut core = sess.core(core_index).map_err(to_py_err)?;
-        let dump = RsCoreDump::dump_core(&mut core, ranges).map_err(to_py_err)?;
-        Ok(Self { inner: Some(dump) })
+        let conn: Arc<Connection> = session.conn()?;
+        let wire = py
+            .detach(|| {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "core dump",
+                    conn.session().core(core_index).dump_core(ranges),
+                )
+            })
+            .map_err(to_bridge_err)?;
+        Ok(Self {
+            inner: Some(reconstruct(wire)),
+        })
     }
 
     /// Save the core dump to a file.
@@ -94,5 +114,27 @@ impl CoreDump {
             Some(_) => "CoreDump".into(),
             None => "CoreDump(consumed)".into(),
         }
+    }
+}
+
+/// Rebuild a local `probe_rs::CoreDump` from the wire fields.
+fn reconstruct(wire: probe_rs_rpc::core_ops::WireCoreDump) -> RsCoreDump {
+    RsCoreDump {
+        registers: wire
+            .registers
+            .into_iter()
+            .map(|(id, v)| {
+                (
+                    probe_rs::RegisterId(id.0),
+                    wire_register_value_to_local(v),
+                )
+            })
+            .collect(),
+        data: wire.data,
+        instruction_set: wire_instruction_set_to_local(wire.instruction_set),
+        supports_native_64bit_access: wire.supports_native_64bit_access,
+        core_type: wire_core_type_to_local(wire.core_type),
+        fpu_support: wire.fpu_support,
+        floating_point_register_count: wire.floating_point_register_count.map(|c| c as usize),
     }
 }

@@ -1,5 +1,6 @@
 //! Probe enumeration, opening, and FakeProbe.
 
+use probe_rs_rpc::probe::DebugProbeEntry;
 use crate::error::to_py_err;
 use crate::session::{Permissions, Session};
 use probe_rs::probe::{DebugProbeInfo, Probe, WireProtocol, list::Lister};
@@ -49,105 +50,173 @@ impl ListerPy {
                 "selector must be a 'VID:PID[:SN]' string or a DebugProbeSelector",
             ));
         };
-        self.lister.open(sel).map(ProbePy::from).map_err(to_py_err)
+        let probe = self.lister.open(sel.clone()).map_err(to_py_err)?;
+        Ok(ProbePy {
+            inner: Some(probe),
+            selector: Some(sel),
+            dry_run: false,
+        })
     }
 }
 
 /// Information about a detected debug probe.
 #[pyclass(unsendable)]
 pub struct ProbeInfo {
-    inner: DebugProbeInfo,
+    identifier: String,
+    vendor_id: u16,
+    product_id: u16,
+    serial_number: Option<String>,
+    probe_type: String,
+    inaccessible: bool,
+    /// Present only for locally-listed probes; RPC listings carry no probe
+    /// factory handle, so only local entries can be opened directly.
+    local: Option<DebugProbeInfo>,
 }
 
 impl From<DebugProbeInfo> for ProbeInfo {
     fn from(info: DebugProbeInfo) -> Self {
-        Self { inner: info }
+        Self {
+            identifier: info.identifier.clone(),
+            vendor_id: info.vendor_id,
+            product_id: info.product_id,
+            serial_number: info.serial_number.clone(),
+            // DebugProbeInfo cannot expose its probe factory (private
+            // field), so the type name is only known for RPC listings.
+            probe_type: String::new(),
+            inaccessible: false,
+            local: Some(info),
+        }
     }
 }
+
+impl ProbeInfo {
+    /// Build from an RPC `probe/list` entry (no local open handle).
+    pub(crate) fn from_entry(entry: &DebugProbeEntry) -> Self {
+        Self {
+            identifier: entry.identifier.clone(),
+            vendor_id: entry.vendor_id,
+            product_id: entry.product_id,
+            serial_number: Some(entry.serial_number.clone()).filter(|s| !s.is_empty()),
+            probe_type: entry.probe_type.clone(),
+            inaccessible: entry.inaccessible,
+            local: None,
+        }
+    }
+}
+
 
 #[pymethods]
 impl ProbeInfo {
     /// Vendor ID.
     #[getter]
     fn vid(&self) -> u16 {
-        self.inner.vendor_id
+        self.vendor_id
     }
 
     /// Product ID.
     #[getter]
     fn pid(&self) -> u16 {
-        self.inner.product_id
+        self.product_id
     }
 
     /// Serial number (if available).
     #[getter]
     fn serial(&self) -> Option<String> {
-        self.inner.serial_number.clone()
+        self.serial_number.clone()
     }
 
     /// Probe identifier name.
     #[getter]
     fn identifier(&self) -> String {
-        self.inner.identifier.clone()
+        self.identifier.clone()
     }
 
-    /// Open this probe.
+    /// Probe type name (e.g. "cmsisdap", "jlink").
+    #[getter]
+    fn probe_type(&self) -> String {
+        self.probe_type.clone()
+    }
+
+    /// The probe was found but is not accessible for this user.
+    #[getter]
+    fn inaccessible(&self) -> bool {
+        self.inaccessible
+    }
+
+    /// Open this probe locally (only available for locally-listed probes).
     fn open(&self) -> PyResult<ProbePy> {
-        self.inner.open().map(ProbePy::from).map_err(to_py_err)
+        let info = self.local.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "open() is only available for locally-listed probes; attach through \
+                 Session.auto_attach() or Lister.open(selector).attach() instead",
+            )
+        })?;
+        let probe = info.open().map_err(to_py_err)?;
+        Ok(ProbePy {
+            inner: Some(probe),
+            selector: Some(probe_rs::probe::DebugProbeSelector {
+                vendor_id: self.vendor_id,
+                product_id: self.product_id,
+                serial_number: self.serial_number.clone(),
+                interface: None,
+            }),
+            dry_run: false,
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ProbeInfo(vid={:#06x}, pid={:#06x}, serial={:?})",
-            self.inner.vendor_id, self.inner.product_id, self.inner.serial_number
+            "ProbeInfo(vid={:#06x}, pid={:#06x}, serial={:?}, type={})",
+            self.vendor_id, self.product_id, self.serial_number, self.probe_type
         )
     }
 }
 
 /// An open debug probe.
+///
+/// This is the direct local-probe escape hatch: probe-level operations
+/// (speed, protocol, reset lines) bypass the RPC server. `attach` routes
+/// through the server flow, preferring this probe; the local handle is
+/// released first so the server can claim the USB device.
 #[pyclass(unsendable, name = "Probe")]
 pub struct ProbePy {
     pub(crate) inner: Option<Probe>,
+    pub(crate) selector: Option<probe_rs::probe::DebugProbeSelector>,
+    /// Set when built from a FakeProbe: attach becomes a server-side
+    /// dry-run session (mocked core, no probe lease) so hardware-less
+    /// tests keep working through the RPC facade.
+    pub(crate) dry_run: bool,
 }
 
 impl From<Probe> for ProbePy {
     fn from(p: Probe) -> Self {
-        Self { inner: Some(p) }
+        Self {
+            inner: Some(p),
+            selector: None,
+            dry_run: false,
+        }
     }
 }
 
 #[pymethods]
 impl ProbePy {
-    /// Attach to a target by name.
+    /// Attach to a target by name through the probe-rs server, preferring
+    /// this probe when it can be identified.
     #[pyo3(signature = (target, permissions=None))]
     pub fn attach(&mut self, target: &str, permissions: Option<Permissions>) -> PyResult<Session> {
-        let perms = permissions.unwrap_or_default().inner;
-        let probe = self
-            .inner
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
-        probe
-            .attach(target, perms)
-            .map_err(to_py_err)
-            .map(Session::from)
+        let allow_erase = permissions.unwrap_or_default().allow_erase_all;
+        self.attach_via_server(target, allow_erase, false, None)
     }
 
-    /// Attach under reset.
+    /// Attach under reset through the probe-rs server.
     #[pyo3(signature = (target, permissions=None))]
     pub fn attach_under_reset(
         &mut self,
         target: &str,
         permissions: Option<Permissions>,
     ) -> PyResult<Session> {
-        let perms = permissions.unwrap_or_default().inner;
-        let probe = self
-            .inner
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
-        probe
-            .attach_under_reset(target, perms)
-            .map_err(to_py_err)
-            .map(Session::from)
+        let allow_erase = permissions.unwrap_or_default().allow_erase_all;
+        self.attach_via_server(target, allow_erase, true, None)
     }
 
     pub fn set_speed(&mut self, khz: u32) -> PyResult<u32> {
@@ -268,7 +337,11 @@ impl ProbePy {
             .inner
             .take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("FakeProbe already consumed"))?;
-        Ok(ProbePy::from(inner.into_probe()))
+        Ok(ProbePy {
+            inner: Some(inner.into_probe()),
+            selector: None,
+            dry_run: true,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -276,6 +349,36 @@ impl ProbePy {
             Some(p) => format!("Probe(name={})", p.get_name()),
             None => "Probe(consumed)".into(),
         }
+    }
+}
+
+impl ProbePy {
+    /// Route attach through the RPC server, preferring this probe's
+    /// selector; the local handle is dropped first so the server can claim
+    /// the USB device.
+    fn attach_via_server(
+        &mut self,
+        target: &str,
+        allow_erase: bool,
+        connect_under_reset: bool,
+        wait_for_probe: Option<f64>,
+    ) -> PyResult<Session> {
+        // Release the local USB claim before the server opens the probe.
+        self.inner.take();
+        let selector = self.selector.clone().map(|sel| probe_rs_rpc::probe::DebugProbeSelector {
+            vendor_id: sel.vendor_id,
+            product_id: sel.product_id,
+            interface: sel.interface,
+            serial_number: sel.serial_number,
+        });
+        crate::session::Session::attach_selected(
+            target,
+            selector,
+            allow_erase,
+            self.dry_run,
+            connect_under_reset,
+            wait_for_probe,
+        )
     }
 }
 
@@ -304,12 +407,17 @@ impl FakeProbePy {
     }
 
     /// Convert into a real Probe handle.
+    #[allow(clippy::wrong_self_convention)] // Python methods take &mut self
     pub fn into_probe(&mut self) -> PyResult<ProbePy> {
         let fp = self
             .inner
             .take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("FakeProbe already consumed"))?;
-        Ok(ProbePy::from(fp.into_probe()))
+        Ok(ProbePy {
+            inner: Some(fp.into_probe()),
+            selector: None,
+            dry_run: true,
+        })
     }
 }
 
