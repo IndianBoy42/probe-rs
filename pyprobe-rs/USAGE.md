@@ -246,7 +246,10 @@ sess.close()                          # idempotent; later calls fail fast
 `close()` (explicit, via `with`, or via `pr.close_all()`) makes every later
 call on the session and its handles raise immediately with kind `Connection`
 instead of hitting a dead server, and releases the probe lease right away —
-even while `CoreHandle`/RTT objects are still referenced.
+even while `CoreHandle`/RTT objects are still referenced. `close()` itself
+never blocks, so it is safe to call from RTT/flash progress callbacks; when
+an operation is in flight, the lease releases as soon as that operation ends
+(its own deadline bounds the wait).
 
 ```python
 sess.list_cores()                     # -> [(0, CoreType.Armv7em), ...]
@@ -687,6 +690,12 @@ Streaming semantics:
   exceptions are printed to stderr and never stop the stream. After
   `stop_streaming()`/`close()` no *new* callbacks fire; a chunk already in
   flight when you stopped may still be delivered.
+- while a flash/reset owns the session, the poller skips its ticks (the
+  target is not readable mid-operation anyway); bytes produced during that
+  window follow the target's own RTT buffer mode (lost under `SkipIfFull`,
+  buffered under `BlockIfFull`) and the ring catches up at the next tick
+  after the operation ends. Skipping instead of waiting is what keeps the
+  poller from stalling the session's wire;
 - `up.read()` is a direct RPC poll: the server consumes the target's ring
   buffer, so **everything pending is returned even beyond `count`** —
   truncating would lose the remainder (already consumed server-side). It

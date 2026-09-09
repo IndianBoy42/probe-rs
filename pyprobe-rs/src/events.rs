@@ -18,7 +18,7 @@ use pyo3::types::PyBytes;
 use tokio::time::{MissedTickBehavior, timeout};
 
 use crate::error::to_bridge_err;
-use crate::rpc::{Bridge, Connection};
+use crate::rpc::{Bridge, Connection, SessionTryError};
 
 /// Host-side ring capacity per streamed channel (drop-oldest).
 const RING_CAPACITY: usize = 1024 * 1024;
@@ -225,11 +225,18 @@ async fn poll_loop(
         }
         let numbers: Vec<u32> = channels.iter().map(|c| c.number).collect();
         // `rpc_call` block_on's the bridge runtime, which this task is
-        // running on — await the same deadline directly instead. The owned
-        // session clone keeps the future `Send` (no guard across `.await`).
-        let session = match conn.session() {
-            Ok(s) => s.clone(),
-            Err(_) => break,
+        // running on — await the same deadline directly instead. The clone
+        // keeps the future `Send` (no guard across `.await`). A busy lock
+        // means a call (typically a flash) owns the wire: the tick is
+        // skipped rather than blocking this runtime worker on the mutex —
+        // a blocked worker could strand the client's dispatch task behind
+        // it, which is how a flash response could go unrouted. Skipping is
+        // also semantically right: while a flash owns the wire the target
+        // is not available for side reads; the ring catches up afterwards.
+        let session = match conn.try_session_clone() {
+            Ok(s) => s,
+            Err(SessionTryError::Busy) => continue,
+            Err(SessionTryError::Closed) => break,
         };
         let poll = session.poll_rtt_up(rtt, numbers);
         match timeout(deadline, poll).await {
@@ -330,5 +337,45 @@ mod tests {
         pump.send(99);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(counter.load(Ordering::SeqCst), 8);
+    }
+    #[test]
+    fn poller_skips_ticks_while_a_call_owns_the_wire() {
+        let (conn, mut tx) = crate::rpc::test_support::silent_wire();
+        // Own the connection's single guard first: the poller's first tick
+        // is immediate, and while the wire is owned it must neither emit a
+        // request nor block the runtime worker.
+        let guard = conn.session().expect("live");
+        let poller = RttPoller::start(
+            Arc::clone(&conn),
+            Key::new(),
+            vec![SubscribedChannel {
+                number: 1,
+                ring: Arc::new(ChannelRing::new()),
+            }],
+            Duration::from_millis(20),
+            None,
+        )
+        .expect("poller");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            tx.try_recv().is_err(),
+            "no poll may be emitted while a call owns the wire"
+        );
+        assert!(poller.is_running(), "busy ticks must not kill the poller");
+        drop(guard);
+        // The next tick after release emits the poll request.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if tx.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "poller stopped emitting after the wire was released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(poller.is_running());
+        poller.stop();
     }
 }

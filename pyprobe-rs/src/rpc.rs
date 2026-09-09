@@ -46,6 +46,11 @@ impl Bridge {
         self.rt.spawn(fut);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        self.rt.enter()
+    }
+
     fn new() -> Result<Self, BridgeError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -183,16 +188,48 @@ impl Connection {
 
     /// Borrow the live transport's session. Errors once the connection is
     /// severed; the borrow keeps the transport alive for the call's duration.
+    /// Blocking by design: the connection is one wire, and the exclusive
+    /// guard held for the call's duration is what serializes requests onto
+    /// it — the connection never has two requests in flight.
     pub(crate) fn session(&self) -> Result<SessionRef<'_>, BridgeError> {
-        Ok(SessionRef(live_inner(self)?))
+        Ok(SessionRef {
+            conn: self,
+            guard: live_inner(self)?,
+        })
+    }
+
+    /// Clone the session interface without holding the guard across the
+    /// await. For event pollers: blocking on this lock would freeze a
+    /// runtime worker for the whole in-flight call (e.g. a flash) — and a
+    /// frozen worker can strand the client's dispatch task behind it — so
+    /// the caller skips its tick instead. Skipping is also semantically
+    /// right: while a flash owns the wire, the target is not available for
+    /// side reads.
+    pub(crate) fn try_session_clone(
+        &self,
+    ) -> Result<SessionInterface, SessionTryError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SessionTryError::Closed);
+        }
+        match self.inner.try_lock() {
+            Some(inner) => Ok(inner.as_ref().expect("checked at construction").session.clone()),
+            None => Err(SessionTryError::Busy),
+        }
     }
 
     /// Sever the transport: later calls fail fast and the server releases
     /// the probe lease (the RPC session drops with the connection) even
     /// while handles keep this `Arc` alive. Idempotent.
+    ///
+    /// Never blocks. When a call is in flight it holds the connection's
+    /// only guard; the take is then deferred to that call's `SessionRef`
+    /// drop, so `close()` is safe from RTT/flash callbacks and the lease
+    /// release is bounded by the in-flight call's own deadline.
     pub(crate) fn sever(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.inner.lock().take();
+        if let Some(mut inner) = self.inner.try_lock() {
+            inner.take();
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -215,12 +252,34 @@ fn live_inner<'a>(
     Ok(guard)
 }
 
-/// Borrow of the transport valid for one call's duration.
-pub(crate) struct SessionRef<'a>(MutexGuard<'a, Option<ConnectionInner>>);
+/// Why [`Connection::try_session_clone`] returned without a session.
+pub(crate) enum SessionTryError {
+    /// A call is in flight; retry on the next tick.
+    Busy,
+    /// The connection is severed.
+    Closed,
+}
+
+/// Borrow of the transport valid for one call's duration. At most one of
+/// these exists at a time (the mutex guard is exclusive).
+pub(crate) struct SessionRef<'a> {
+    conn: &'a Connection,
+    guard: MutexGuard<'a, Option<ConnectionInner>>,
+}
 impl std::ops::Deref for SessionRef<'_> {
     type Target = SessionInterface;
     fn deref(&self) -> &SessionInterface {
-        &self.0.as_ref().expect("checked at construction").session
+        &self.guard.as_ref().expect("checked at construction").session
+    }
+}
+impl Drop for SessionRef<'_> {
+    fn drop(&mut self) {
+        // sever() during this call deferred the take to us: dropping the
+        // transport ends the wire and releases the probe lease as soon as
+        // the in-flight call no longer borrows it.
+        if self.conn.closed.load(Ordering::SeqCst) {
+            self.guard.take();
+        }
     }
 }
 
@@ -244,11 +303,44 @@ pub(crate) mod test_support {
             dry_run: true,
         })
     }
+    /// A live connection whose wire ends are exposed: nothing ever replies,
+    /// and `out_frames` (`Receiver::try_recv`) observes every frame the
+    /// client emits. Built inside the shared bridge runtime so the client's
+    /// dispatch task lands there, as in production.
+    pub(crate) fn silent_wire() -> (
+        Arc<Connection>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let bridge = Bridge::global().expect("bridge");
+        let _enter = bridge.test_enter();
+        // Client → server carries the frames under test; server → client is
+        // never fed. Its sender must stay ALIVE (forgotten, not dropped):
+        // dropping it EOFs the client's reader task, which tears down the
+        // whole client and fails every call instantly.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let client = RpcClient::new_local_from_wire(out_tx, in_rx);
+        std::mem::forget(in_tx);
+        let session = SessionInterface::new(client, probe_rs_rpc::Key::new());
+        (
+            Arc::new(Connection {
+                inner: Mutex::new(Some(ConnectionInner { session })),
+                breakpoints: Mutex::new(HashMap::new()),
+                closed: AtomicBool::new(false),
+                dry_run: true,
+            }),
+            out_rx,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support;
     use super::test_support::for_tests;
+    use super::{Bridge, SessionTryError};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn severed_connection_fails_fast_with_connection_kind() {
@@ -262,5 +354,69 @@ mod tests {
             panic!("severed connection must fail session()");
         };
         assert_eq!(err.kind(), "Connection");
+    }
+    #[test]
+    fn bridge_call_times_out_on_silent_wire() {
+        let start = std::time::Instant::now();
+        let (conn, _tx) = test_support::silent_wire();
+        let result = Bridge::global().expect("bridge").wait(
+            Duration::from_millis(150),
+            "silent poll",
+            conn.session()
+                .expect("live")
+                .poll_rtt_up(probe_rs_rpc::Key::new(), vec![0]),
+        );
+        let Err(err) = result else {
+            panic!("a call on a silent wire must hit its deadline");
+        };
+        assert_eq!(err.kind(), "Timeout");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sever_during_in_flight_call_is_bounded_and_defers_release() {
+        let (conn, _tx) = test_support::silent_wire();
+        let worker = std::thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || {
+                let _guard = conn.session().expect("live");
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        conn.sever();
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "sever must not wait for the in-flight call"
+        );
+        worker.join().expect("worker");
+        // The deferred take runs when the in-flight call's SessionRef drops.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while conn.inner.try_lock().is_some_and(|g| g.is_some()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transport was never released after the in-flight call ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn try_session_clone_reflects_state() {
+        let (conn, _tx) = test_support::silent_wire();
+        assert!(conn.try_session_clone().is_ok());
+        {
+            let _guard = conn.session().expect("live");
+            assert!(matches!(
+                conn.try_session_clone(),
+                Err(SessionTryError::Busy)
+            ));
+        }
+        conn.sever();
+        assert!(matches!(
+            conn.try_session_clone(),
+            Err(SessionTryError::Closed)
+        ));
     }
 }

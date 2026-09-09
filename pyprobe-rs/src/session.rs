@@ -759,8 +759,10 @@ impl Session {
     }
 
     /// Close the session (idempotent). Later calls on this session and its
-    /// handles fail fast; the probe lease is released once the transport
-    /// drops (immediately when no handles are alive).
+    /// handles fail fast; the probe lease is released when the transport
+    /// drops — immediately when idle, otherwise as soon as the in-flight
+    /// operation ends (its own deadline bounds the wait). close() itself
+    /// never blocks, so it is safe from RTT/flash progress callbacks.
     pub fn close(&mut self) {
         if let Some(conn) = self.conn.take() {
             conn.sever();
