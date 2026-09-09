@@ -172,4 +172,3 @@ pub fn instruction_set_to_py(i: InstructionSet) -> InstructionSetProxy {
         InstructionSet::Xtensa => InstructionSetProxy::Xtensa,
     }
 }
-

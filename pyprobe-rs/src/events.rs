@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use probe_rs_rpc_client::ClientError;
 use probe_rs_rpc::{Key, RttClient};
+use probe_rs_rpc_client::ClientError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tokio::time::{MissedTickBehavior, timeout};
@@ -111,10 +111,7 @@ impl<T: Send + 'static> Pump<T> {
     }
 
     /// Spawn a pump sharing an existing stop flag (poller lifecycle).
-    pub(crate) fn spawn_on(
-        stop: Arc<AtomicBool>,
-        on_item: impl Fn(T) + Send + 'static,
-    ) -> Self {
+    pub(crate) fn spawn_on(stop: Arc<AtomicBool>, on_item: impl Fn(T) + Send + 'static) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread_stop = Arc::clone(&stop);
         let spawned = std::thread::Builder::new()
@@ -172,17 +169,15 @@ impl RttPoller {
                 deliver(&callback, channel, &data)
             })
         });
-        Bridge::global()
-            .map_err(to_bridge_err)?
-            .spawn(poll_loop(
-                conn,
-                rtt,
-                channels,
-                interval,
-                pump,
-                stop.clone(),
-                running.clone(),
-            ));
+        Bridge::global().map_err(to_bridge_err)?.spawn(poll_loop(
+            conn,
+            rtt,
+            channels,
+            interval,
+            pump,
+            stop.clone(),
+            running.clone(),
+        ));
         Ok(Self { stop, running })
     }
 
@@ -250,8 +245,7 @@ async fn poll_loop(
                     if data.is_empty() {
                         continue;
                     }
-                    let Some(channel) = channels.iter().find(|c| c.number == result.channel)
-                    else {
+                    let Some(channel) = channels.iter().find(|c| c.number == result.channel) else {
                         continue;
                     };
                     channel.ring.push(&data);
@@ -319,10 +313,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&counter);
-        let pump =
-            Pump::spawn_on(Arc::clone(&stop), move |_: usize| {
-                seen.fetch_add(1, Ordering::SeqCst);
-            });
+        let pump = Pump::spawn_on(Arc::clone(&stop), move |_: usize| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
         for i in 0..8 {
             pump.send(i);
         }

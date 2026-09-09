@@ -84,27 +84,33 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
     let default_config = RttChannelConfig::default();
 
     let (handle, channels) = Python::attach(|py| {
-        py.detach(|| -> PyResult<(Key<RttClient>, probe_rs_rpc::rtt_client::RttChannels)> {
-            // Two round-trips, both bounded by the default deadline: create
-            // the server-side client, then read its channel snapshot. The
-            // control-block attach happens server-side inside
-            // `get_rtt_channels` (and is retried by every later poll).
-            let data = rpc_call(
-                DEFAULT_TIMEOUT,
-                "rtt attach",
-                conn.session()
-                    .map_err(rtt_err)?
-                    .create_rtt_client(scan, Vec::new(), default_config),
-            )
-            .map_err(rtt_err)?;
-            let channels = rpc_call(
-                DEFAULT_TIMEOUT,
-                "rtt channels",
-                conn.session().map_err(rtt_err)?.get_rtt_channels(data.handle),
-            )
-            .map_err(rtt_err)?;
-            Ok((data.handle, channels))
-        })
+        py.detach(
+            || -> PyResult<(Key<RttClient>, probe_rs_rpc::rtt_client::RttChannels)> {
+                // Two round-trips, both bounded by the default deadline: create
+                // the server-side client, then read its channel snapshot. The
+                // control-block attach happens server-side inside
+                // `get_rtt_channels` (and is retried by every later poll).
+                let data = rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "rtt attach",
+                    conn.session().map_err(rtt_err)?.create_rtt_client(
+                        scan,
+                        Vec::new(),
+                        default_config,
+                    ),
+                )
+                .map_err(rtt_err)?;
+                let channels = rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "rtt channels",
+                    conn.session()
+                        .map_err(rtt_err)?
+                        .get_rtt_channels(data.handle),
+                )
+                .map_err(rtt_err)?;
+                Ok((data.handle, channels))
+            },
+        )
     })?;
 
     let state = |metas: &[RttChannelMeta]| -> Vec<ChannelState> {

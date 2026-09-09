@@ -32,14 +32,15 @@ use crate::types::*;
 #[pyfunction]
 fn list_probes(py: Python<'_>) -> PyResult<Vec<ProbeInfo>> {
     if open_state::server_active() {
-        let entries = py.detach(|| {
-            crate::rpc::rpc_call(
-                crate::rpc::DEFAULT_TIMEOUT,
-                "probe list",
-                open_state::ensure_server_client()?.list_probes(),
-            )
-        })
-        .map_err(error::to_bridge_err)?;
+        let entries = py
+            .detach(|| {
+                crate::rpc::rpc_call(
+                    crate::rpc::DEFAULT_TIMEOUT,
+                    "probe list",
+                    open_state::ensure_server_client()?.list_probes(),
+                )
+            })
+            .map_err(error::to_bridge_err)?;
         return Ok(entries.iter().map(ProbeInfo::from_entry).collect());
     }
     Ok(ListerPy::new().list_all())

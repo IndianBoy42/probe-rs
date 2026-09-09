@@ -127,7 +127,9 @@ fn event_to_py(e: &WireProgressEvent) -> ProgressEvent {
             None,
             0.0,
         ),
-        WireProgressEvent::Finished(op) => ("Finished", operation_name(op).to_string(), 0, None, 0.0),
+        WireProgressEvent::Finished(op) => {
+            ("Finished", operation_name(op).to_string(), 0, None, 0.0)
+        }
         WireProgressEvent::Failed(op) => ("Failed", operation_name(op).to_string(), 0, None, 0.0),
         WireProgressEvent::DiagnosticMessage { message } => {
             ("DiagnosticMessage", message.clone(), 0, None, 0.0)
@@ -290,7 +292,11 @@ fn flash_image(
     if run {
         rpc_call(DEFAULT_TIMEOUT, "boot", session.boot(built.boot_info, 0))?;
     } else {
-        rpc_call(DEFAULT_TIMEOUT, "boot", session.prepare_boot(built.boot_info, 0))?;
+        rpc_call(
+            DEFAULT_TIMEOUT,
+            "boot",
+            session.prepare_boot(built.boot_info, 0),
+        )?;
     }
     Ok(())
 }
@@ -340,7 +346,17 @@ pub fn download_file(
     let opts = options.unwrap_or_default();
     let wire = wire_download_options(&opts)?;
     let conn2 = Arc::clone(&conn);
-    py.detach(move || flash_image(&conn2, path, format_opts, wire, opts.preverify, true, progress))
+    py.detach(move || {
+        flash_image(
+            &conn2,
+            path,
+            format_opts,
+            wire,
+            opts.preverify,
+            true,
+            progress,
+        )
+    })
     .map_err(to_bridge_err)?;
     reapply_breakpoints(py, &conn);
     Ok(())
@@ -440,9 +456,8 @@ impl FlashLoader {
                     rpc_call(
                         FLASH_TIMEOUT,
                         "pre-verify flash",
-                    conn.session()?
-                        .verify(key, progress_forward(pump.as_ref())),
-                )?,
+                        conn.session()?.verify(key, progress_forward(pump.as_ref())),
+                    )?,
                     VerifyResult::Mismatch
                 );
             }
@@ -494,8 +509,13 @@ pub fn build_loader(
             rpc_call(
                 BUILD_TIMEOUT,
                 "build flash loader",
-                conn.session()?
-                    .build_flash_loader_resolved(&upload, format_opts, None, false, None),
+                conn.session()?.build_flash_loader_resolved(
+                    &upload,
+                    format_opts,
+                    None,
+                    false,
+                    None,
+                ),
             )
         })
         .map_err(to_bridge_err)?;

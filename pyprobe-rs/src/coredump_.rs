@@ -13,9 +13,11 @@ use std::time::Duration;
 use probe_rs::CoreDump as RsCoreDump;
 use pyo3::prelude::*;
 
-use crate::core_::{wire_core_type_to_local, wire_instruction_set_to_local, wire_register_value_to_local};
+use crate::core_::{
+    wire_core_type_to_local, wire_instruction_set_to_local, wire_register_value_to_local,
+};
 use crate::error::{to_bridge_err, to_py_err};
-use crate::rpc::{rpc_call, Connection};
+use crate::rpc::{Connection, rpc_call};
 use crate::session::Session;
 
 #[pyclass]
@@ -128,12 +130,7 @@ fn reconstruct(wire: probe_rs_rpc::core_ops::WireCoreDump) -> RsCoreDump {
         registers: wire
             .registers
             .into_iter()
-            .map(|(id, v)| {
-                (
-                    probe_rs::RegisterId(id.0),
-                    wire_register_value_to_local(v),
-                )
-            })
+            .map(|(id, v)| (probe_rs::RegisterId(id.0), wire_register_value_to_local(v)))
             .collect(),
         data: wire.data,
         instruction_set: wire_instruction_set_to_local(wire.instruction_set),

@@ -5,8 +5,6 @@
 //! interpreter. The wire carries no register-name table, so name→id
 //! resolution is served from the static tables in this file.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use probe_rs_rpc::core_ops::{
     WireBreakpointCause, WireCoreStatus, WireCoreType, WireHaltReason, WireInstructionSet,
     WireRegisterId, WireRegisterValue, WireSteppingMode, WireVectorCatchCondition,
@@ -14,13 +12,15 @@ use probe_rs_rpc::core_ops::{
 use probe_rs_rpc_client::{ClientError, CoreInterface, SessionInterface};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use crate::error::{py_err_with_kind, to_bridge_err, BridgeError, Phase};
-use crate::rpc::{rpc_call, Bridge, Connection, DEFAULT_TIMEOUT};
+use crate::error::{BridgeError, Phase, py_err_with_kind, to_bridge_err};
+use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, rpc_call};
 use crate::types::{
-    core_type_to_py, instruction_set_to_py, ArchitectureProxy, CoreStateProxy, CoreStatusProxy,
-    CoreTypeProxy, EndianProxy, HaltKindProxy, HaltReasonProxy, InstructionSetProxy,
-    VectorCatchConditionProxy,
+    ArchitectureProxy, CoreStateProxy, CoreStatusProxy, CoreTypeProxy, EndianProxy, HaltKindProxy,
+    HaltReasonProxy, InstructionSetProxy, VectorCatchConditionProxy, core_type_to_py,
+    instruction_set_to_py,
 };
 
 /// Interval between status polls in `wait_for_core_halted`.
@@ -328,12 +328,17 @@ fn unknown_register(name: &str) -> PyErr {
         .collect();
     known.sort_unstable();
     known.dedup();
-    py_err_with_kind(format!("unknown register: {name} (known: {})", known.join(", ")), "Register")
+    py_err_with_kind(
+        format!("unknown register: {name} (known: {})", known.join(", ")),
+        "Register",
+    )
 }
 
 // ── Wire → local enum helpers ──────────────────────────────────────
 
-pub(crate) fn wire_instruction_set_to_local(w: WireInstructionSet) -> probe_rs_target::InstructionSet {
+pub(crate) fn wire_instruction_set_to_local(
+    w: WireInstructionSet,
+) -> probe_rs_target::InstructionSet {
     use probe_rs_target::InstructionSet as I;
     match w {
         WireInstructionSet::Thumb2 => I::Thumb2,
@@ -520,7 +525,8 @@ impl CoreHandle {
         T: Send,
     {
         let core_if = self.core_if().map_err(to_bridge_err)?;
-        py.detach(|| rpc_call(deadline, op, f(core_if))).map_err(to_bridge_err)
+        py.detach(|| rpc_call(deadline, op, f(core_if)))
+            .map_err(to_bridge_err)
     }
 
     /// Re-apply this core's tracked hardware breakpoints (after ops that
@@ -528,7 +534,8 @@ impl CoreHandle {
     fn reapply_tracked_breakpoints(&self, py: Python<'_>) -> PyResult<()> {
         let conn = self.conn.clone();
         let core = self.core;
-        py.detach(|| reapply_breakpoints(&conn, core)).map_err(to_bridge_err)
+        py.detach(|| reapply_breakpoints(&conn, core))
+            .map_err(to_bridge_err)
     }
 
     /// Same as [`Self::rpc`] for calls that address the session rather than
@@ -544,7 +551,8 @@ impl CoreHandle {
         T: Send,
     {
         let session = self.conn.session().map_err(to_bridge_err)?.clone();
-        py.detach(|| rpc_call(DEFAULT_TIMEOUT, op, f(session))).map_err(to_bridge_err)
+        py.detach(|| rpc_call(DEFAULT_TIMEOUT, op, f(session)))
+            .map_err(to_bridge_err)
     }
 
     /// Core metadata (instruction set, FPU) for this core.
@@ -651,16 +659,22 @@ impl CoreHandle {
 /// while the session (and our tracked set) stays alive. GIL-free; safe to
 /// call from inside a `py.detach` block.
 pub(crate) fn reapply_breakpoints(conn: &Arc<Connection>, core: u32) -> Result<(), BridgeError> {
-    let addresses = conn.breakpoints.lock().get(&core).cloned().unwrap_or_default();
+    let addresses = conn
+        .breakpoints
+        .lock()
+        .get(&core)
+        .cloned()
+        .unwrap_or_default();
     if addresses.is_empty() {
         return Ok(());
     }
     let session = conn.session()?.clone();
-    let results = Bridge::global()?.wait(
-        DEFAULT_TIMEOUT,
-        "reapply breakpoints",
-        async move { session.core(core as usize).set_hw_breakpoints(addresses).await },
-    )?;
+    let results = Bridge::global()?.wait(DEFAULT_TIMEOUT, "reapply breakpoints", async move {
+        session
+            .core(core as usize)
+            .set_hw_breakpoints(addresses)
+            .await
+    })?;
     for result in results.map_err(|e| BridgeError::from_client(e, Phase::Call))? {
         result.map_err(|e| {
             BridgeError::Rpc(format!(
@@ -754,20 +768,16 @@ impl CoreHandle {
             let bridge = Bridge::global()?;
             let session = conn.session()?.clone();
             bridge
-                .wait(
-                    deadline,
-                    "wait for core halted",
-                    async move {
-                        let core_if = session.core(core as usize);
-                        loop {
-                            match core_if.status().await {
-                                Ok(WireCoreStatus::Halted(_)) => return Ok(()),
-                                Ok(_) => tokio::time::sleep(HALT_POLL_INTERVAL).await,
-                                Err(e) => return Err(e),
-                            }
+                .wait(deadline, "wait for core halted", async move {
+                    let core_if = session.core(core as usize);
+                    loop {
+                        match core_if.status().await {
+                            Ok(WireCoreStatus::Halted(_)) => return Ok(()),
+                            Ok(_) => tokio::time::sleep(HALT_POLL_INTERVAL).await,
+                            Err(e) => return Err(e),
                         }
-                    },
-                )?
+                    }
+                })?
                 .map_err(|e| BridgeError::from_client(e, Phase::Call))
         })
         .map_err(to_bridge_err)
@@ -1071,7 +1081,8 @@ impl CoreHandle {
         // no disable endpoint, and the facade refuses to fake one.
         Err(py_err_with_kind(
             "the probe-rs RPC server has no vector-catch disable endpoint; \
-             the catch clears on core reset".into(),
+             the catch clears on core reset"
+                .into(),
             "Rpc",
         ))
     }
@@ -1142,9 +1153,7 @@ impl CoreHandle {
         self.core_metadata(py)?
             .floating_point_register_count
             .map(|c| c as usize)
-            .ok_or_else(|| {
-                py_err_with_kind("this core has no floating-point unit".into(), "Rpc")
-            })
+            .ok_or_else(|| py_err_with_kind("this core has no floating-point unit".into(), "Rpc"))
     }
 
     fn is_64_bit(&self, py: Python<'_>) -> PyResult<bool> {
@@ -1230,7 +1239,6 @@ impl CoreHandle {
 
 /// Role-id helpers that need the core's architecture.
 impl CoreHandle {
-
     /// Status as the raw wire value.
     fn raw_status(&self, py: Python<'_>) -> PyResult<WireCoreStatus> {
         self.rpc(py, "core status", |c| async move { c.status().await })
@@ -1240,8 +1248,9 @@ impl CoreHandle {
     /// statement stepping without debug info) go to stderr.
     fn step_by(&self, py: Python<'_>, mode: WireSteppingMode) -> PyResult<u64> {
         let core = self.core;
-        let response =
-            self.rpc_session(py, "step core", |s| async move { s.debug_step(core, mode).await })?;
+        let response = self.rpc_session(py, "step core", |s| async move {
+            s.debug_step(core, mode).await
+        })?;
         if let Some(warning) = response.warning {
             eprintln!("pyprobe-rs: step warning: {warning}");
         }

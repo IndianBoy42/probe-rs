@@ -3,11 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use probe_rs::config::{Registry as RsRegistry, Target as RsTarget};
 use probe_rs::CoreType;
+use probe_rs::config::{Registry as RsRegistry, Target as RsTarget};
 use probe_rs_rpc::core_ops::WireCoreType;
 use probe_rs_rpc::info::WireSessionTargetMetadata;
-use probe_rs_rpc::probe::{AttachRequest, DebugProbeEntry, DebugProbeSelector as WireProbeSelector, WireProtocol};
+use probe_rs_rpc::probe::{
+    AttachRequest, DebugProbeEntry, DebugProbeSelector as WireProbeSelector, WireProtocol,
+};
 use probe_rs_rpc_client::RpcClient;
 use probe_rs_target::MemoryRegion;
 use pyo3::prelude::*;
@@ -15,9 +17,9 @@ use pyo3::prelude::*;
 /// pyo3 0.29 removed the `PyObject` alias; spell it out once here.
 type PyObject = Py<PyAny>;
 
-use crate::error::{to_bridge_err, to_py_err, py_err_with_kind, BridgeError};
+use crate::error::{BridgeError, py_err_with_kind, to_bridge_err, to_py_err};
 use crate::open_state;
-use crate::rpc::{rpc_call, Bridge, Connection, DEFAULT_TIMEOUT};
+use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, rpc_call};
 use crate::types::*;
 
 /// Session configuration.
@@ -372,13 +374,14 @@ impl Session {
         )
         .map_err(to_bridge_err)?;
         let conn = Arc::new(conn);
-        let meta = py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "target metadata",
-                conn.session()?.target_metadata(),
-            )
-        })
+        let meta = py
+            .detach(|| {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "target metadata",
+                    conn.session()?.target_metadata(),
+                )
+            })
             .map_err(to_bridge_err)?;
         open_state::register(&conn, target.to_string());
         Ok(Session {
@@ -555,13 +558,14 @@ impl Session {
     #[pyo3(signature = (core=0, limit=20))]
     pub fn stack_trace(&self, py: Python<'_>, core: u32, limit: u32) -> PyResult<Vec<PyObject>> {
         let conn = self.conn()?;
-        let traces = py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "stack trace",
-                conn.session()?.take_rich_stack_trace(Some(core), limit),
-            )
-        })
+        let traces = py
+            .detach(|| {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "stack trace",
+                    conn.session()?.take_rich_stack_trace(Some(core), limit),
+                )
+            })
             .map_err(to_bridge_err)?;
         let mut out = Vec::new();
         for trace in traces.cores {
@@ -578,7 +582,13 @@ impl Session {
     pub fn scopes(&self, py: Python<'_>, core: u32, frame: u32) -> PyResult<Vec<PyObject>> {
         let conn = self.conn()?;
         let scopes = py
-            .detach(|| rpc_call(DEFAULT_TIMEOUT, "scopes", conn.session()?.scopes(core, frame)))
+            .detach(|| {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "scopes",
+                    conn.session()?.scopes(core, frame),
+                )
+            })
             .map_err(to_bridge_err)?;
         scopes
             .into_iter()
@@ -617,8 +627,7 @@ impl Session {
                 )
             })
             .map_err(to_bridge_err)?;
-        vars
-            .into_iter()
+        vars.into_iter()
             .map(|v| {
                 py_dict(
                     py,
@@ -650,7 +659,8 @@ impl Session {
                 rpc_call(
                     DEFAULT_TIMEOUT,
                     "evaluate",
-                    conn.session()?.evaluate(core, frame, expression.to_string()),
+                    conn.session()?
+                        .evaluate(core, frame, expression.to_string()),
                 )
             })
             .map_err(to_bridge_err)?;
@@ -676,7 +686,8 @@ impl Session {
             rpc_call(
                 DEFAULT_TIMEOUT,
                 "load svd",
-                conn.session()?.load_svd(core, Some(std::path::PathBuf::from(path))),
+                conn.session()?
+                    .load_svd(core, Some(std::path::PathBuf::from(path))),
             )
         })
         .map_err(to_bridge_err)
@@ -700,16 +711,16 @@ impl Session {
                 column: None,
             })
             .collect();
-        let res = py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "resolve breakpoints",
-                conn.session()?.resolve_source_breakpoints(locations),
-            )
-        })
+        let res = py
+            .detach(|| {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "resolve breakpoints",
+                    conn.session()?.resolve_source_breakpoints(locations),
+                )
+            })
             .map_err(to_bridge_err)?;
-        res
-            .into_iter()
+        res.into_iter()
             .map(|r| match r.breakpoint {
                 Some(bp) => py_dict(
                     py,
@@ -928,10 +939,9 @@ fn rich_frame_dict(
     py: Python<'_>,
     frame: &probe_rs_rpc::stack_trace::RichStackTraceFrame,
 ) -> PyResult<PyObject> {
-    let (file, line, column) = frame
-        .location
-        .as_ref()
-        .map_or((None, None, None), |l| (Some(l.file.clone()), l.line, l.column));
+    let (file, line, column) = frame.location.as_ref().map_or((None, None, None), |l| {
+        (Some(l.file.clone()), l.line, l.column)
+    });
     py_dict(
         py,
         vec![

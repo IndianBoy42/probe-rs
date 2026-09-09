@@ -1,9 +1,9 @@
 //! Probe enumeration, opening, and FakeProbe.
 
-use probe_rs_rpc::probe::DebugProbeEntry;
 use crate::error::to_py_err;
 use crate::session::{Permissions, Session};
 use probe_rs::probe::{DebugProbeInfo, Probe, WireProtocol, list::Lister};
+use probe_rs_rpc::probe::DebugProbeEntry;
 use pyo3::prelude::*;
 use std::str::FromStr;
 
@@ -105,7 +105,6 @@ impl ProbeInfo {
         }
     }
 }
-
 
 #[pymethods]
 impl ProbeInfo {
@@ -381,12 +380,15 @@ impl ProbePy {
     ) -> PyResult<Session> {
         // Release the local USB claim before the server opens the probe.
         self.inner.take();
-        let selector = self.selector.clone().map(|sel| probe_rs_rpc::probe::DebugProbeSelector {
-            vendor_id: sel.vendor_id,
-            product_id: sel.product_id,
-            interface: sel.interface,
-            serial_number: sel.serial_number,
-        });
+        let selector = self
+            .selector
+            .clone()
+            .map(|sel| probe_rs_rpc::probe::DebugProbeSelector {
+                vendor_id: sel.vendor_id,
+                product_id: sel.product_id,
+                interface: sel.interface,
+                serial_number: sel.serial_number,
+            });
         crate::session::Session::attach_selected(
             target,
             selector,

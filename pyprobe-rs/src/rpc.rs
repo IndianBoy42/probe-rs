@@ -6,8 +6,8 @@
 //! Every call is wrapped in a deadline: the postcard-rpc host client waits
 //! forever otherwise.
 
-use std::collections::HashMap;
 use parking_lot::{Mutex, MutexGuard};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -74,11 +74,9 @@ impl Bridge {
         F: Future,
     {
         self.rt.block_on(async move {
-            tokio::time::timeout(timeout, fut)
-                .await
-                .map_err(|_| {
-                    BridgeError::Timeout(format!("{op} did not complete within {timeout:?}"))
-                })
+            tokio::time::timeout(timeout, fut).await.map_err(|_| {
+                BridgeError::Timeout(format!("{op} did not complete within {timeout:?}"))
+            })
         })
     }
 }
@@ -120,10 +118,7 @@ struct ConnectionInner {
     session: SessionInterface,
 }
 impl Connection {
-    pub(crate) async fn connect(
-        url: &str,
-        token: Option<&str>,
-    ) -> Result<RpcClient, BridgeError> {
+    pub(crate) async fn connect(url: &str, token: Option<&str>) -> Result<RpcClient, BridgeError> {
         let client = probe_rs_rpc_client::connect(url, token, USER_AGENT)
             .await
             .map_err(|e| BridgeError::from_client(e, Phase::Connect))?;
@@ -205,14 +200,16 @@ impl Connection {
     /// the caller skips its tick instead. Skipping is also semantically
     /// right: while a flash owns the wire, the target is not available for
     /// side reads.
-    pub(crate) fn try_session_clone(
-        &self,
-    ) -> Result<SessionInterface, SessionTryError> {
+    pub(crate) fn try_session_clone(&self) -> Result<SessionInterface, SessionTryError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(SessionTryError::Closed);
         }
         match self.inner.try_lock() {
-            Some(inner) => Ok(inner.as_ref().expect("checked at construction").session.clone()),
+            Some(inner) => Ok(inner
+                .as_ref()
+                .expect("checked at construction")
+                .session
+                .clone()),
             None => Err(SessionTryError::Busy),
         }
     }
@@ -269,7 +266,11 @@ pub(crate) struct SessionRef<'a> {
 impl std::ops::Deref for SessionRef<'_> {
     type Target = SessionInterface;
     fn deref(&self) -> &SessionInterface {
-        &self.guard.as_ref().expect("checked at construction").session
+        &self
+            .guard
+            .as_ref()
+            .expect("checked at construction")
+            .session
     }
 }
 impl Drop for SessionRef<'_> {
@@ -282,7 +283,6 @@ impl Drop for SessionRef<'_> {
         }
     }
 }
-
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -307,10 +307,7 @@ pub(crate) mod test_support {
     /// and `out_frames` (`Receiver::try_recv`) observes every frame the
     /// client emits. Built inside the shared bridge runtime so the client's
     /// dispatch task lands there, as in production.
-    pub(crate) fn silent_wire() -> (
-        Arc<Connection>,
-        tokio::sync::mpsc::Receiver<Vec<u8>>,
-    ) {
+    pub(crate) fn silent_wire() -> (Arc<Connection>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let bridge = Bridge::global().expect("bridge");
         let _enter = bridge.test_enter();
         // Client → server carries the frames under test; server → client is
