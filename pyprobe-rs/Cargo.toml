@@ -14,11 +14,15 @@ name = "pyprobe_rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["extension-module", "espressif"]
+default = ["extension-module", "espressif", "bundled-server"]
 # Wheel builds need the extension feature (maturin uses default features).
 # Tests build without it so the test binaries can link libpython.
 extension-module = ["pyo3/extension-module"]
 espressif = ["dep:probe-rs-espressif"]
+# Embed a schema-locked workspace `probe-rs` server binary (built via
+# `just build-serve-bin`) so a spawned server can never drift from the
+# client protocol. Test builds run without it (`--no-default-features`).
+bundled-server = []
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["abi3-py38"] }
@@ -30,5 +34,7 @@ probe-rs-rpc.workspace = true
 probe-rs-rpc-client = { workspace = true, features = ["remote"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
 
+[build-dependencies]
+sha2 = "0.10"
 [lints]
 workspace = true

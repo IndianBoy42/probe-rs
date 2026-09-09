@@ -62,7 +62,7 @@ macro_use_imports = "deny"
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+
 
 [profile.dev]
 # Keep stack trace data, but no other debug info by default.
@@ -74,6 +74,11 @@ debug = "line-tables-only"
 # For release builds the default is no debuginfo. Let's instead keep the
 # line tables for better backtraces.
 debug = "line-tables-only"
+# Stripped build of the `probe-rs` server binary embedded by pyprobe-rs
+# (see pyprobe-rs/build.rs); built via `just build-serve-bin`.
+[profile.server]
+inherits = "release"
+strip = true
 
 [profile.dev.package.zip]
 # Set the default for zip in development mode so the creation of the zip does not take forever

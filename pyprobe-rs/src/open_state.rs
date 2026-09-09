@@ -140,9 +140,7 @@ pub(crate) fn shutdown_server(force: bool) -> Result<(), BridgeError> {
         // keeps the probe lease after its client died; the only fix is
         // killing that server. The pidfile gate in the manager keeps this
         // from touching anything but a `probe-rs serve` process.
-        s.manager
-            .kill_by_pidfile()
-            .map_err(BridgeError::Connection)
+        s.manager.kill_by_pidfile().map_err(BridgeError::Connection)
     } else {
         Err(BridgeError::Connection(
             "refusing to shut down a server pyprobe-rs did not spawn; \
@@ -173,9 +171,18 @@ pub(crate) fn ensure_server_client() -> Result<RpcClient, BridgeError> {
 
 fn connect_remote(host: &str, token: Option<&str>) -> Result<RpcClient, BridgeError> {
     // Bridge::wait yields the future's own Result; flatten the nesting.
-    Bridge::global()?
-        .wait(CONNECT_TIMEOUT, "connect", Connection::connect(host, token))
-        .and_then(|inner| inner)
+    let attempt = || {
+        Bridge::global()?
+            .wait(CONNECT_TIMEOUT, "connect", Connection::connect(host, token))
+            .and_then(|inner| inner)
+    };
+    match attempt() {
+        Ok(client) => Ok(client),
+        // Same transient-handshake retry as the local path; remote links add
+        // latency, so a spurious first-failure must not surface to users.
+        Err(e @ BridgeError::ServerVersion(_)) => attempt().map_err(|_| e),
+        Err(e) => Err(e),
+    }
 }
 
 fn connect_local() -> Result<RpcClient, BridgeError> {
@@ -193,12 +200,23 @@ fn connect_local() -> Result<RpcClient, BridgeError> {
     match attempt() {
         Ok(client) => Ok(client),
         Err(e @ BridgeError::ServerVersion(_)) => {
-            // A schema mismatch on a server we spawned means a stale binary
-            // from an older build; restarting picks up the current one.
-            if heal_restart().is_ok() {
-                attempt()
-            } else {
-                Err(e)
+            // Upstream maps transient handshake losses (LostData / task
+            // errors on a fresh fast connection) to the same
+            // `IncompatibleServer` error as a real schema mismatch, so one
+            // immediate retry precedes anything destructive.
+            match attempt() {
+                Ok(client) => Ok(client),
+                Err(e2 @ BridgeError::ServerVersion(_)) => {
+                    // Persistent mismatch on a server we spawned means a
+                    // stale binary from an older build; restarting picks up
+                    // the current one.
+                    if heal_restart().is_ok() {
+                        attempt().map_err(|_| e2)
+                    } else {
+                        Err(e2)
+                    }
+                }
+                Err(other) => Err(other),
             }
         }
         // A server that answered the readiness probe can die before the
@@ -221,8 +239,7 @@ pub(crate) fn heal_restart() -> Result<(), BridgeError> {
     let mut s = state().lock();
     if !s.manager.spawned_by_us() {
         return Err(BridgeError::ProbeBusy(
-            "cannot restart a server pyprobe-rs did not spawn; stop the other client first"
-                .into(),
+            "cannot restart a server pyprobe-rs did not spawn; stop the other client first".into(),
         ));
     }
     s.manager.kill();
@@ -248,7 +265,9 @@ fn manager_err(e: ManagerError) -> BridgeError {
     use ManagerError as M;
     match e {
         M::BinaryNotFound => BridgeError::Connection(
-            "probe-rs binary not found; install probe-rs or point PYPROBE_RS_BIN at it".into(),
+            "probe-rs server binary not found; run `just build-serve-bin` \
+             or point PYPROBE_RS_BIN at a built `probe-rs` executable"
+                .into(),
         ),
         M::Spawn(e) => BridgeError::Connection(format!("failed to spawn probe-rs serve: {e}")),
         M::ReadinessTimeout => BridgeError::Connection(

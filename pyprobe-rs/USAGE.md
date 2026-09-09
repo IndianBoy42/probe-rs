@@ -40,8 +40,10 @@ maturin develop --release      # into the active virtualenv
 The `espressif` chip-support plugin is enabled by default
 (`maturin develop --features espressif` is implied).
 
-The installed package needs a `probe-rs` CLI binary (it is the RPC server);
-see [Server lifecycle](#server-lifecycle) for how it is resolved.
+The installed package carries a matching `probe-rs` server binary (the RPC
+server) embedded in the extension — no system install is needed. See
+[Server lifecycle](#server-lifecycle) for the resolution order and the
+`PYPROBE_RS_BIN` override.
 
 ## Execution model
 
@@ -101,10 +103,14 @@ its own fake probe and claims no device. The direct form is
   `pr.open()` is called again without arguments.
 
 The binary is resolved in this order: the `PYPROBE_RS_BIN` environment
-variable (ignored if it does not point at a file) → this workspace's
-`target/{debug,release}/probe-rs` → `PATH`. A stale binary from an older
-build is caught by the RPC schema handshake; on a server pyprobe-rs spawned,
-it is restarted once to pick up the current one.
+variable (ignored if it does not point at a file) → the server binary
+embedded in the package (a stripped workspace build, materialized once into
+the per-user runtime directory) → this workspace's
+`target/{server,release,debug}/probe-rs`. `PATH` is deliberately never
+consulted: the RPC protocol is version-unstable by design, so a foreign
+binary can pass a schema handshake yet behave differently. A stale binary
+from an older build is caught by the RPC schema handshake; on a server
+pyprobe-rs spawned, it is restarted once to pick up the current one.
 
 Lifecycle handles:
 
@@ -854,7 +860,7 @@ Two pytest suites cover the no-hardware surface:
   surface shapes, and the asyncio wrapper.
 
 ```bash
-uv run pytest tests/        # needs the probe-rs binary; no hardware needed
+uv run pytest tests/        # no hardware needed; uses the embedded server when present
 ```
 
 ```bash

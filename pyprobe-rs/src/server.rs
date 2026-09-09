@@ -13,10 +13,10 @@
 #![cfg(unix)]
 
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use std::os::unix::process::CommandExt;
 /// Lines kept in the child-output ring; older lines drop first.
 const LOG_RING_LINES: usize = 200;
 /// Poll interval while waiting for the server socket to open.
@@ -37,7 +37,7 @@ pub(crate) enum EnsureOutcome {
 /// Why the server could not be delivered ready. Every message names the fix.
 #[derive(Debug)]
 pub(crate) enum ManagerError {
-    /// No `probe-rs` executable found (env override, workspace target dirs, PATH).
+    /// No `probe-rs` executable found (env override, embedded copy, workspace target dirs).
     BinaryNotFound,
     /// The child could not be spawned at all.
     Spawn(std::io::Error),
@@ -52,12 +52,15 @@ impl std::fmt::Display for ManagerError {
         match self {
             Self::BinaryNotFound => write!(
                 f,
-                "no probe-rs server binary found (checked PYPROBE_RS_BIN, \
-                 workspace target/{{debug,release}}, PATH); \
-                 set PYPROBE_RS_BIN to a built `probe-rs` executable"
+                "no probe-rs server binary found (checked PYPROBE_RS_BIN, the embedded \
+                 binary, and workspace target/{{server,release,debug}}); run \
+                 `just build-serve-bin` or set PYPROBE_RS_BIN to a built `probe-rs` executable"
             ),
             Self::Spawn(e) => {
-                write!(f, "failed to spawn the probe-rs server ({e}); check the PYPROBE_RS_BIN path")
+                write!(
+                    f,
+                    "failed to spawn the probe-rs server ({e}); check the PYPROBE_RS_BIN path"
+                )
             }
             Self::ReadinessTimeout => write!(
                 f,
@@ -65,7 +68,10 @@ impl std::fmt::Display for ManagerError {
                  inspect the server logs for its startup crash"
             ),
             Self::Config(e) => {
-                write!(f, "failed to write the generated server config ({e}); check that the runtime dir is writable")
+                write!(
+                    f,
+                    "failed to write the generated server config ({e}); check that the runtime dir is writable"
+                )
             }
         }
     }
@@ -133,10 +139,19 @@ impl ServerManager {
         )
     }
 
-    /// Binary resolution order: `PYPROBE_RS_BIN` → workspace
-    /// `target/{debug,release}/probe-rs` → PATH. An env override that does not
-    /// exist falls through rather than hard-failing; binary drift is caught by
-    /// the bridge's schema handshake.
+    /// The workspace `probe-rs` server binary embedded at build time; empty
+    /// when the `bundled-server` feature is off or no binary had been built.
+    #[cfg(feature = "bundled-server")]
+    const EMBEDDED: &[u8] = include_bytes!(env!("PYPROBE_RS_EMBED"));
+    #[cfg(feature = "bundled-server")]
+    const EMBEDDED_SHA: &str = env!("PYPROBE_RS_EMBED_SHA");
+
+    /// Binary resolution order: `PYPROBE_RS_BIN` → the embedded server
+    /// binary (feature `bundled-server`) → workspace
+    /// `target/{server,release,debug}/probe-rs`. `PATH` is deliberately not
+    /// consulted: the RPC protocol is version-unstable, so only a binary
+    /// built from this source tree is schema-guaranteed; a foreign `probe-rs`
+    /// can pass the handshake yet behave differently.
     pub(crate) fn resolve_binary() -> Option<PathBuf> {
         if let Some(bin) = std::env::var_os("PYPROBE_RS_BIN") {
             let bin = PathBuf::from(bin);
@@ -144,20 +159,50 @@ impl ServerManager {
                 return Some(bin);
             }
         }
+        #[cfg(feature = "bundled-server")]
+        if let Some(bin) = Self::extract_embedded() {
+            return Some(bin);
+        }
         // The workspace root is the parent of this crate dir; a sibling build
         // of the same checkout is the cheapest drift-checked default.
         if let Some(root) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
-            for profile in ["debug", "release"] {
+            for profile in ["server", "release", "debug"] {
                 let bin = root.join("target").join(profile).join("probe-rs");
                 if bin.is_file() {
                     return Some(bin);
                 }
             }
         }
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("probe-rs"))
-            .find(|bin| bin.is_file())
+        None
+    }
+
+    /// Materialize the embedded server binary under the private dir and
+    /// return its path. `None` when nothing was embedded. Idempotent: a
+    /// file with the right size and exec bits is reused; otherwise a
+    /// pid-suffixed temp file is written, chmodded, and atomically renamed
+    /// into place (POSIX rename replaces the destination), so concurrent
+    /// processes converge on a complete file.
+    #[cfg(feature = "bundled-server")]
+    fn extract_embedded() -> Option<PathBuf> {
+        if Self::EMBEDDED.is_empty() {
+            return None;
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dest = Self::private_dir()
+            .join("bin")
+            .join(format!("probe-rs-{}", &Self::EMBEDDED_SHA[..8]));
+        #[allow(clippy::unnecessary_cast)] // m.len() is u64, EMBEDDED.len() is usize
+        let usable = std::fs::metadata(&dest)
+            .map(|m| m.len() as usize == Self::EMBEDDED.len() && m.mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if !usable {
+            std::fs::create_dir_all(dest.parent().unwrap()).ok()?;
+            let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+            std::fs::write(&tmp, Self::EMBEDDED).ok()?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok()?;
+            std::fs::rename(&tmp, &dest).ok()?;
+        }
+        Some(dest)
     }
 
     /// Raw transport probe: can we connect to the unix socket right now? This
@@ -248,8 +293,9 @@ impl ServerManager {
     /// Returns an error when there is no pidfile (a server not spawned by any
     /// pyprobe-rs manager) or the pid is not a probe-rs serve process.
     pub(crate) fn kill_by_pidfile(&mut self) -> Result<(), String> {
-        let text = std::fs::read_to_string(self.pidfile_path())
-            .map_err(|_| "no server pidfile: this server was not spawned by pyprobe-rs".to_string())?;
+        let text = std::fs::read_to_string(self.pidfile_path()).map_err(|_| {
+            "no server pidfile: this server was not spawned by pyprobe-rs".to_string()
+        })?;
         let pid: u32 = text
             .lines()
             .next()
@@ -258,8 +304,7 @@ impl ServerManager {
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
             .map_err(|_| format!("pid {pid} from the server pidfile no longer exists"))?;
         let argv: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
-        let is_serve = argv.iter().any(|a| a.ends_with("probe-rs"))
-            && argv.contains(&"serve");
+        let is_serve = argv.iter().any(|a| a.ends_with("probe-rs")) && argv.contains(&"serve");
         if !is_serve {
             return Err(format!(
                 "pid {pid} from the server pidfile is not a `probe-rs serve` process; \
@@ -377,9 +422,10 @@ fn current_uid() -> String {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:")
-                && let Some(real) = rest.split_whitespace().next() {
-                    return real.to_string();
-                }
+                && let Some(real) = rest.split_whitespace().next()
+            {
+                return real.to_string();
+            }
         }
     }
     // Non-Linux unix: $USER keeps the dir per-user (where XDG_RUNTIME_DIR
@@ -415,7 +461,6 @@ mod tests {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock()
     }
-
 
     /// One isolated env + dir sandbox per test. Created and dropped while the
     /// env lock is held.
@@ -501,8 +546,8 @@ mod tests {
             // lifetime cap so a broken test cannot leak a parker forever.
             "bind" => {
                 let _ = std::fs::remove_file(&sock);
-                let listener = std::os::unix::net::UnixListener::bind(&sock)
-                    .expect("stub: bind socket");
+                let listener =
+                    std::os::unix::net::UnixListener::bind(&sock).expect("stub: bind socket");
                 println!("pyprobe-stub listening");
                 for _ in 0..300 {
                     let _ = listener.accept();
@@ -538,38 +583,93 @@ mod tests {
         let _sb = sandbox("bind");
         let m = ServerManager::new();
         m.write_config().expect("write config");
-        let text =
-            std::fs::read_to_string(m.dir.join(".probe-rs.toml")).expect("config readable");
-        assert_eq!(text, format!("[server]\naddress = \"{}\"\n", m.socket_url()));
+        let text = std::fs::read_to_string(m.dir.join(".probe-rs.toml")).expect("config readable");
+        assert_eq!(
+            text,
+            format!("[server]\naddress = \"{}\"\n", m.socket_url())
+        );
         // No `users` key: unix-socket mode performs no auth and grants all.
         assert!(!text.contains("users"));
     }
-
     #[test]
-    fn server_binary_resolution_env_and_path() {
+    fn server_binary_resolution_env_and_workspace() {
         let _g = env_lock();
         let sb = sandbox("bind");
-        // An env override that exists wins over everything.
+        // An env override that exists wins over everything — including the
+        // embedded copy and the workspace binaries.
         assert_eq!(ServerManager::resolve_binary(), Some(sb.script.clone()));
         // An env override that does not exist falls through.
         unsafe { std::env::set_var("PYPROBE_RS_BIN", sb.dir.join("missing-bin")) };
-        // With the override gone and PATH empty, only the workspace bins can
-        // answer; none exist in a bare checkout.
+        // PATH is no longer consulted at all: point it at a directory with a
+        // `probe-rs` stub and assert it is ignored.
         unsafe {
+            use std::os::unix::fs::PermissionsExt;
             std::env::remove_var("PYPROBE_RS_BIN");
-            let empty = sb.dir.join("empty-path");
-            std::fs::create_dir_all(&empty).unwrap();
-            std::env::set_var("PATH", &empty);
+            let fake = sb.dir.join("fake-path");
+            std::fs::create_dir_all(&fake).unwrap();
+            let stub = fake.join("probe-rs");
+            std::fs::write(&stub, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::env::set_var("PATH", &fake);
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .to_path_buf();
-        let ws = ["debug", "release"]
+        let ws = ["server", "release", "debug"]
             .iter()
             .map(|p| root.join("target").join(p).join("probe-rs"))
             .find(|b| b.is_file());
-        assert_eq!(ServerManager::resolve_binary(), ws);
+        let resolved = ServerManager::resolve_binary();
+        #[cfg(feature = "bundled-server")]
+        if !ServerManager::EMBEDDED.is_empty() {
+            // The embedded copy exists in this build: it wins over both the
+            // (ignored) PATH stub and any workspace binary.
+            let path = resolved.expect("embedded copy resolves");
+            assert!(path.starts_with(ServerManager::private_dir()));
+            return;
+        }
+        match (ws, resolved) {
+            // Dev checkout with a workspace build: it must win over PATH.
+            (Some(_), Some(resolved)) => assert!(resolved.starts_with(&root)),
+            // Bare checkout: resolution must fail rather than hit PATH.
+            (None, None) => {}
+            other => panic!("unexpected resolution {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "bundled-server")]
+    #[test]
+    fn embedded_server_extracts_idempotently() {
+        use std::os::unix::fs::MetadataExt;
+        let _g = env_lock();
+        let _sb = sandbox("embed");
+        let bin = ServerManager::extract_embedded();
+        if ServerManager::EMBEDDED.is_empty() {
+            assert!(bin.is_none(), "empty embed must resolve to None");
+            return;
+        }
+        let bin = bin.expect("non-empty embed extracts");
+        let meta = std::fs::metadata(&bin).expect("extracted file exists");
+        #[allow(clippy::unnecessary_cast)] // m.len() is u64, EMBEDDED.len() is usize
+        {
+            assert_eq!(meta.len() as usize, ServerManager::EMBEDDED.len());
+        }
+        assert_ne!(meta.mode() & 0o111, 0, "extracted binary is executable");
+        assert_eq!(
+            bin.file_name().and_then(|n| n.to_str()),
+            Some(format!("probe-rs-{}", &ServerManager::EMBEDDED_SHA[..8]).as_str())
+        );
+        // A second call must reuse the extracted file, not rewrite it.
+        let mtime = meta.modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let bin2 = ServerManager::extract_embedded().expect("re-extract");
+        assert_eq!(bin, bin2);
+        assert_eq!(
+            std::fs::metadata(&bin2).unwrap().modified().unwrap(),
+            mtime,
+            "usable file must be reused, not rewritten"
+        );
     }
 
     #[test]
@@ -663,7 +763,11 @@ mod tests {
         // Same signature, now-dead pid: never ours.
         assert!(!m.is_ours());
         // Right pid (this test process), wrong dir: not ours.
-        std::fs::write(&pidfile, format!("{}\n/somewhere/else\n", std::process::id())).unwrap();
+        std::fs::write(
+            &pidfile,
+            format!("{}\n/somewhere/else\n", std::process::id()),
+        )
+        .unwrap();
         assert!(!m.is_ours());
         // Garbage pidfile: not ours.
         std::fs::write(&pidfile, "garbage\n").unwrap();
