@@ -18,6 +18,9 @@ use pyo3::types::PyBytes;
 use tokio::time::{MissedTickBehavior, timeout};
 
 use crate::error::to_bridge_err;
+use probe_rs_rpc_client::SessionInterface;
+use std::collections::HashMap;
+
 use crate::rpc::{Bridge, Connection, SessionTryError};
 
 /// Host-side ring capacity per streamed channel (drop-oldest).
@@ -206,6 +209,7 @@ async fn poll_loop(
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) {
+    let mut health: HashMap<u32, ChannelHealth> = HashMap::new();
     // Bridge deadline: scaled with the poll interval (bounded below by 1 s),
     // so a slow server stalls the loop instead of erroring it out.
     let deadline = (interval * 2).max(Duration::from_secs(1));
@@ -230,32 +234,62 @@ async fn poll_loop(
         // is not available for side reads; the ring catches up afterwards.
         let session = match conn.try_session_clone() {
             Ok(s) => s,
-            Err(SessionTryError::Busy) => continue,
+            Err(SessionTryError::Busy | SessionTryError::Unavailable) => continue,
             Err(SessionTryError::Closed) => break,
         };
         let poll = session.poll_rtt_up(rtt, numbers);
         match timeout(deadline, poll).await {
             Ok(Ok(results)) => {
                 last_warn = None;
+                let mut probe = false;
                 'results: for result in results {
-                    let Ok(data) = result.result else {
-                        // Per-channel failure: the server already logged it.
-                        continue;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
                     let Some(channel) = channels.iter().find(|c| c.number == result.channel) else {
                         continue;
                     };
-                    channel.ring.push(&data);
-                    // Re-check after the await: stop_streaming()/close() must
-                    // not be followed by new deliveries.
-                    if stop.load(Ordering::SeqCst) || conn.is_closed() {
-                        break 'results;
+                    match result.result {
+                        Ok(data) => {
+                            health
+                                .entry(result.channel)
+                                .or_default()
+                                .record_success(result.channel, &mut last_warn);
+                            if data.is_empty() {
+                                continue;
+                            }
+                            channel.ring.push(&data);
+                            // Re-check after the await: stop_streaming()/close()
+                            // must not be followed by new deliveries.
+                            if stop.load(Ordering::SeqCst) || conn.is_closed() {
+                                break 'results;
+                            }
+                            if let Some(pump) = &pump {
+                                pump.send((result.channel, data));
+                            }
+                        }
+                        Err(e) => {
+                            probe |= health.entry(result.channel).or_default().record_failure(
+                                result.channel,
+                                &e.to_string(),
+                                &mut last_warn,
+                            );
+                        }
                     }
-                    if let Some(pump) = &pump {
-                        pump.send((result.channel, data));
+                }
+                // A subscribed channel failed persistently: ask the server
+                // for the fresh channel list — this also re-attaches the
+                // control block server-side — and warn once when the channel
+                // is gone (target reset into a different build).
+                if probe {
+                    match timeout(
+                        deadline,
+                        probe_channels(&session, rtt, &channels, &mut health),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn_later(
+                            &mut last_warn,
+                            format!("RTT channel probe did not complete within {deadline:?}"),
+                        ),
                     }
                 }
             }
@@ -276,6 +310,95 @@ async fn poll_loop(
         }
     }
     running.store(false, Ordering::Relaxed);
+}
+
+/// Per-channel failure tracking for the poller's visibility layer.
+///
+/// The server re-attaches the RTT control block on every poll
+/// (`RttClient::poll_channel` → `try_attach`), so transient failures —
+/// target booting, control block re-initialized by an unexpected reset —
+/// heal silently. What must stay VISIBLE is the quiet window itself: a
+/// channel that starts failing, keeps failing, or comes back. A channel
+/// that stays failed for [`STALE_CHANNEL_TICKS`] triggers a channel-list
+/// probe: a fresh `get_rtt_channels` re-attaches server-side and tells us
+/// whether the subscribed channel number still exists at all.
+#[derive(Default)]
+struct ChannelHealth {
+    failures: u32,
+    last_error: Option<String>,
+    reported_missing: bool,
+}
+
+/// Consecutive failed polls before the channel list is probed (25 x 20 ms
+/// default interval = 500 ms of silence).
+const STALE_CHANNEL_TICKS: u32 = 25;
+/// Re-probe cadence after the first probe (250 ticks = 5 s at 20 ms).
+const STALE_CHANNEL_REPROBE: u32 = 250;
+
+impl ChannelHealth {
+    fn record_success(&mut self, channel: u32, last_warn: &mut Option<Instant>) {
+        if self.failures > 0 {
+            warn_later(
+                last_warn,
+                format!("RTT channel {channel} is streaming again"),
+            );
+        }
+        self.failures = 0;
+        self.last_error = None;
+        self.reported_missing = false;
+    }
+
+    /// Record one failed poll. Warns on failure transitions (rate-limited);
+    /// returns true when the channel list should be probed (persistent
+    /// failure, cooldown elapsed).
+    fn record_failure(
+        &mut self,
+        channel: u32,
+        error: &str,
+        last_warn: &mut Option<Instant>,
+    ) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        let changed = self.last_error.as_deref() != Some(error);
+        self.last_error = Some(error.to_string());
+        if changed {
+            warn_later(last_warn, format!("RTT channel {channel}: {error}"));
+        }
+        self.failures >= STALE_CHANNEL_TICKS
+            && (self.failures == STALE_CHANNEL_TICKS
+                || (self.failures - STALE_CHANNEL_TICKS).is_multiple_of(STALE_CHANNEL_REPROBE))
+    }
+}
+
+/// Probe the server's channel list for a persistently failing channel set:
+/// re-attaches the control block server-side and warns once per channel
+/// that no longer exists (target reset into a different build). Data on
+/// surviving channels resumes via the normal poll path.
+async fn probe_channels(
+    session: &SessionInterface,
+    rtt: Key<RttClient>,
+    channels: &[SubscribedChannel],
+    health: &mut HashMap<u32, ChannelHealth>,
+) {
+    let list = match session.get_rtt_channels(rtt).await {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("pyprobe-rs: RTT channel probe failed: {e}");
+            return;
+        }
+    };
+    for channel in channels {
+        let exists = list.up.iter().any(|m| m.number == channel.number);
+        let state = health.entry(channel.number).or_default();
+        if !exists && !state.reported_missing {
+            state.reported_missing = true;
+            eprintln!(
+                "pyprobe-rs: RTT channel {0} no longer exists in the control \
+                 block (target reset into a different build?); re-attach via \
+                 Session.attach_rtt() to pick up the new channel set",
+                channel.number
+            );
+        }
+    }
 }
 
 /// Forward one chunk to the Python callback. Exceptions are printed and
@@ -308,6 +431,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn channel_failure_transitions_drive_probes() {
+        let mut last_warn = None;
+        let mut health = ChannelHealth::default();
+        // First failure: warn-worthy transition, far from the probe threshold.
+        assert!(!health.record_failure(0, "control block not found", &mut last_warn));
+        assert_eq!(health.failures, 1);
+        // Same error repeated: quiet until the threshold.
+        for _ in 0..STALE_CHANNEL_TICKS - 2 {
+            assert!(!health.record_failure(0, "control block not found", &mut last_warn));
+        }
+        // Threshold reached: probe the channel list.
+        assert!(health.record_failure(0, "control block not found", &mut last_warn));
+        // Cooldown ticks between probes.
+        assert!(!health.record_failure(0, "control block not found", &mut last_warn));
+        for _ in 0..STALE_CHANNEL_REPROBE - 2 {
+            health.record_failure(0, "control block not found", &mut last_warn);
+        }
+        assert!(health.record_failure(0, "control block not found", &mut last_warn));
+        // Recovery resets everything: the next failure starts from scratch.
+        health.record_success(0, &mut last_warn);
+        assert_eq!(health.failures, 0);
+        assert!(!health.record_failure(0, "control block not found", &mut last_warn));
+    }
+
+    #[test]
+    fn error_change_rewarns_without_resetting_the_streak() {
+        let mut last_warn = None;
+        let mut health = ChannelHealth::default();
+        for _ in 0..STALE_CHANNEL_TICKS - 1 {
+            health.record_failure(0, "control block not found", &mut last_warn);
+        }
+        // A different error text is a new transition but the channel is
+        // still persistently failing — the probe fires at the threshold
+        // tick with the new error text.
+        assert!(health.record_failure(0, "read pointer changed", &mut last_warn));
+        assert_eq!(health.failures, STALE_CHANNEL_TICKS);
+    }
+
     #[test]
     fn pump_shared_stop_flag_ends_delivery() {
         let stop = Arc::new(AtomicBool::new(false));

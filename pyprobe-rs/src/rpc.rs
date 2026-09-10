@@ -8,19 +8,38 @@
 
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use probe_rs_rpc::probe::{AttachRequest, AttachResult};
 use probe_rs_rpc_client::{ClientError, RpcClient, SessionInterface};
 
-use crate::error::{BridgeError, Phase};
+use crate::error::{BridgeError, Phase, is_fatal_recoverable};
+use crate::open_state;
 
 /// Default deadline for bridge calls that pass no explicit timeout.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const USER_AGENT: &str = concat!("pyprobe-rs/", env!("CARGO_PKG_VERSION"));
+
+/// Minimum time a reattach waits for the probe lease. The failed
+/// operation's server-side future may still be winding down when the old
+/// transport drops; the lease is released once it does.
+const REATTACH_LEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// How to rebuild the transport after a dead probe/target link: the same
+/// server this connection originally used.
+#[derive(Clone)]
+pub(crate) enum ConnSource {
+    /// Reconnect through the module's server manager (spawned-local mode).
+    Local,
+    /// Reconnect to the same remote host.
+    Remote { host: String, token: Option<String> },
+}
 
 /// Shared async runtime for all RPC connections.
 pub(crate) struct Bridge {
@@ -98,7 +117,8 @@ where
 pub(crate) struct Connection {
     /// Transport + attached session; `None` once severed. Handles keep
     /// `Arc<Connection>` alive after `close()`, so the transport must be
-    /// droppable independently of this struct's lifetime.
+    /// droppable independently of this struct's lifetime. Also `None`
+    /// transiently while a reattach rebuilds it.
     inner: Mutex<Option<ConnectionInner>>,
     /// Hardware breakpoints set through the facade, per core index. The flash
     /// path re-applies them after a reflash because a reset can clear the
@@ -110,8 +130,18 @@ pub(crate) struct Connection {
     /// Attach-time dry_run: the session runs on a mocked core, so the flash
     /// path skips the boot step (a boot sequence just times out on it).
     pub(crate) dry_run: bool,
+    /// Where to rebuild the transport from after a dead-link failure.
+    source: ConnSource,
+    /// The attach request this connection was built with; reused by
+    /// [`Connection::reattach`] so the rebuilt session keeps the original
+    /// attach policy (chip, speed, permissions, dry-run).
+    request: AttachRequest,
+    /// DWARF file pushed via `load_debug_info`; re-pushed after a reattach
+    /// because the debug state lives in the (new) server session.
+    pub(crate) debug_info: Mutex<Option<PathBuf>>,
+    /// One-shot guard: automatic dead-link recovery already ran.
+    recovered: AtomicBool,
 }
-
 /// Transport and session, dropped as a unit by `sever`. The client lives
 /// only inside the `SessionInterface`; nothing reads it separately.
 struct ConnectionInner {
@@ -132,22 +162,34 @@ impl Connection {
     pub(crate) async fn attach(
         client: RpcClient,
         request: AttachRequest,
+        source: ConnSource,
     ) -> Result<Self, BridgeError> {
         let dry_run = request.dry_run;
+        let session = Self::attach_session(client.clone(), request.clone()).await?;
+        Ok(Self {
+            inner: Mutex::new(Some(ConnectionInner { session })),
+            breakpoints: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            dry_run,
+            source,
+            request,
+            debug_info: Mutex::new(None),
+            recovered: AtomicBool::new(false),
+        })
+    }
+
+    /// Attach and map the wire result onto a session or a bridge error.
+    /// Shared by [`Connection::attach`] and [`Connection::reattach`].
+    async fn attach_session(
+        client: RpcClient,
+        request: AttachRequest,
+    ) -> Result<SessionInterface, BridgeError> {
         let result = client
             .attach_probe(request)
             .await
             .map_err(|e| BridgeError::from_client(e, Phase::Call))?;
         match result {
-            AttachResult::Success(sessid) => {
-                let session = SessionInterface::new(client.clone(), sessid);
-                Ok(Self {
-                    inner: Mutex::new(Some(ConnectionInner { session })),
-                    breakpoints: Mutex::new(HashMap::new()),
-                    closed: AtomicBool::new(false),
-                    dry_run,
-                })
-            }
+            AttachResult::Success(sessid) => Ok(SessionInterface::new(client, sessid)),
             AttachResult::ProbeInUse => Err(BridgeError::ProbeBusy(
                 "the probe is claimed by another session on this server; close \
                  that session first (pyprobe_rs.close_all() closes every session \
@@ -180,7 +222,6 @@ impl Connection {
             }
         }
     }
-
     /// Borrow the live transport's session. Errors once the connection is
     /// severed; the borrow keeps the transport alive for the call's duration.
     /// Blocking by design: the connection is one wire, and the exclusive
@@ -205,15 +246,15 @@ impl Connection {
             return Err(SessionTryError::Closed);
         }
         match self.inner.try_lock() {
-            Some(inner) => Ok(inner
-                .as_ref()
-                .expect("checked at construction")
-                .session
-                .clone()),
+            Some(inner) => match inner.as_ref() {
+                Some(state) => Ok(state.session.clone()),
+                // Transient: a reattach is rebuilding the transport; the
+                // next tick observes the new session.
+                None => Err(SessionTryError::Unavailable),
+            },
             None => Err(SessionTryError::Busy),
         }
     }
-
     /// Sever the transport: later calls fail fast and the server releases
     /// the probe lease (the RPC session drops with the connection) even
     /// while handles keep this `Arc` alive. Idempotent.
@@ -232,6 +273,103 @@ impl Connection {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    /// Rebuild the transport and the attached session after a dead
+    /// probe/target link (target power cycle, USB replug).
+    ///
+    /// The old transport is dropped first: the server releases the probe
+    /// lease when the client disconnects. The attach then waits for the
+    /// lease (`REATTACH_LEASE_WAIT`) because the failed operation's
+    /// server-side future may still be winding down. Session-resident state
+    /// (DWARF debug info, hardware breakpoints) is restored afterwards; a
+    /// failure there is logged, not raised — the retried operation surfaces
+    /// what actually matters. `closed` is never touched: event pollers
+    /// observe the swapped transport on their next tick. Blocking; run with
+    /// the GIL released on a plain thread.
+    pub(crate) fn reattach(&self, deadline: Duration) -> Result<(), BridgeError> {
+        let mut request = self.request.clone();
+        if request
+            .wait_for_probe
+            .is_none_or(|w| w < REATTACH_LEASE_WAIT)
+        {
+            request.wait_for_probe = Some(REATTACH_LEASE_WAIT);
+        }
+        self.inner.lock().take();
+        let client = match &self.source {
+            ConnSource::Local => open_state::ensure_server_client(),
+            ConnSource::Remote { host, token } => {
+                open_state::connect_remote(host, token.as_deref())
+            }
+        }?;
+        let session = Bridge::global()?.wait(
+            deadline,
+            "reattach",
+            Self::attach_session(client, request),
+        )??;
+        *self.inner.lock() = Some(ConnectionInner {
+            session: session.clone(),
+        });
+        if let Some(path) = self.debug_info.lock().clone() {
+            let _ = Bridge::global()?.wait(
+                deadline.min(DEFAULT_TIMEOUT),
+                "reattach: reload debug info",
+                session.load_debug_info(path),
+            );
+        }
+        let breakpoints: Vec<(u32, Vec<u64>)> = self
+            .breakpoints
+            .lock()
+            .iter()
+            .filter(|(_, addresses)| !addresses.is_empty())
+            .map(|(core, addresses)| (*core, addresses.clone()))
+            .collect();
+        for (core, addresses) in breakpoints {
+            let _ = Bridge::global()?.wait(
+                DEFAULT_TIMEOUT,
+                "reattach: reapply breakpoints",
+                session.core(core as usize).set_hw_breakpoints(addresses),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Run one facade RPC with one-shot dead-link recovery.
+///
+/// `call` performs one full blocking attempt (an `rpc_call` whose
+/// `conn.session()` temporary holds the wire guard for its duration). When
+/// the failure classifies as a recoverable dead link — target power cycle,
+/// USB replug ([`is_fatal_recoverable`]) — the session is reattached once
+/// and the call retried. Every later dead-link failure surfaces unchanged:
+/// one automatic recovery absorbs a transient rig glitch without hiding a
+/// persistently broken one. Must run with the GIL released on a plain
+/// thread (reattach blocks on the bridge runtime).
+pub(crate) fn call_with_recovery<T, M>(
+    conn: &Arc<Connection>,
+    timeout: Duration,
+    op: &str,
+    call: M,
+) -> Result<T, BridgeError>
+where
+    M: Fn() -> Result<T, BridgeError>,
+{
+    match call() {
+        Err(BridgeError::Rpc(msg, kind))
+            if is_fatal_recoverable(kind, &msg)
+                && !conn.closed.load(Ordering::SeqCst)
+                && !conn.recovered.swap(true, Ordering::SeqCst) =>
+        {
+            if let Err(re) = conn.reattach(timeout.max(DEFAULT_TIMEOUT)) {
+                return Err(BridgeError::Rpc(
+                    format!("{msg}; recovery reattach failed: {re}"),
+                    kind,
+                ));
+            }
+            eprintln!("pyprobe-rs: probe link lost during {op}; reattached and retried");
+            call()
+        }
+        other => other,
+    }
 }
 
 /// Borrow the inner transport or classify a severed connection.
@@ -240,11 +378,19 @@ fn live_inner<'a>(
 ) -> Result<MutexGuard<'a, Option<ConnectionInner>>, BridgeError> {
     let guard = conn.inner.lock();
     if guard.is_none() {
-        return Err(BridgeError::Connection(
-            "this session is closed (Session.close() or pyprobe_rs.close_all() \
-             ran); attach a new session"
-                .into(),
-        ));
+        return Err(if conn.closed.load(Ordering::SeqCst) {
+            BridgeError::Connection(
+                "this session is closed (Session.close() or pyprobe_rs.close_all() \
+                 ran); attach a new session"
+                    .into(),
+            )
+        } else {
+            BridgeError::Connection(
+                "this session is reattaching after a probe failure; retry \
+                 the call in a moment"
+                    .into(),
+            )
+        });
     }
     Ok(guard)
 }
@@ -253,10 +399,11 @@ fn live_inner<'a>(
 pub(crate) enum SessionTryError {
     /// A call is in flight; retry on the next tick.
     Busy,
+    /// The transport is being rebuilt (reattach); retry on the next tick.
+    Unavailable,
     /// The connection is severed.
     Closed,
 }
-
 /// Borrow of the transport valid for one call's duration. At most one of
 /// these exists at a time (the mutex guard is exclusive).
 pub(crate) struct SessionRef<'a> {
@@ -288,6 +435,29 @@ impl Drop for SessionRef<'_> {
 pub(crate) mod test_support {
     use super::*;
     use std::sync::Arc;
+
+    /// A minimal attach request for test connections; never sent anywhere.
+    fn test_attach_request() -> AttachRequest {
+        AttachRequest {
+            chip: Some("test".into()),
+            protocol: None,
+            probe: probe_rs_rpc::probe::DebugProbeEntry {
+                identifier: "test".into(),
+                vendor_id: 0,
+                product_id: 0,
+                interface: None,
+                serial_number: "test".into(),
+                probe_type: "test".into(),
+                inaccessible: false,
+            },
+            speed: None,
+            connect_under_reset: false,
+            dry_run: true,
+            allow_erase_all: false,
+            resume_target: false,
+            wait_for_probe: None,
+        }
+    }
     pub(crate) fn for_tests() -> Arc<Connection> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -301,6 +471,10 @@ pub(crate) mod test_support {
             breakpoints: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             dry_run: true,
+            source: ConnSource::Local,
+            request: test_attach_request(),
+            debug_info: Mutex::new(None),
+            recovered: AtomicBool::new(false),
         })
     }
     /// A live connection whose wire ends are exposed: nothing ever replies,
@@ -325,6 +499,10 @@ pub(crate) mod test_support {
                 breakpoints: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
                 dry_run: true,
+                source: ConnSource::Local,
+                request: test_attach_request(),
+                debug_info: Mutex::new(None),
+                recovered: AtomicBool::new(false),
             }),
             out_rx,
         )

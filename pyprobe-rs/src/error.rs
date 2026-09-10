@@ -96,8 +96,10 @@ pub(crate) enum BridgeError {
     Attach(String, &'static str),
     /// A bridge call exceeded its deadline.
     Timeout(String),
-    /// The server reported a target-level failure.
-    Rpc(String),
+    /// The server reported a target-level failure. The second field is the
+    /// best-effort Python `.kind` classified from the error string (the wire
+    /// carries no structured error kind).
+    Rpc(String, &'static str),
 }
 
 impl std::fmt::Display for BridgeError {
@@ -127,7 +129,7 @@ impl std::fmt::Display for BridgeError {
                 f,
                 "{msg}; pass a larger timeout or check that the target responds"
             ),
-            Self::Rpc(msg) => write!(f, "{msg}"),
+            Self::Rpc(msg, _) => write!(f, "{msg}"),
         }
     }
 }
@@ -141,7 +143,7 @@ impl BridgeError {
             Self::ProbeBusy(_) => "ProbeBusy",
             Self::Attach(_, kind) => kind,
             Self::Timeout(_) => "Timeout",
-            Self::Rpc(_) => "Rpc",
+            Self::Rpc(_, kind) => kind,
         }
     }
 
@@ -159,8 +161,14 @@ impl BridgeError {
                     .into(),
             ),
             E::SshSpawn(e) => Self::Connection(format!("could not start the ssh tunnel: {e}")),
-            E::FileRead(path, e) => Self::Rpc(format!("could not read {}: {e}", path.display())),
-            E::Remote(e) => Self::Rpc(e.to_string()),
+            E::FileRead(path, e) => {
+                Self::Rpc(format!("could not read {}: {e}", path.display()), "Rpc")
+            }
+            E::Remote(e) => {
+                let msg = e.to_string();
+                let kind = classify_remote(&msg);
+                Self::Rpc(msg, kind)
+            }
             E::Transport(t) => {
                 let msg = t.to_string();
                 match phase {
@@ -168,7 +176,7 @@ impl BridgeError {
                     Phase::Call => Self::ServerGone(msg),
                 }
             }
-            _ => Self::Rpc(e.to_string()),
+            _ => Self::Rpc(e.to_string(), "Rpc"),
         }
     }
 }
@@ -186,4 +194,104 @@ pub(crate) fn py_err_with_kind(msg: String, kind: &str) -> PyErr {
         let _ = err.value(py).setattr("kind", kind);
         err
     })
+}
+
+/// Best-effort classification of a server-side probe-rs error string into a
+/// Python `.kind`. The wire serializes server errors with `format!("{e:?}")`
+/// (anyhow debug: the variant Display plus its `Caused by` chain), so the
+/// variant display texts of `probe_rs::Error`, `ArmError`,
+/// `DebugProbeError` and `rtt::Error` all reach the client. Matched
+/// case-insensitively, most specific first; the result feeds script
+/// branching (`e.kind == "Probe"`), never control flow here.
+pub(crate) fn classify_remote(msg: &str) -> &'static str {
+    let m = msg.to_ascii_lowercase();
+    // RTT strings beat the generic probe wrapper they may sit under
+    // (`rtt::Error::Probe` wraps a probe error chain).
+    if m.contains("control block") || m.contains("rtt") {
+        return "Rtt";
+    }
+    if m.contains("no target responded")
+        || m.contains("usb")
+        || m.contains("debug probe")
+        || m.contains("debug port")
+        || m.contains("re-attach")
+        || m.contains("probe")
+    {
+        return "Probe";
+    }
+    if m.contains("is not enabled") || m.contains("has to be halted") {
+        return "Core";
+    }
+    if m.contains("not aligned") {
+        return "Memory";
+    }
+    if m.contains("timeout") || m.contains("timed out") {
+        return "Timeout";
+    }
+    "Rpc"
+}
+
+/// Whether a server-side failure describes a dead probe/target link that a
+/// fresh attach can fix: target power cycle (`No target responded`),
+/// USB replug, or an upstream error whose remedy literally is a re-attach
+/// (`ArmError::ReAttachRequired`). Conservative on purpose — timeouts,
+/// halted-state mismatches and target-level errors are NOT recoverable by
+/// re-attaching and must surface unchanged.
+pub(crate) fn is_fatal_recoverable(kind: &str, msg: &str) -> bool {
+    if kind != "Probe" {
+        return false;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("no target responded") || m.contains("usb") || m.contains("re-attach")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_remote_matches_upstream_display_texts() {
+        // ArmError::NoTargetResponse (target power cycled, SWD link dead).
+        assert_eq!(
+            classify_remote(
+                "No target responded to the debug port. Check that the target \
+                 is connected and powered"
+            ),
+            "Probe"
+        );
+        // DebugProbeError::Usb.
+        assert!(classify_remote("USB Communication Error: No such device").starts_with('P'));
+        // ArmError::CoreNotHalted after an unexpected reset started the core.
+        assert_eq!(
+            classify_remote("The core has to be halted for the operation"),
+            "Core"
+        );
+        // probe_rs::Error::CoreDisabled (debug domain lost).
+        assert_eq!(classify_remote("Core 0 is not enabled."), "Core");
+        // probe_rs::Error::Timeout.
+        assert_eq!(classify_remote("A timeout occurred."), "Timeout");
+        // rtt::Error::ControlBlockNotFound.
+        assert_eq!(
+            classify_remote("RTT control block not found in target memory."),
+            "Rtt"
+        );
+        // Unrecognized text stays generic.
+        assert_eq!(classify_remote("something entirely unexpected"), "Rpc");
+    }
+
+    #[test]
+    fn fatal_recovery_only_fires_for_dead_link_signatures() {
+        assert!(is_fatal_recoverable(
+            "Probe",
+            "No target responded to the debug port"
+        ));
+        assert!(is_fatal_recoverable("Probe", "USB Communication Error"));
+        // Target-level and timeout failures must never trigger a re-attach.
+        assert!(!is_fatal_recoverable("Timeout", "A timeout occurred."));
+        assert!(!is_fatal_recoverable("Core", "The core has to be halted"));
+        assert!(!is_fatal_recoverable(
+            "Rtt",
+            "RTT control block not found in target memory."
+        ));
+    }
 }

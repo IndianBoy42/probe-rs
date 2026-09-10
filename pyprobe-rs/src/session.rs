@@ -19,7 +19,7 @@ type PyObject = Py<PyAny>;
 
 use crate::error::{BridgeError, py_err_with_kind, to_bridge_err, to_py_err};
 use crate::open_state;
-use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, rpc_call};
+use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
 use crate::types::*;
 
 /// Session configuration.
@@ -314,11 +314,13 @@ impl Session {
             let conn = Arc::new(conn);
             let meta = py
                 .detach(|| {
-                    rpc_call(
-                        DEFAULT_TIMEOUT,
-                        "target metadata",
-                        conn.session()?.target_metadata(),
-                    )
+                    call_with_recovery(&conn, DEFAULT_TIMEOUT, "target metadata", || {
+                        rpc_call(
+                            DEFAULT_TIMEOUT,
+                            "target metadata",
+                            conn.session()?.target_metadata(),
+                        )
+                    })
                 })
                 .map_err(to_bridge_err)?;
             open_state::register(&conn, target.to_string());
@@ -376,11 +378,13 @@ impl Session {
         let conn = Arc::new(conn);
         let meta = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "target metadata",
-                    conn.session()?.target_metadata(),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "target metadata", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "target metadata",
+                        conn.session()?.target_metadata(),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         open_state::register(&conn, target.to_string());
@@ -437,13 +441,15 @@ impl Session {
                 if addresses.is_empty() {
                     continue;
                 }
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "clear breakpoints",
-                    conn.session()?
-                        .core(*core as usize)
-                        .clear_hw_breakpoints(addresses.clone()),
-                )?;
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "clear breakpoints", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "clear breakpoints",
+                        conn.session()?
+                            .core(*core as usize)
+                            .clear_hw_breakpoints(addresses.clone()),
+                    )
+                })?;
             }
             Ok(())
         })
@@ -454,11 +460,13 @@ impl Session {
     pub fn resume_all_cores(&mut self, py: Python<'_>) -> PyResult<()> {
         let conn = self.conn()?;
         py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "resume all cores",
-                conn.session()?.resume_all_cores(),
-            )
+            call_with_recovery(&conn, DEFAULT_TIMEOUT, "resume all cores", || {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "resume all cores",
+                    conn.session()?.resume_all_cores(),
+                )
+            })
         })
         .map_err(to_bridge_err)
     }
@@ -507,11 +515,13 @@ impl Session {
     pub fn erase_all(&mut self, py: Python<'_>) -> PyResult<()> {
         let conn = self.conn()?;
         py.detach(|| {
-            rpc_call(
-                ERASE_TIMEOUT,
-                "erase all",
-                conn.session()?.erase_all(false, async |_| {}),
-            )
+            call_with_recovery(&conn, ERASE_TIMEOUT, "erase all", || {
+                rpc_call(
+                    ERASE_TIMEOUT,
+                    "erase all",
+                    conn.session()?.erase_all(false, async |_| {}),
+                )
+            })
         })
         .map_err(to_bridge_err)
     }
@@ -542,14 +552,22 @@ impl Session {
     pub fn load_debug_info(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         let conn = self.conn()?;
         py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "load debug info",
-                conn.session()?
-                    .load_debug_info(std::path::PathBuf::from(path)),
-            )
+            call_with_recovery(&conn, DEFAULT_TIMEOUT, "load debug info", || {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "load debug info",
+                    conn.session()?
+                        .load_debug_info(std::path::PathBuf::from(path)),
+                )
+            })
         })
-        .map_err(to_bridge_err)
+        .map_err(to_bridge_err)?;
+        // The reattach recovery re-pushes this file: the debug state lives
+        // in the (new) server session.
+        conn.debug_info
+            .lock()
+            .replace(std::path::PathBuf::from(path));
+        Ok(())
     }
 
     /// Rich stack trace of `core` (server-side DWARF; call
@@ -560,11 +578,13 @@ impl Session {
         let conn = self.conn()?;
         let traces = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "stack trace",
-                    conn.session()?.take_rich_stack_trace(Some(core), limit),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "stack trace", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "stack trace",
+                        conn.session()?.take_rich_stack_trace(Some(core), limit),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         let mut out = Vec::new();
@@ -583,11 +603,13 @@ impl Session {
         let conn = self.conn()?;
         let scopes = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "scopes",
-                    conn.session()?.scopes(core, frame),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "scopes", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "scopes",
+                        conn.session()?.scopes(core, frame),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         scopes
@@ -620,11 +642,14 @@ impl Session {
         let conn = self.conn()?;
         let vars = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "variables",
-                    conn.session()?.variables(core, variables_reference, filter),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "variables", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "variables",
+                        conn.session()?
+                            .variables(core, variables_reference, filter.clone()),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         vars.into_iter()
@@ -656,12 +681,14 @@ impl Session {
         let conn = self.conn()?;
         let resp = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "evaluate",
-                    conn.session()?
-                        .evaluate(core, frame, expression.to_string()),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "evaluate", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "evaluate",
+                        conn.session()?
+                            .evaluate(core, frame, expression.to_string()),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         py_dict(
@@ -683,12 +710,14 @@ impl Session {
     pub fn load_svd(&self, py: Python<'_>, path: &str, core: u32) -> PyResult<()> {
         let conn = self.conn()?;
         py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "load svd",
-                conn.session()?
-                    .load_svd(core, Some(std::path::PathBuf::from(path))),
-            )
+            call_with_recovery(&conn, DEFAULT_TIMEOUT, "load svd", || {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "load svd",
+                    conn.session()?
+                        .load_svd(core, Some(std::path::PathBuf::from(path))),
+                )
+            })
         })
         .map_err(to_bridge_err)
     }
@@ -713,11 +742,14 @@ impl Session {
             .collect();
         let res = py
             .detach(|| {
-                rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "resolve breakpoints",
-                    conn.session()?.resolve_source_breakpoints(locations),
-                )
+                call_with_recovery(&conn, DEFAULT_TIMEOUT, "resolve breakpoints", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "resolve breakpoints",
+                        conn.session()?
+                            .resolve_source_breakpoints(locations.clone()),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         res.into_iter()
@@ -747,11 +779,13 @@ impl Session {
     pub fn clear_debug_state(&self, py: Python<'_>, core: u32) -> PyResult<()> {
         let conn = self.conn()?;
         py.detach(|| {
-            rpc_call(
-                DEFAULT_TIMEOUT,
-                "clear debug state",
-                conn.session()?.clear_core_debug_state(core),
-            )
+            call_with_recovery(&conn, DEFAULT_TIMEOUT, "clear debug state", || {
+                rpc_call(
+                    DEFAULT_TIMEOUT,
+                    "clear debug state",
+                    conn.session()?.clear_core_debug_state(core),
+                )
+            })
         })
         .map_err(to_bridge_err)
     }
@@ -867,8 +901,19 @@ fn attach_with(
             resume_target: false,
             wait_for_probe: wait,
         };
+        // The reattach recovery rebuilds the transport from the same source
+        // (module-managed server or remote host) as the original attach.
+        let (host, token) = open_state::remote_config();
+        let source = match host {
+            Some(host) => crate::rpc::ConnSource::Remote { host, token },
+            None => crate::rpc::ConnSource::Local,
+        };
         Bridge::global()?
-            .wait(deadline, "attach", Connection::attach(client, request))
+            .wait(
+                deadline,
+                "attach",
+                Connection::attach(client, request, source),
+            )
             .and_then(|inner| inner)
     })
 }

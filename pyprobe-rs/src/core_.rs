@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::error::{BridgeError, Phase, py_err_with_kind, to_bridge_err};
-use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, rpc_call};
+use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
 use crate::types::{
     ArchitectureProxy, CoreStateProxy, CoreStatusProxy, CoreTypeProxy, EndianProxy, HaltKindProxy,
     HaltReasonProxy, InstructionSetProxy, VectorCatchConditionProxy, core_type_to_py,
@@ -490,11 +490,6 @@ impl CoreHandle {
         }
     }
 
-    /// CoreInterface for this handle's core. Fails once the session is closed.
-    fn core_if(&self) -> Result<CoreInterface, BridgeError> {
-        Ok(self.conn.session()?.core(self.core as usize))
-    }
-
     /// Run `f` over this core's `CoreInterface` on the bridge runtime with
     /// the GIL released. The returned future owns the interface, so the
     /// borrow ends inside `py.detach`.
@@ -502,7 +497,7 @@ impl CoreHandle {
         &self,
         py: Python<'_>,
         op: &str,
-        f: impl FnOnce(CoreInterface) -> F + Send,
+        f: impl Fn(CoreInterface) -> F + Send,
     ) -> PyResult<T>
     where
         F: Future<Output = Result<T, ClientError>>,
@@ -513,20 +508,29 @@ impl CoreHandle {
 
     /// [`Self::rpc`] with an explicit bridge deadline; used when the
     /// server-side wait can exceed the default 30 s.
+    ///
+    /// The interface is re-derived on every attempt so a dead-link recovery
+    /// (`call_with_recovery`) retries against the rebuilt session.
     fn rpc_with_deadline<T, F>(
         &self,
         py: Python<'_>,
         deadline: Duration,
         op: &str,
-        f: impl FnOnce(CoreInterface) -> F + Send,
+        f: impl Fn(CoreInterface) -> F + Send,
     ) -> PyResult<T>
     where
         F: Future<Output = Result<T, ClientError>>,
         T: Send,
     {
-        let core_if = self.core_if().map_err(to_bridge_err)?;
-        py.detach(|| rpc_call(deadline, op, f(core_if)))
-            .map_err(to_bridge_err)
+        let conn = self.conn.clone();
+        let core = self.core;
+        py.detach(move || {
+            call_with_recovery(&conn, deadline, op, || {
+                let core_if = conn.session()?.core(core as usize);
+                rpc_call(deadline, op, f(core_if))
+            })
+        })
+        .map_err(to_bridge_err)
     }
 
     /// Re-apply this core's tracked hardware breakpoints (after ops that
@@ -544,15 +548,20 @@ impl CoreHandle {
         &self,
         py: Python<'_>,
         op: &str,
-        f: impl FnOnce(SessionInterface) -> F + Send,
+        f: impl Fn(SessionInterface) -> F + Send,
     ) -> PyResult<T>
     where
         F: Future<Output = Result<T, ClientError>>,
         T: Send,
     {
-        let session = self.conn.session().map_err(to_bridge_err)?.clone();
-        py.detach(|| rpc_call(DEFAULT_TIMEOUT, op, f(session)))
-            .map_err(to_bridge_err)
+        let conn = self.conn.clone();
+        py.detach(move || {
+            call_with_recovery(&conn, DEFAULT_TIMEOUT, op, || {
+                let session = conn.session()?.clone();
+                rpc_call(DEFAULT_TIMEOUT, op, f(session))
+            })
+        })
+        .map_err(to_bridge_err)
     }
 
     /// Core metadata (instruction set, FPU) for this core.
@@ -677,9 +686,10 @@ pub(crate) fn reapply_breakpoints(conn: &Arc<Connection>, core: u32) -> Result<(
     })?;
     for result in results.map_err(|e| BridgeError::from_client(e, Phase::Call))? {
         result.map_err(|e| {
-            BridgeError::Rpc(format!(
-                "failed to re-apply a hardware breakpoint on core {core}: {e}"
-            ))
+            BridgeError::Rpc(
+                format!("failed to re-apply a hardware breakpoint on core {core}: {e}"),
+                "Breakpoint",
+            )
         })?;
     }
     Ok(())
@@ -765,20 +775,21 @@ impl CoreHandle {
         let conn = self.conn.clone();
         let core = self.core;
         py.detach(move || {
-            let bridge = Bridge::global()?;
-            let session = conn.session()?.clone();
-            bridge
-                .wait(deadline, "wait for core halted", async move {
-                    let core_if = session.core(core as usize);
-                    loop {
-                        match core_if.status().await {
-                            Ok(WireCoreStatus::Halted(_)) => return Ok(()),
-                            Ok(_) => tokio::time::sleep(HALT_POLL_INTERVAL).await,
-                            Err(e) => return Err(e),
+            call_with_recovery(&conn, deadline, "wait for core halted", || {
+                let session = conn.session()?.clone();
+                Bridge::global()?
+                    .wait(deadline, "wait for core halted", async move {
+                        let core_if = session.core(core as usize);
+                        loop {
+                            match core_if.status().await {
+                                Ok(WireCoreStatus::Halted(_)) => return Ok(()),
+                                Ok(_) => tokio::time::sleep(HALT_POLL_INTERVAL).await,
+                                Err(e) => return Err(e),
+                            }
                         }
-                    }
-                })?
-                .map_err(|e| BridgeError::from_client(e, Phase::Call))
+                    })?
+                    .map_err(|e| BridgeError::from_client(e, Phase::Call))
+            })
         })
         .map_err(to_bridge_err)
     }
@@ -872,26 +883,30 @@ impl CoreHandle {
     }
 
     fn write_8(&self, py: Python<'_>, addr: u64, data: Vec<u8>) -> PyResult<()> {
-        self.rpc(py, "write memory 8", |c| async move {
-            c.write_memory_8(addr, data).await
+        self.rpc(py, "write memory 8", |c| {
+            let data = data.clone();
+            async move { c.write_memory_8(addr, data).await }
         })
     }
 
     fn write_16(&self, py: Python<'_>, addr: u64, data: Vec<u16>) -> PyResult<()> {
-        self.rpc(py, "write memory 16", |c| async move {
-            c.write_memory_16(addr, data).await
+        self.rpc(py, "write memory 16", |c| {
+            let data = data.clone();
+            async move { c.write_memory_16(addr, data).await }
         })
     }
 
     fn write_32(&self, py: Python<'_>, addr: u64, data: Vec<u32>) -> PyResult<()> {
-        self.rpc(py, "write memory 32", |c| async move {
-            c.write_memory_32(addr, data).await
+        self.rpc(py, "write memory 32", |c| {
+            let data = data.clone();
+            async move { c.write_memory_32(addr, data).await }
         })
     }
 
     fn write_64(&self, py: Python<'_>, addr: u64, data: Vec<u64>) -> PyResult<()> {
-        self.rpc(py, "write memory 64", |c| async move {
-            c.write_memory_64(addr, data).await
+        self.rpc(py, "write memory 64", |c| {
+            let data = data.clone();
+            async move { c.write_memory_64(addr, data).await }
         })
     }
 
@@ -906,8 +921,9 @@ impl CoreHandle {
     }
 
     fn write(&self, py: Python<'_>, addr: u64, data: Vec<u8>) -> PyResult<()> {
-        self.rpc(py, "write memory", |c| async move {
-            c.write_memory_8(addr, data).await
+        self.rpc(py, "write memory", |c| {
+            let data = data.clone();
+            async move { c.write_memory_8(addr, data).await }
         })
     }
 
@@ -1040,8 +1056,9 @@ impl CoreHandle {
             let entry = tracked.entry(self.core).or_default();
             entry.retain(|a| !addresses.contains(a));
         }
-        self.rpc(py, "clear hw breakpoints", |c| async move {
-            c.clear_hw_breakpoints(addresses).await
+        self.rpc(py, "clear hw breakpoints", |c| {
+            let addresses = addresses.clone();
+            async move { c.clear_hw_breakpoints(addresses).await }
         })
     }
 
@@ -1056,8 +1073,9 @@ impl CoreHandle {
         if addresses.is_empty() {
             return Ok(());
         }
-        self.rpc(py, "clear hw breakpoints", |c| async move {
-            c.clear_hw_breakpoints(addresses).await
+        self.rpc(py, "clear hw breakpoints", |c| {
+            let addresses = addresses.clone();
+            async move { c.clear_hw_breakpoints(addresses).await }
         })
     }
 

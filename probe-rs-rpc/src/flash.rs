@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::format::FormatOptions;
 use crate::{FlashLoader, Key, RpcResult, RttClient, Session};
 
-#[derive(Serialize, Deserialize, Default, Schema)]
+#[derive(Serialize, Deserialize, Default, Schema, Clone)]
 pub struct DownloadOptions {
     pub keep_unwritten_bytes: bool,
     pub do_chip_erase: bool,

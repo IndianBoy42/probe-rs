@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 
 use crate::error::{BridgeError, py_err_with_kind, to_bridge_err};
 use crate::events::{ChannelRing, RttPoller, SubscribedChannel};
-use crate::rpc::{Connection, DEFAULT_TIMEOUT, rpc_call};
+use crate::rpc::{Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
 use crate::types::ChannelModeProxy;
 
 /// Bridge deadline for one down-channel write. The server retries the write
@@ -38,7 +38,7 @@ const DOWN_WRITE_ATTEMPT_MS: u32 = 0;
 /// `Rtt` kind (the wire carries no structured error kind) instead of `Rpc`.
 fn rtt_err(e: BridgeError) -> PyErr {
     match e {
-        BridgeError::Rpc(msg) => py_err_with_kind(msg, "Rtt"),
+        BridgeError::Rpc(msg, _) => py_err_with_kind(msg, "Rtt"),
         other => to_bridge_err(other),
     }
 }
@@ -90,23 +90,25 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
                 // the server-side client, then read its channel snapshot. The
                 // control-block attach happens server-side inside
                 // `get_rtt_channels` (and is retried by every later poll).
-                let data = rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "rtt attach",
-                    conn.session().map_err(rtt_err)?.create_rtt_client(
-                        scan,
-                        Vec::new(),
-                        default_config,
-                    ),
-                )
+                let data = call_with_recovery(&conn, DEFAULT_TIMEOUT, "rtt attach", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "rtt attach",
+                        conn.session()?.create_rtt_client(
+                            scan.clone(),
+                            Vec::new(),
+                            default_config.clone(),
+                        ),
+                    )
+                })
                 .map_err(rtt_err)?;
-                let channels = rpc_call(
-                    DEFAULT_TIMEOUT,
-                    "rtt channels",
-                    conn.session()
-                        .map_err(rtt_err)?
-                        .get_rtt_channels(data.handle),
-                )
+                let channels = call_with_recovery(&conn, DEFAULT_TIMEOUT, "rtt channels", || {
+                    rpc_call(
+                        DEFAULT_TIMEOUT,
+                        "rtt channels",
+                        conn.session()?.get_rtt_channels(data.handle),
+                    )
+                })
                 .map_err(rtt_err)?;
                 Ok((data.handle, channels))
             },
@@ -325,11 +327,13 @@ impl UpChannel {
         let (conn, rtt, channel) = self.parts(py);
         let results = py
             .detach(|| {
-                rpc_call(
-                    READ_TIMEOUT,
-                    "rtt poll",
-                    conn.session()?.poll_rtt_up(rtt, vec![channel]),
-                )
+                call_with_recovery(&conn, READ_TIMEOUT, "rtt poll", || {
+                    rpc_call(
+                        READ_TIMEOUT,
+                        "rtt poll",
+                        conn.session()?.poll_rtt_up(rtt, vec![channel]),
+                    )
+                })
             })
             .map_err(rtt_err)?;
         let result = results.into_iter().next().ok_or_else(|| {
@@ -423,16 +427,18 @@ impl DownChannel {
         drop(rtt);
         let written = py
             .detach(|| {
-                rpc_call(
-                    WRITE_TIMEOUT,
-                    "rtt write",
-                    conn.session()?.send_to_rtt(
-                        client,
-                        channel,
-                        data.to_vec(),
-                        DOWN_WRITE_ATTEMPT_MS,
-                    ),
-                )
+                call_with_recovery(&conn, WRITE_TIMEOUT, "rtt write", || {
+                    rpc_call(
+                        WRITE_TIMEOUT,
+                        "rtt write",
+                        conn.session()?.send_to_rtt(
+                            client,
+                            channel,
+                            data.to_vec(),
+                            DOWN_WRITE_ATTEMPT_MS,
+                        ),
+                    )
+                })
             })
             .map_err(rtt_err)?;
         Ok(written as usize)

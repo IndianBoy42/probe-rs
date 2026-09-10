@@ -105,7 +105,7 @@ pub struct DebugProbeSelector {
     pub serial_number: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Schema)]
+#[derive(Serialize, Deserialize, Schema, Clone)]
 pub struct AttachRequest {
     pub chip: Option<String>,
     pub protocol: Option<WireProtocol>,

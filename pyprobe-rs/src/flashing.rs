@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 
 use crate::error::{BridgeError, to_bridge_err};
 use crate::events::Pump;
-use crate::rpc::{Connection, DEFAULT_TIMEOUT, rpc_call};
+use crate::rpc::{Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
 use crate::session::Session;
 
 /// Deadline for programming and verification: a full read-back on a large
@@ -238,6 +238,34 @@ fn wire_download_options(opts: &DownloadOptions) -> PyResult<WireDownloadOptions
 /// flash, the program step is skipped (upstream `preverify` semantics). When
 /// `run` is set, all cores resume after boot; otherwise they stay halted.
 fn flash_image(
+    conn: &Arc<Connection>,
+    path: &str,
+    format: FormatOptions,
+    wire: WireDownloadOptions,
+    preverify: bool,
+    run: bool,
+    progress: Option<Py<PyAny>>,
+) -> Result<(), BridgeError> {
+    // Server-side objects (loader, boot info) belong to the session that
+    // built them, so a dead-link recovery (target power cycle, USB replug)
+    // restarts the whole pipeline once instead of resuming a stage.
+    call_with_recovery(conn, FLASH_TIMEOUT, "flash", || {
+        flash_once(
+            conn,
+            path,
+            format.clone(),
+            wire.clone(),
+            preverify,
+            run,
+            progress.clone(),
+        )
+    })
+}
+
+/// One full flash pipeline attempt: resolve → build → (pre-verify) →
+/// program → boot.
+#[allow(clippy::too_many_arguments)]
+fn flash_once(
     conn: &Arc<Connection>,
     path: &str,
     format: FormatOptions,

@@ -169,7 +169,7 @@ pub(crate) fn ensure_server_client() -> Result<RpcClient, BridgeError> {
     }
 }
 
-fn connect_remote(host: &str, token: Option<&str>) -> Result<RpcClient, BridgeError> {
+pub(crate) fn connect_remote(host: &str, token: Option<&str>) -> Result<RpcClient, BridgeError> {
     // Bridge::wait yields the future's own Result; flatten the nesting.
     let attempt = || {
         Bridge::global()?
@@ -199,7 +199,7 @@ fn connect_local() -> Result<RpcClient, BridgeError> {
     };
     match attempt() {
         Ok(client) => Ok(client),
-        Err(e @ BridgeError::ServerVersion(_)) => {
+        Err(BridgeError::ServerVersion(_)) => {
             // Upstream maps transient handshake losses (LostData / task
             // errors on a fresh fast connection) to the same
             // `IncompatibleServer` error as a real schema mismatch, so one

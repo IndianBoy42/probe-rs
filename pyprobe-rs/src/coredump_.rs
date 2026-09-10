@@ -17,7 +17,7 @@ use crate::core_::{
     wire_core_type_to_local, wire_instruction_set_to_local, wire_register_value_to_local,
 };
 use crate::error::{to_bridge_err, to_py_err};
-use crate::rpc::{Connection, rpc_call};
+use crate::rpc::{Connection, call_with_recovery, rpc_call};
 use crate::session::Session;
 
 #[pyclass]
@@ -62,11 +62,13 @@ impl CoreDump {
         let conn: Arc<Connection> = session.conn()?;
         let wire = py
             .detach(|| {
-                rpc_call(
-                    DUMP_TIMEOUT,
-                    "core dump",
-                    conn.session()?.core(core_index).dump_core(ranges),
-                )
+                call_with_recovery(&conn, DUMP_TIMEOUT, "core dump", || {
+                    rpc_call(
+                        DUMP_TIMEOUT,
+                        "core dump",
+                        conn.session()?.core(core_index).dump_core(ranges.clone()),
+                    )
+                })
             })
             .map_err(to_bridge_err)?;
         Ok(Self {

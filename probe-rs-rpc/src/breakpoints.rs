@@ -17,7 +17,7 @@ pub struct WireSourceLocation {
     pub address: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Schema)]
+#[derive(Serialize, Deserialize, Schema, Clone)]
 pub struct SourceBreakpointLocation {
     pub path: String,
     pub line: u64,

@@ -808,6 +808,43 @@ recovers.
 Python-side argument mistakes still raise builtin exceptions
 (`ValueError`, `TypeError`, `IndexError`, `OverflowError`).
 
+## Unexpected target resets and power cycles
+
+MCUs reset when you don't ask them to (watchdogs, brownouts, reset buttons,
+reflashes from another tool). Sessions are built to survive that:
+
+- **RTT keeps streaming.** The server re-attaches the RTT control block on
+  every poll, so a firmware re-initialization heals on its own. The
+  background poller surfaces what is happening instead of going silent: it
+  warns when a channel starts (or stops) failing, and after ~500 ms of
+  silence it probes the channel list — warning once if a subscribed channel
+  number no longer exists (the target rebooted into a different build), in
+  which case re-attach via `sess.attach_rtt()` to pick up the new set.
+- **Breakpoints survive resets.** Hardware breakpoints are re-applied after
+  `sess.flash()`, `core.reset()`, and `core.reset_and_halt()` (a
+  SYSRESETREQ clears the FP comparators; the debug domain keeps them).
+- **Dead links self-heal once.** If the target loses power or the probe is
+  replugged mid-session ("No target responded", USB errors), the next
+  operation rebuilds the transport, re-attaches, restores DWARF debug info
+  and tracked breakpoints, and retries the operation — once per session.
+  You'll see `pyprobe-rs: probe link lost during <op>; reattached and
+  retried` on stderr. Later dead-link failures surface unchanged: a
+  persistently broken rig must not be masked. The failure comes back as
+  `kind == "Probe"`; recovery from there is `sess.close()` + a fresh
+  `Session.auto_attach(...)`.
+- **State changes are visible, not fatal.** A reset while halted leaves the
+  core running: `core.status()` reports it, `step()` raises `kind == "Core"`
+  ("has to be halted"), and `wait_for_core_halted(timeout_ms=…)` is
+  deadline-bounded. A power reset can also drop the debug domain
+  (`kind == "Core"`, "is not enabled") — that one is not auto-recoverable;
+  close and re-attach (with `connect_under_reset=True` if the target locks
+  up).
+
+Error-string classification for server-side failures is best-effort (the RPC
+wire carries no structured error kind): `Timeout`, `Probe`, `Rtt`, `Core`,
+`Memory` kinds are matched from the probe-rs error text, everything else
+stays `Rpc`.
+
 ## Enums
 
 All enums live at module level and support `==` comparison:
