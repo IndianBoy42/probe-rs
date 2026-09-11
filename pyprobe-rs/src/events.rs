@@ -108,13 +108,16 @@ pub(crate) struct Pump<T> {
 
 impl<T: Send + 'static> Pump<T> {
     /// Spawn a pump with its own stop flag.
-    pub(crate) fn spawn(on_item: impl Fn(T) + Send + 'static) -> Self {
+    pub(crate) fn spawn(on_item: impl FnMut(T) + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         Self::spawn_on(stop, on_item)
     }
 
     /// Spawn a pump sharing an existing stop flag (poller lifecycle).
-    pub(crate) fn spawn_on(stop: Arc<AtomicBool>, on_item: impl Fn(T) + Send + 'static) -> Self {
+    pub(crate) fn spawn_on(
+        stop: Arc<AtomicBool>,
+        mut on_item: impl FnMut(T) + Send + 'static,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread_stop = Arc::clone(&stop);
         let spawned = std::thread::Builder::new()

@@ -63,6 +63,18 @@ pub enum ChannelModeProxy {
     BlockIfFull = 2,
 }
 
+/// Wire form of the RTT channel mode, for the attach-time channel config.
+pub(crate) fn channel_mode_to_wire(
+    mode: ChannelModeProxy,
+) -> probe_rs_rpc::rtt_config::ChannelMode {
+    use probe_rs_rpc::rtt_config::ChannelMode as W;
+    match mode {
+        ChannelModeProxy::NoBlockSkip => W::NoBlockSkip,
+        ChannelModeProxy::NoBlockTrim => W::NoBlockTrim,
+        ChannelModeProxy::BlockIfFull => W::BlockIfFull,
+    }
+}
+
 #[pyclass(name = "VectorCatchCondition", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VectorCatchConditionProxy {

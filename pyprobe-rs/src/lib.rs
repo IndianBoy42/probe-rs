@@ -13,6 +13,7 @@ mod open_state;
 mod probe_;
 mod rpc;
 mod rtt_;
+#[cfg(unix)]
 mod server;
 mod session;
 mod types;

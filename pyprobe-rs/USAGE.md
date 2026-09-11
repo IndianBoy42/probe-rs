@@ -174,7 +174,7 @@ probes = pr.list_probes()                  # -> list[ProbeInfo]
 for p in probes:
     print(p.vid, p.pid, p.serial, p.identifier, p.probe_type, p.inaccessible)
 
-probe = probes[0].open()                   # local open; only for locally-listed probes
+probe = probes[0].open()                   # local handle, or a server-side selector
 # or by selector:
 probe = pr.Lister().open("1366:1015")                      # == Lister::open(selector)
 sel = pr.DebugProbeSelector(0x1366, 0x1015, "SERIAL")       # str(sel) == "1366:1015:SERIAL"
@@ -194,11 +194,13 @@ probe.detach()
 
 `pr.list_probes()` uses the server's view when a server is active (remote
 mode configured, or a server is already running): those entries carry
-`probe_type` (e.g. `"cmsisdap"`, `"jlink"`) and `inaccessible` markers, but
-have no local open handle — `ProbeInfo.open()` raises `ValueError` on them.
-With no server active, probes are listed locally and `open()` works; those
-entries always report `probe_type == ""` and `inaccessible == False`. Listing
-probes never starts a server.
+`probe_type` (e.g. `"cmsisdap"`, `"jlink"`) and `inaccessible` markers, and
+`ProbeInfo.open()` returns a `Probe` bound to that listing — it has no local
+handle, so probe-level calls (`set_speed`, `get_name`, …) raise, but
+`attach()` and `attach_under_reset()` route through the server and select it.
+With no server active, probes are listed locally and `open()` returns a real
+local handle; those entries always report `probe_type == ""` and
+`inaccessible == False`. Listing probes never starts a server.
 
 `get_name()` returns the debug-formatted descriptor of the underlying probe —
 a long USB dump on CMSIS-DAP probes. Use `ProbeInfo.identifier` for a short
@@ -367,9 +369,10 @@ the block methods instead of `read_word_*` loops.
 ## Core registers
 
 Registers are addressed by name (case-insensitive) or numeric id. The RPC
-wire carries bare register ids with no name table, so name → id resolution is
-served from pyprobe-rs's built-in Cortex-M and RISC-V register files (ids are
-the probe-rs ids verbatim).
+wire carries bare register ids with no name table, so name → id resolution
+uses the same probe-rs register file the server reads from (selected from the
+core's instruction-set and FPU metadata): Cortex-M, RISC-V (32/64), AArch32,
+AArch64 and Xtensa all resolve, together with each architecture's ABI aliases.
 
 ```python
 core.read_core_reg("PC")               # by name (case-insensitive)
@@ -398,7 +401,7 @@ core.read_fp()
 core.read_return_address()
 ```
 
-Enumerate registers (a snapshot of the built-in name tables for the core's
+Enumerate registers (a snapshot of the probe-rs register file for the core's
 architecture; floating-point registers are listed only when the core has an
 FPU):
 
@@ -407,9 +410,9 @@ for reg in core.registers():           # -> [CoreRegisterInfo]
     print(reg.name, reg.id, reg.size_in_bits)
 ```
 
-For architectures whose register file is not built in (AArch64, Xtensa),
-`registers()` and register *names* are unavailable — address registers by
-numeric id instead.
+Names are lowercased, and the arch-neutral `pc`/`sp`/`lr`/`fp` aliases are
+appended when the architecture names those registers differently (Cortex-M
+lists both `r15` and `pc`, for example).
 
 ## Breakpoints and vector catch
 
@@ -652,6 +655,7 @@ read/write is one RPC request with the GIL released.
 ```python
 rtt = sess.attach_rtt(0)               # scan RAM for the RTT control block
 rtt = sess.attach_rtt(0, ptr=0x2000_0100)   # or attach at a known control block
+rtt = sess.attach_rtt(0, modes={0: pr.ChannelMode.BlockIfFull})  # attach-time up-channel modes
 
 rtt.up_channels()                      # -> [ChannelInfo(number, name)]
 rtt.down_channels()                    # ChannelInfo: attach-time snapshot
@@ -715,11 +719,13 @@ Streaming semantics:
 
 Gaps on the RPC surface (all raise `pr.ProbeRsError`):
 
-- `up.set_mode()` / `up.mode()`: the wire has no live mode endpoint — modes
-  are fixed by the attach-time channel configuration, and pyprobe-rs keeps
-  the target's own buffering.
-- `rtt.ptr()`: the wire does not expose the control-block address — pass
-  `ptr=` to `attach_rtt` when you know it.
+- `up.set_mode()`: the wire has no live mode endpoint. Set the mode at attach
+  time with `modes={channel_number: pr.ChannelMode.BlockIfFull}`; channels
+  without an entry keep the target's own buffering.
+- `up.mode()`: returns the mode configured at attach time; raises for a
+  channel left at the target's own mode (the wire cannot read it live).
+- `rtt.ptr()`: returns the address only when `attach_rtt(ptr=...)` pinned it;
+  the wire does not report the address found by a RAM scan.
 - `up.buffer_size()` / `down.buffer_size()` / `ChannelInfo.buffer_size`:
   the wire does not report target-side buffer sizes.
 

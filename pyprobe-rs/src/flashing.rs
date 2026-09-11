@@ -104,10 +104,10 @@ fn operation_name(op: &WireOperation) -> &'static str {
     }
 }
 
-/// Map a wire progress event onto the Python proxy. The wire stream carries
-/// no timestamps, so `time_s` is always 0 — the field stays for the
-/// Python-visible shape.
-fn event_to_py(e: &WireProgressEvent) -> ProgressEvent {
+/// Map a wire progress event onto the Python proxy. `time_s` comes from the
+/// pump, which clocks each operation client-side; every non-Progress variant
+/// stays 0, matching the old in-process binding.
+fn event_to_py(e: &WireProgressEvent, time_s: f32) -> ProgressEvent {
     let (kind, operation, size, total, time_s) = match e {
         WireProgressEvent::FlashLayoutReady { .. } => {
             ("FlashLayoutReady", "layout".into(), 0, None, 0.0)
@@ -125,7 +125,7 @@ fn event_to_py(e: &WireProgressEvent) -> ProgressEvent {
             operation_name(operation).to_string(),
             *size,
             None,
-            0.0,
+            time_s,
         ),
         WireProgressEvent::Finished(op) => {
             ("Finished", operation_name(op).to_string(), 0, None, 0.0)
@@ -152,7 +152,29 @@ fn event_to_py(e: &WireProgressEvent) -> ProgressEvent {
 /// inside the entered runtime and panicking.
 fn progress_pump(progress: Option<Py<PyAny>>) -> Option<Pump<WireProgressEvent>> {
     progress.map(|callback| {
-        Pump::spawn(move |event: WireProgressEvent| deliver_progress(&callback, event))
+        // Per-call clock table: no global state, and successive flash calls
+        // restart each operation's timer from zero.
+        let mut started: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        Pump::spawn(move |event: WireProgressEvent| {
+            let time_s = match &event {
+                WireProgressEvent::Started(op) => {
+                    started.insert(operation_name(op).to_string(), std::time::Instant::now());
+                    0.0
+                }
+                WireProgressEvent::AddProgressBar { operation, .. } => {
+                    started
+                        .entry(operation_name(operation).to_string())
+                        .or_insert_with(std::time::Instant::now);
+                    0.0
+                }
+                WireProgressEvent::Progress { operation, .. } => started
+                    .get(operation_name(operation))
+                    .map_or(0.0, |t| t.elapsed().as_secs_f32()),
+                _ => 0.0,
+            };
+            deliver_progress(&callback, event, time_s)
+        })
     })
 }
 
@@ -170,12 +192,12 @@ fn progress_forward(
 /// Convert and deliver one progress event to the Python callback.
 /// Exceptions are printed to stderr, never propagated: the RPC stream has
 /// no error channel, and a misbehaving callback must not kill a flash.
-fn deliver_progress(callback: &Py<PyAny>, event: WireProgressEvent) {
+fn deliver_progress(callback: &Py<PyAny>, event: WireProgressEvent, time_s: f32) {
     // Python::attach panics during interpreter finalization (pyo3, Py 3.13+);
     // the pump thread must never take the process down at shutdown.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         Python::attach(|py| {
-            let event = event_to_py(&event);
+            let event = event_to_py(&event, time_s);
             if let Err(err) = callback.call1(py, (event,)) {
                 err.print(py);
             }

@@ -12,12 +12,14 @@ use probe_rs_rpc_client::RpcClient;
 
 use crate::error::BridgeError;
 use crate::rpc::{Bridge, Connection};
+#[cfg(unix)]
 use crate::server::{ManagerError, ServerManager};
 
 /// Connect-phase timeout covering transport setup and the schema handshake.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 struct OpenState {
+    #[cfg(unix)]
     manager: ServerManager,
     host: Option<String>,
     token: Option<String>,
@@ -32,6 +34,7 @@ static SESSIONS: Mutex<Vec<(Weak<Connection>, String)>> = Mutex::new(Vec::new())
 fn state() -> &'static Mutex<OpenState> {
     STATE.get_or_init(|| {
         Mutex::new(OpenState {
+            #[cfg(unix)]
             manager: ServerManager::new(),
             host: None,
             token: None,
@@ -114,6 +117,7 @@ pub(crate) fn remote_mode() -> Option<String> {
 
 /// True when a server is already ensured (remote host configured or a local
 /// server is running) — `list_probes` uses the server's view only then.
+#[cfg(unix)]
 pub(crate) fn server_active() -> bool {
     if remote_mode().is_some() {
         return true;
@@ -121,9 +125,16 @@ pub(crate) fn server_active() -> bool {
     state().lock().manager.socket_connectable()
 }
 
+/// Off unix no local server can be spawned, so only remote mode counts.
+#[cfg(not(unix))]
+pub(crate) fn server_active() -> bool {
+    remote_mode().is_some()
+}
+
 /// Kill the local server. Refused for servers pyprobe-rs did not spawn
 /// unless `force` is set (then only after verifying the pidfile points at a
 /// live `probe-rs serve` process). Always refused in remote mode.
+#[cfg(unix)]
 pub(crate) fn shutdown_server(force: bool) -> Result<(), BridgeError> {
     let mut s = state().lock();
     if s.host.is_some() {
@@ -150,9 +161,24 @@ pub(crate) fn shutdown_server(force: bool) -> Result<(), BridgeError> {
     }
 }
 
+/// Local servers exist only on unix, so there is never anything to shut down.
+#[cfg(not(unix))]
+pub(crate) fn shutdown_server(_force: bool) -> Result<(), BridgeError> {
+    Err(BridgeError::Connection(
+        "local server management requires unix; there is no local server to shut down".into(),
+    ))
+}
+
 /// Ring-buffer snapshot of the spawned server's stdout/stderr.
+#[cfg(unix)]
 pub(crate) fn server_logs() -> Vec<String> {
     state().lock().manager.logs()
+}
+
+/// Local servers exist only on unix, so there are never logs to report.
+#[cfg(not(unix))]
+pub(crate) fn server_logs() -> Vec<String> {
+    Vec::new()
 }
 
 /// Ensure the configured server is running and return a fresh, schema-checked
@@ -185,6 +211,7 @@ pub(crate) fn connect_remote(host: &str, token: Option<&str>) -> Result<RpcClien
     }
 }
 
+#[cfg(unix)]
 fn connect_local() -> Result<RpcClient, BridgeError> {
     let url = {
         let mut s = state().lock();
@@ -233,8 +260,19 @@ fn connect_local() -> Result<RpcClient, BridgeError> {
     }
 }
 
+/// No server can be spawned locally off unix; point the user at remote mode.
+#[cfg(not(unix))]
+fn connect_local() -> Result<RpcClient, BridgeError> {
+    Err(BridgeError::Connection(
+        "local server management requires unix; use \
+         pyprobe_rs.open(host=\"ws://host:port\", token=...) instead"
+            .into(),
+    ))
+}
+
 /// Restart a server pyprobe-rs spawned (stale-kernel recovery). Refused for
 /// foreign servers.
+#[cfg(unix)]
 pub(crate) fn heal_restart() -> Result<(), BridgeError> {
     let mut s = state().lock();
     if !s.manager.spawned_by_us() {
@@ -247,9 +285,21 @@ pub(crate) fn heal_restart() -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Unreachable off unix (`own_server_idle` never fires), but the attach-heal
+/// call path still references it.
+#[cfg(not(unix))]
+pub(crate) fn heal_restart() -> Result<(), BridgeError> {
+    Err(BridgeError::Connection(
+        "local server management requires unix; use \
+         pyprobe_rs.open(host=\"ws://host:port\", token=...) instead"
+            .into(),
+    ))
+}
+
 /// True when the running server was spawned by this crate, no attach is in
 /// flight, and no live connection exists — the preconditions for automatic
 /// stale-session healing.
+#[cfg(unix)]
 pub(crate) fn own_server_idle() -> bool {
     let s = state().lock();
     if !s.manager.spawned_by_us() || s.attach_inflight > 0 {
@@ -260,7 +310,14 @@ pub(crate) fn own_server_idle() -> bool {
     reg.is_empty()
 }
 
+/// No own server can exist off unix, so the heal gate stays closed.
+#[cfg(not(unix))]
+pub(crate) fn own_server_idle() -> bool {
+    false
+}
+
 /// Map a server-manager failure onto the bridge taxonomy.
+#[cfg(unix)]
 fn manager_err(e: ManagerError) -> BridgeError {
     use ManagerError as M;
     match e {

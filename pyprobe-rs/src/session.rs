@@ -13,6 +13,7 @@ use probe_rs_rpc::probe::{
 use probe_rs_rpc_client::RpcClient;
 use probe_rs_target::MemoryRegion;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// pyo3 0.29 removed the `PyObject` alias; spell it out once here.
 type PyObject = Py<PyAny>;
@@ -424,11 +425,18 @@ impl Session {
             .map_err(to_py_err)
     }
 
-    /// Get the target architecture.
+    /// Get the target architecture, from the attached session's primary core.
+    ///
+    /// Resolving it from the wire metadata rather than the client's builtin
+    /// registry keeps this working for chips the server knows but the client
+    /// does not.
     pub fn architecture(&self) -> PyResult<ArchitectureProxy> {
-        builtin_target(&self.meta.target_name)
-            .map(|t| architecture_to_py(t.architecture()))
-            .map_err(to_py_err)
+        let core = self.meta.cores.first().ok_or_else(|| {
+            py_err_with_kind("the attached session reports no cores".into(), "Rpc")
+        })?;
+        Ok(architecture_to_py(
+            rs_core_type(core.core_type).architecture(),
+        ))
     }
 
     /// Clear all hardware breakpoints across all cores.
@@ -793,14 +801,30 @@ impl Session {
     // ── RTT ────────────────────────────────────────────────────────
 
     /// Attach to RTT on the given core, optionally at a specific pointer.
-    #[pyo3(signature = (core_index=0, ptr=None))]
+    ///
+    /// `modes` maps an up-channel number to a `ChannelMode` applied when the
+    /// server configures that channel at attach time (the wire has no live
+    /// mode change); omitted channels keep the target's own mode.
+    #[pyo3(signature = (core_index=0, ptr=None, *, modes=None))]
     pub fn attach_rtt(
         slf: &Bound<'_, Self>,
         core_index: usize,
         ptr: Option<u64>,
+        modes: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<crate::rtt_::Rtt> {
         let conn = slf.borrow().conn()?;
-        crate::rtt_::attach(conn, core_index as u32, ptr)
+        let mut parsed: Vec<(usize, ChannelModeProxy)> = Vec::new();
+        if let Some(dict) = modes {
+            for (key, value) in dict.iter() {
+                let channel: usize = key.extract().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "attach_rtt modes keys must be channel numbers",
+                    )
+                })?;
+                parsed.push((channel, value.extract()?));
+            }
+        }
+        crate::rtt_::attach(conn, core_index as u32, ptr, parsed)
     }
 
     /// Close the session (idempotent). Later calls on this session and its

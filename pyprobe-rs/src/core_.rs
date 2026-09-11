@@ -12,8 +12,11 @@ use probe_rs_rpc::core_ops::{
 use probe_rs_rpc_client::{ClientError, CoreInterface, SessionInterface};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use probe_rs::{CoreRegister, CoreRegisters, RegisterRole};
 
 use crate::error::{BridgeError, Phase, py_err_with_kind, to_bridge_err};
 use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
@@ -30,263 +33,53 @@ const HALT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// deadline (the RPC round-trip itself must not eat into the wait).
 const BRIDGE_SLACK: Duration = Duration::from_secs(5);
 
-// ── Register name tables ───────────────────────────────────────────
+// ── Register catalog ───────────────────────────────────────────────
 //
 // The RPC wire carries bare `WireRegisterId(u16)` values with no name or
-// width metadata, so name resolution happens here. Both tables mirror the
-// register files in the probe-rs sources named in each block comment; the
-// server maps `WireRegisterId` straight onto `probe_rs::RegisterId`
-// (`probe-rs-tools/src/bin/probe-rs/rpc/functions/core_ops.rs`,
-// `from_wire_register_id`), so the ids are the probe-rs ids verbatim.
+// width metadata, so name resolution happens here. Rather than mirror each
+// architecture's register file, we reuse the probe-rs files the server maps
+// ids from (`CoreRegisters::for_core_type`): names, ids and widths stay in
+// lockstep with the server, and every architecture probe-rs knows is
+// covered rather than only the ones this facade once hard-coded.
 
-/// (name, id, base width in bits) for every register we expose, lowercase.
-type RegEntry = (&'static str, u16, u32);
-
-/// Mirror of `probe-rs/src/architecture/arm/core/registers/cortex_m.rs`:
-/// r0..r12 = 0..12, sp = 13, lr = 14, pc = 15, xpsr = 0b1_0000,
-/// msp = 0b10001, psp = 0b10010, control (EXTRA) = 0b10100,
-/// fpscr = 33, s0..s31 = 64..95. Everything is 32-bit.
-const CORTEX_M_REGISTERS: &[RegEntry] = &[
-    ("r0", 0, 32),
-    ("r1", 1, 32),
-    ("r2", 2, 32),
-    ("r3", 3, 32),
-    ("r4", 4, 32),
-    ("r5", 5, 32),
-    ("r6", 6, 32),
-    ("r7", 7, 32),
-    ("r8", 8, 32),
-    ("r9", 9, 32),
-    ("r10", 10, 32),
-    ("r11", 11, 32),
-    ("r12", 12, 32),
-    ("r13", 13, 32),
-    ("r14", 14, 32),
-    ("r15", 15, 32),
-    ("sp", 13, 32),
-    ("lr", 14, 32),
-    ("pc", 15, 32),
-    ("fp", 7, 32),
-    ("xpsr", 0b1_0000, 32),
-    ("msp", 0b10001, 32),
-    ("psp", 0b10010, 32),
-    ("control", 0b10100, 32),
-    ("extra", 0b10100, 32),
-    ("fpscr", 33, 32),
-    ("s0", 64, 32),
-    ("s1", 65, 32),
-    ("s2", 66, 32),
-    ("s3", 67, 32),
-    ("s4", 68, 32),
-    ("s5", 69, 32),
-    ("s6", 70, 32),
-    ("s7", 71, 32),
-    ("s8", 72, 32),
-    ("s9", 73, 32),
-    ("s10", 74, 32),
-    ("s11", 75, 32),
-    ("s12", 76, 32),
-    ("s13", 77, 32),
-    ("s14", 78, 32),
-    ("s15", 79, 32),
-    ("s16", 80, 32),
-    ("s17", 81, 32),
-    ("s18", 82, 32),
-    ("s19", 83, 32),
-    ("s20", 84, 32),
-    ("s21", 85, 32),
-    ("s22", 86, 32),
-    ("s23", 87, 32),
-    ("s24", 88, 32),
-    ("s25", 89, 32),
-    ("s26", 90, 32),
-    ("s27", 91, 32),
-    ("s28", 92, 32),
-    ("s29", 93, 32),
-    ("s30", 94, 32),
-    ("s31", 95, 32),
-];
-
-/// Mirror of `probe-rs/src/architecture/riscv/registers.rs`: pc = 0x7b1,
-/// x0..x31 = 0x1000..0x101f, f0..f31 = 0x1020..0x103f, and the FP CSRs
-/// fflags/frm/fcsr = 0x001/0x002/0x003. `registers64.rs` keeps every id and
-/// role identical and only widens the data types, so one table serves RV32
-/// and RV64 and the width is adjusted at lookup time. The second half of the
-/// table lists the ABI aliases from the file's `RegisterRole::Other` names.
-const RISCV_REGISTERS: &[RegEntry] = &[
-    ("pc", 0x7b1, 32),
-    ("x0", 0x1000, 32),
-    ("x1", 0x1001, 32),
-    ("x2", 0x1002, 32),
-    ("x3", 0x1003, 32),
-    ("x4", 0x1004, 32),
-    ("x5", 0x1005, 32),
-    ("x6", 0x1006, 32),
-    ("x7", 0x1007, 32),
-    ("x8", 0x1008, 32),
-    ("x9", 0x1009, 32),
-    ("x10", 0x100A, 32),
-    ("x11", 0x100B, 32),
-    ("x12", 0x100C, 32),
-    ("x13", 0x100D, 32),
-    ("x14", 0x100E, 32),
-    ("x15", 0x100F, 32),
-    ("x16", 0x1010, 32),
-    ("x17", 0x1011, 32),
-    ("x18", 0x1012, 32),
-    ("x19", 0x1013, 32),
-    ("x20", 0x1014, 32),
-    ("x21", 0x1015, 32),
-    ("x22", 0x1016, 32),
-    ("x23", 0x1017, 32),
-    ("x24", 0x1018, 32),
-    ("x25", 0x1019, 32),
-    ("x26", 0x101A, 32),
-    ("x27", 0x101B, 32),
-    ("x28", 0x101C, 32),
-    ("x29", 0x101D, 32),
-    ("x30", 0x101E, 32),
-    ("x31", 0x101F, 32),
-    ("zero", 0x1000, 32),
-    ("ra", 0x1001, 32),
-    ("sp", 0x1002, 32),
-    ("gp", 0x1003, 32),
-    ("tp", 0x1004, 32),
-    ("t0", 0x1005, 32),
-    ("t1", 0x1006, 32),
-    ("t2", 0x1007, 32),
-    ("fp", 0x1008, 32),
-    ("s0", 0x1008, 32),
-    ("s1", 0x1009, 32),
-    ("a0", 0x100A, 32),
-    ("a1", 0x100B, 32),
-    ("a2", 0x100C, 32),
-    ("a3", 0x100D, 32),
-    ("a4", 0x100E, 32),
-    ("a5", 0x100F, 32),
-    ("a6", 0x1010, 32),
-    ("a7", 0x1011, 32),
-    ("s2", 0x1012, 32),
-    ("s3", 0x1013, 32),
-    ("s4", 0x1014, 32),
-    ("s5", 0x1015, 32),
-    ("s6", 0x1016, 32),
-    ("s7", 0x1017, 32),
-    ("s8", 0x1018, 32),
-    ("s9", 0x1019, 32),
-    ("s10", 0x101A, 32),
-    ("s11", 0x101B, 32),
-    ("t3", 0x101C, 32),
-    ("t4", 0x101D, 32),
-    ("t5", 0x101E, 32),
-    ("t6", 0x101F, 32),
-    ("fflags", 0x001, 32),
-    ("frm", 0x002, 32),
-    ("fcsr", 0x003, 32),
-    ("f0", 0x1020, 32),
-    ("f1", 0x1021, 32),
-    ("f2", 0x1022, 32),
-    ("f3", 0x1023, 32),
-    ("f4", 0x1024, 32),
-    ("f5", 0x1025, 32),
-    ("f6", 0x1026, 32),
-    ("f7", 0x1027, 32),
-    ("f8", 0x1028, 32),
-    ("f9", 0x1029, 32),
-    ("f10", 0x102A, 32),
-    ("f11", 0x102B, 32),
-    ("f12", 0x102C, 32),
-    ("f13", 0x102D, 32),
-    ("f14", 0x102E, 32),
-    ("f15", 0x102F, 32),
-    ("f16", 0x1030, 32),
-    ("f17", 0x1031, 32),
-    ("f18", 0x1032, 32),
-    ("f19", 0x1033, 32),
-    ("f20", 0x1034, 32),
-    ("f21", 0x1035, 32),
-    ("f22", 0x1036, 32),
-    ("f23", 0x1037, 32),
-    ("f24", 0x1038, 32),
-    ("f25", 0x1039, 32),
-    ("f26", 0x103A, 32),
-    ("f27", 0x103B, 32),
-    ("f28", 0x103C, 32),
-    ("f29", 0x103D, 32),
-    ("f30", 0x103E, 32),
-    ("f31", 0x103F, 32),
-    ("ft0", 0x1020, 32),
-    ("ft1", 0x1021, 32),
-    ("ft2", 0x1022, 32),
-    ("ft3", 0x1023, 32),
-    ("ft4", 0x1024, 32),
-    ("ft5", 0x1025, 32),
-    ("ft6", 0x1026, 32),
-    ("ft7", 0x1027, 32),
-    ("fs0", 0x1028, 32),
-    ("fs1", 0x1029, 32),
-    ("fa0", 0x102A, 32),
-    ("fa1", 0x102B, 32),
-    ("fa2", 0x102C, 32),
-    ("fa3", 0x102D, 32),
-    ("fa4", 0x102E, 32),
-    ("fa5", 0x102F, 32),
-    ("fa6", 0x1030, 32),
-    ("fa7", 0x1031, 32),
-    ("fs2", 0x1032, 32),
-    ("fs3", 0x1033, 32),
-    ("fs4", 0x1034, 32),
-    ("fs5", 0x1035, 32),
-    ("fs6", 0x1036, 32),
-    ("fs7", 0x1037, 32),
-    ("fs8", 0x1038, 32),
-    ("fs9", 0x1039, 32),
-    ("fs10", 0x103A, 32),
-    ("fs11", 0x103B, 32),
-    ("ft8", 0x103C, 32),
-    ("ft9", 0x103D, 32),
-    ("ft10", 0x103E, 32),
-    ("ft11", 0x103F, 32),
-];
-
-/// The register catalog for `instruction_set`, or `None` for architectures
-/// whose register file we do not mirror (AArch64, Xtensa).
-fn table_for(instruction_set: WireInstructionSet) -> Option<&'static [RegEntry]> {
-    match instruction_set {
-        WireInstructionSet::RV32
-        | WireInstructionSet::RV32C
-        | WireInstructionSet::RV64
-        | WireInstructionSet::RV64C => Some(RISCV_REGISTERS),
-        WireInstructionSet::Thumb2 | WireInstructionSet::A32 => Some(CORTEX_M_REGISTERS),
+/// Every name a register answers to: the architecture-defined primary name
+/// plus role aliases (`Other`, `Argument`, `Return`).
+fn register_names(r: &CoreRegister) -> impl Iterator<Item = &'static str> {
+    r.roles.iter().filter_map(|role| match role {
+        RegisterRole::Core(n)
+        | RegisterRole::Argument(n)
+        | RegisterRole::Return(n)
+        | RegisterRole::Other(n) => Some(*n),
         _ => None,
-    }
+    })
 }
 
-/// Width of `name` under `instruction_set`, applying the RV64 widening from
-/// `registers64.rs`: data registers widen to 64-bit, the FP CSRs stay 32-bit.
-fn reg_bits(instruction_set: WireInstructionSet, name: &str, base: u32) -> u32 {
-    match instruction_set {
-        WireInstructionSet::RV64 | WireInstructionSet::RV64C => {
-            if matches!(name, "fflags" | "frm" | "fcsr") {
-                32
-            } else {
-                64
-            }
-        }
-        _ => base,
-    }
-}
-
-fn is_riscv(instruction_set: WireInstructionSet) -> bool {
-    matches!(
-        instruction_set,
-        WireInstructionSet::RV32
-            | WireInstructionSet::RV32C
-            | WireInstructionSet::RV64
-            | WireInstructionSet::RV64C
+/// The register file matching a wire instruction set. `for_core_type` picks
+/// the FPU and 64-bit variants from the live metadata, so the returned file
+/// is the one the server reads from.
+fn registers_for(
+    instruction_set: WireInstructionSet,
+    fpu_support: bool,
+    floating_point_register_count: Option<u64>,
+) -> &'static CoreRegisters {
+    let core_type = match instruction_set {
+        // The Cortex-M families share one file; the FPU flag selects the
+        // variant. A32 uses the AArch32 file on both v7-A/R and 32-bit v8-A.
+        WireInstructionSet::Thumb2 => probe_rs::CoreType::Armv7m,
+        WireInstructionSet::A32 => probe_rs::CoreType::Armv7a,
+        WireInstructionSet::A64 => probe_rs::CoreType::Armv8a,
+        WireInstructionSet::RV32 | WireInstructionSet::RV32C => probe_rs::CoreType::Riscv,
+        WireInstructionSet::RV64 | WireInstructionSet::RV64C => probe_rs::CoreType::Riscv64,
+        WireInstructionSet::Xtensa => probe_rs::CoreType::Xtensa,
+    };
+    CoreRegisters::for_core_type(
+        core_type,
+        fpu_support,
+        floating_point_register_count.map(|c| c as usize),
     )
 }
 
+/// True for instruction sets whose registers are 64 bits wide.
 fn instruction_set_is_64_bit(instruction_set: WireInstructionSet) -> bool {
     matches!(
         instruction_set,
@@ -294,37 +87,32 @@ fn instruction_set_is_64_bit(instruction_set: WireInstructionSet) -> bool {
     )
 }
 
-/// Which table defines a lowercase register name.
-enum NameHit {
-    /// Defined only in the Cortex-M table; always 32-bit.
-    CortexM(u16),
-    /// Defined only in the RISC-V table; the width follows RV64 widening.
-    Riscv(u16),
-    /// Defined in both tables with different ids (`pc`, `sp`, `fp`,
-    /// `s0`..`s11`); the core's instruction set decides.
-    Ambiguous,
-    /// Unknown name.
-    None,
+/// Arch-neutral aliases the facade accepts beside a register's own names,
+/// matching the old in-process binding (`pc`/`sp`/`lr`/`fp`).
+const ROLE_ALIASES: &[(&str, RegisterRole)] = &[
+    ("pc", RegisterRole::ProgramCounter),
+    ("sp", RegisterRole::StackPointer),
+    ("lr", RegisterRole::ReturnAddress),
+    ("fp", RegisterRole::FramePointer),
+];
+
+/// The register playing `role`, if the file defines one.
+fn role_register(
+    regs: &'static CoreRegisters,
+    role: RegisterRole,
+) -> Option<&'static CoreRegister> {
+    regs.all_registers().find(|r| r.register_has_role(role))
 }
 
-/// Look `name` up across both static tables. Most names live in exactly one
-/// table, so this usually avoids the metadata roundtrip.
-fn lookup_name(name: &str) -> NameHit {
-    let cm = CORTEX_M_REGISTERS.iter().find(|(n, _, _)| *n == name);
-    let rv = RISCV_REGISTERS.iter().find(|(n, _, _)| *n == name);
-    match (cm, rv) {
-        (Some((_, id, _)), None) => NameHit::CortexM(*id),
-        (None, Some((_, id, _))) => NameHit::Riscv(*id),
-        (Some(_), Some(_)) => NameHit::Ambiguous,
-        (None, None) => NameHit::None,
-    }
+fn role_register_missing(role: &str) -> PyErr {
+    py_err_with_kind(format!("this core has no {role} register"), "Register")
 }
 
-fn unknown_register(name: &str) -> PyErr {
-    let mut known: Vec<&str> = CORTEX_M_REGISTERS
-        .iter()
-        .chain(RISCV_REGISTERS.iter())
-        .map(|(n, _, _)| *n)
+fn unknown_register(name: &str, regs: &CoreRegisters) -> PyErr {
+    let mut known: Vec<String> = regs
+        .all_registers()
+        .flat_map(register_names)
+        .map(|n| n.to_lowercase())
         .collect();
     known.sort_unstable();
     known.dedup();
@@ -475,8 +263,8 @@ pub struct CoreRegisterInfo {
 pub struct CoreHandle {
     conn: Arc<Connection>,
     core: u32,
-    /// Instruction set of this core, fetched once on first need. Decides
-    /// between the static register tables and the RV64 width adjustment.
+    /// Instruction set of this core, fetched once on first need. Selects the
+    /// probe-rs register file and backs the `is_64_bit` shortcut.
     /// `OnceLock` because the value only exists after a runtime RPC.
     instruction_set: OnceLock<WireInstructionSet>,
 }
@@ -579,10 +367,24 @@ impl CoreHandle {
         Ok(meta.instruction_set)
     }
 
+    /// The core's register file, from live metadata (one RPC unless the
+    /// instruction set was already cached). Names, ids and widths come
+    /// straight from probe-rs, so every architecture the server supports
+    /// resolves — not only the ones this facade once hard-coded.
+    fn registers_for_core(&self, py: Python<'_>) -> PyResult<&'static CoreRegisters> {
+        let meta = self.core_metadata(py)?;
+        let _ = self.instruction_set.set(meta.instruction_set);
+        Ok(registers_for(
+            meta.instruction_set,
+            meta.fpu_support,
+            meta.floating_point_register_count,
+        ))
+    }
+
     /// Resolve a register name or raw id to a wire register id. Names are
-    /// matched case-insensitively across both static tables; names defined
-    /// in both (`pc`, `sp`, `fp`, `s0`..`s11`) are disambiguated through the
-    /// core's instruction set. Raw ids pass through untouched.
+    /// matched case-insensitively against the core's register file (primary
+    /// names and role aliases), so `r0`/`R0`, `xpsr`, `pc` and the ABI names
+    /// all work. Integers pass through untouched.
     fn resolve_register(
         &self,
         py: Python<'_>,
@@ -594,53 +396,22 @@ impl CoreHandle {
         if let Ok(id) = name_or_id.extract::<i64>() {
             return Ok((WireRegisterId(id as u16), None));
         }
-        let name = name_or_id.extract::<String>()?.to_lowercase();
-        match lookup_name(&name) {
-            NameHit::CortexM(id) => Ok((WireRegisterId(id), Some(32))),
-            NameHit::Riscv(id) => {
-                // Only the RISC-V width depends on the instruction set
-                // (RV64 widens the data registers); the id itself does not.
-                let is = self.ensure_instruction_set(py)?;
-                Ok((WireRegisterId(id), Some(reg_bits(is, &name, 32))))
-            }
-            NameHit::Ambiguous => {
-                let is = self.ensure_instruction_set(py)?;
-                match table_for(is) {
-                    Some(table) => match table.iter().find(|(n, _, _)| *n == name) {
-                        Some((n, id, base)) => {
-                            Ok((WireRegisterId(*id), Some(reg_bits(is, n, *base))))
-                        }
-                        None => Err(unknown_register(&name)),
-                    },
-                    None => self.resolve_role_name(is, &name),
+        let name = name_or_id.extract::<String>()?;
+        let regs = self.registers_for_core(py)?;
+        if let Some(reg) = regs
+            .all_registers()
+            .find(|r| register_names(r).any(|n| n.eq_ignore_ascii_case(&name)))
+        {
+            return Ok((WireRegisterId(reg.id().0), Some(reg.size_in_bits() as u32)));
+        }
+        for (alias, role) in ROLE_ALIASES {
+            if alias.eq_ignore_ascii_case(&name) {
+                if let Some(reg) = role_register(regs, *role) {
+                    return Ok((WireRegisterId(reg.id().0), Some(reg.size_in_bits() as u32)));
                 }
             }
-            NameHit::None => Err(unknown_register(&name)),
         }
-    }
-
-    /// Role-name fallback for architectures without a static table
-    /// (AArch64 ids from `aarch64.rs`, Xtensa ids from
-    /// `architecture/xtensa/registers.rs`).
-    fn resolve_role_name(
-        &self,
-        is: WireInstructionSet,
-        name: &str,
-    ) -> PyResult<(WireRegisterId, Option<u32>)> {
-        match (is, name) {
-            // Xtensa: pc is a special register, sp = a1, return address = a0.
-            (WireInstructionSet::Xtensa, "pc") => Ok((WireRegisterId(0xFF00), Some(32))),
-            (WireInstructionSet::Xtensa, "sp") => Ok((WireRegisterId(0x0001), Some(32))),
-            (WireInstructionSet::Xtensa, "lr") | (WireInstructionSet::Xtensa, "ra") => {
-                Ok((WireRegisterId(0x0000), Some(32)))
-            }
-            // AArch64: pc = 32, sp = 31, fp = x29, lr = x30; all 64-bit.
-            (WireInstructionSet::A64, "pc") => Ok((WireRegisterId(32), Some(64))),
-            (WireInstructionSet::A64, "sp") => Ok((WireRegisterId(31), Some(64))),
-            (WireInstructionSet::A64, "fp") => Ok((WireRegisterId(29), Some(64))),
-            (WireInstructionSet::A64, "lr") => Ok((WireRegisterId(30), Some(64))),
-            _ => Err(unknown_register(name)),
-        }
+        Err(unknown_register(&name, regs))
     }
 
     /// Read one register as u128.
@@ -971,23 +742,31 @@ impl CoreHandle {
     // ── Named register shortcuts ──────────────────────────────────
 
     fn read_pc(&self, py: Python<'_>) -> PyResult<u64> {
-        let id = self.program_counter_id(py)?;
-        self.read_reg_u64(py, id)
+        let regs = self.registers_for_core(py)?;
+        let reg = role_register(regs, RegisterRole::ProgramCounter)
+            .ok_or_else(|| role_register_missing("program counter"))?;
+        self.read_reg_u64(py, WireRegisterId(reg.id().0))
     }
 
     fn read_sp(&self, py: Python<'_>) -> PyResult<u64> {
-        let id = self.role_register_id(py, "sp")?;
-        self.read_reg_u64(py, id)
+        let regs = self.registers_for_core(py)?;
+        let reg = role_register(regs, RegisterRole::StackPointer)
+            .ok_or_else(|| role_register_missing("stack pointer"))?;
+        self.read_reg_u64(py, WireRegisterId(reg.id().0))
     }
 
     fn read_fp(&self, py: Python<'_>) -> PyResult<u64> {
-        let id = self.role_register_id(py, "fp")?;
-        self.read_reg_u64(py, id)
+        let regs = self.registers_for_core(py)?;
+        let reg = role_register(regs, RegisterRole::FramePointer)
+            .ok_or_else(|| role_register_missing("frame pointer"))?;
+        self.read_reg_u64(py, WireRegisterId(reg.id().0))
     }
 
     fn read_return_address(&self, py: Python<'_>) -> PyResult<u64> {
-        let id = self.return_address_id(py)?;
-        self.read_reg_u64(py, id)
+        let regs = self.registers_for_core(py)?;
+        let reg = role_register(regs, RegisterRole::ReturnAddress)
+            .ok_or_else(|| role_register_missing("return address"))?;
+        self.read_reg_u64(py, WireRegisterId(reg.id().0))
     }
 
     // ── Breakpoints ────────────────────────────────────────────────
@@ -1187,43 +966,33 @@ impl CoreHandle {
         ))
     }
 
-    /// Snapshot of the registers this facade knows for the core's
-    /// architecture (the wire carries no name table; Cortex-M and RISC-V
-    /// files are built in). Floating-point registers are listed only when
-    /// the core has an FPU.
+    /// Snapshot of every register probe-rs defines for this core's
+    /// architecture. Names are lowercased, and the arch-neutral
+    /// `pc`/`sp`/`lr`/`fp` aliases are appended when the file exposes the
+    /// register under another name.
     fn registers(&self, py: Python<'_>) -> PyResult<Vec<CoreRegisterInfo>> {
-        let meta = self.core_metadata(py)?;
-        let is = meta.instruction_set;
-        let _ = self.instruction_set.set(is);
-        let Some(table) = table_for(is) else {
-            return Err(py_err_with_kind(
-                format!(
-                    "register names for {is:?} cores are not built into pyprobe-rs; \
-                     address registers by numeric ID instead"
-                ),
-                "Register",
-            ));
-        };
-        Ok(table
-            .iter()
-            .filter(|(name, _, _)| {
-                // Keep FP registers only for cores with an FPU: on RISC-V
-                // every FP register name starts with 'f' (but 'fp' is the
-                // integer frame pointer, x8); on Cortex-M it is fpscr plus
-                // s0..s31 ('sp' is the only other s-name).
-                let fp = if is_riscv(is) {
-                    name.starts_with('f') && *name != "fp"
-                } else {
-                    *name == "fpscr" || (name.starts_with('s') && *name != "sp")
-                };
-                !fp || meta.fpu_support
+        let regs = self.registers_for_core(py)?;
+        let mut out: Vec<CoreRegisterInfo> = regs
+            .all_registers()
+            .map(|r| CoreRegisterInfo {
+                name: r.name().to_lowercase(),
+                id: r.id().0,
+                size_in_bits: r.size_in_bits() as u32,
             })
-            .map(|(name, id, base)| CoreRegisterInfo {
-                name: name.to_string(),
-                id: *id,
-                size_in_bits: reg_bits(is, name, *base),
-            })
-            .collect())
+            .collect();
+        let mut seen: HashSet<String> = out.iter().map(|r| r.name.clone()).collect();
+        for (alias, role) in ROLE_ALIASES {
+            if let Some(reg) = role_register(regs, *role) {
+                if seen.insert((*alias).to_string()) {
+                    out.push(CoreRegisterInfo {
+                        name: (*alias).to_string(),
+                        id: reg.id().0,
+                        size_in_bits: reg.size_in_bits() as u32,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Memory regions of the attached target as (kind, start, end) tuples,
@@ -1292,63 +1061,6 @@ impl CoreHandle {
                 )
             })?;
         Ok(wire_core_type_to_local(wire_type))
-    }
-
-    /// Register id of the program counter for this core's architecture.
-    fn program_counter_id(&self, py: Python<'_>) -> PyResult<WireRegisterId> {
-        let is = self.ensure_instruction_set(py)?;
-        let id = match is {
-            // cortex_m.rs: PC = 15.
-            WireInstructionSet::Thumb2 | WireInstructionSet::A32 => 15,
-            // aarch64.rs: PC has its own id slot on AArch64.
-            WireInstructionSet::A64 => 32,
-            // riscv/registers.rs: the DPC/pc debug register.
-            WireInstructionSet::RV32
-            | WireInstructionSet::RV32C
-            | WireInstructionSet::RV64
-            | WireInstructionSet::RV64C => 0x7b1,
-            // xtensa/registers.rs: pc is a special register.
-            WireInstructionSet::Xtensa => 0xFF00,
-        };
-        Ok(WireRegisterId(id))
-    }
-
-    /// Register id of the return-address register for this architecture.
-    fn return_address_id(&self, py: Python<'_>) -> PyResult<WireRegisterId> {
-        let is = self.ensure_instruction_set(py)?;
-        let id = match is {
-            WireInstructionSet::Thumb2 | WireInstructionSet::A32 => 14,
-            WireInstructionSet::A64 => 30,
-            WireInstructionSet::RV32
-            | WireInstructionSet::RV32C
-            | WireInstructionSet::RV64
-            | WireInstructionSet::RV64C => 0x1001,
-            WireInstructionSet::Xtensa => 0x0000,
-        };
-        Ok(WireRegisterId(id))
-    }
-
-    /// Register id of a role name (`sp`, `fp`) for this architecture.
-    fn role_register_id(&self, py: Python<'_>, role: &str) -> PyResult<WireRegisterId> {
-        let is = self.ensure_instruction_set(py)?;
-        let (sp, fp): (u16, Option<u16>) = match is {
-            WireInstructionSet::Thumb2 | WireInstructionSet::A32 => (13, Some(7)),
-            WireInstructionSet::A64 => (31, Some(29)),
-            WireInstructionSet::RV32
-            | WireInstructionSet::RV32C
-            | WireInstructionSet::RV64
-            | WireInstructionSet::RV64C => (0x1002, Some(0x1008)),
-            // Xtensa has no frame-pointer role; sp is a1.
-            WireInstructionSet::Xtensa => (0x0001, None),
-        };
-        match (role, fp) {
-            ("sp", _) => Ok(WireRegisterId(sp)),
-            ("fp", Some(fp)) => Ok(WireRegisterId(fp)),
-            _ => Err(py_err_with_kind(
-                format!("register {role} does not exist on this core"),
-                "Register",
-            )),
-        }
     }
 }
 

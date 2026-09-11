@@ -1,6 +1,6 @@
 //! Probe enumeration, opening, and FakeProbe.
 
-use crate::error::to_py_err;
+use crate::error::{py_err_with_kind, to_py_err};
 use crate::session::{Permissions, Session};
 use probe_rs::probe::{DebugProbeInfo, Probe, WireProtocol, list::Lister};
 use probe_rs_rpc::probe::DebugProbeEntry;
@@ -57,6 +57,7 @@ impl ListerPy {
             dry_run: false,
             speed_khz: None,
             protocol: None,
+            enumerated_remotely: false,
         })
     }
 }
@@ -67,11 +68,12 @@ pub struct ProbeInfo {
     identifier: String,
     vendor_id: u16,
     product_id: u16,
+    interface: Option<u8>,
     serial_number: Option<String>,
     probe_type: String,
     inaccessible: bool,
     /// Present only for locally-listed probes; RPC listings carry no probe
-    /// factory handle, so only local entries can be opened directly.
+    /// factory handle, so only local entries hold one.
     local: Option<DebugProbeInfo>,
 }
 
@@ -81,6 +83,8 @@ impl From<DebugProbeInfo> for ProbeInfo {
             identifier: info.identifier.clone(),
             vendor_id: info.vendor_id,
             product_id: info.product_id,
+            // DebugProbeInfo cannot expose its interface (private field).
+            interface: None,
             serial_number: info.serial_number.clone(),
             // DebugProbeInfo cannot expose its probe factory (private
             // field), so the type name is only known for RPC listings.
@@ -98,6 +102,7 @@ impl ProbeInfo {
             identifier: entry.identifier.clone(),
             vendor_id: entry.vendor_id,
             product_id: entry.product_id,
+            interface: entry.interface,
             serial_number: Some(entry.serial_number.clone()).filter(|s| !s.is_empty()),
             probe_type: entry.probe_type.clone(),
             inaccessible: entry.inaccessible,
@@ -144,26 +149,50 @@ impl ProbeInfo {
         self.inaccessible
     }
 
-    /// Open this probe locally (only available for locally-listed probes).
+    /// Open this probe.
+    ///
+    /// Locally-listed probes open a local handle (the direct-probe escape
+    /// hatch). Probes listed by the server are opened as a server-side
+    /// selector: the returned `Probe` has no local handle, but `attach()`
+    /// routes through the server and selects this probe.
     fn open(&self) -> PyResult<ProbePy> {
-        let info = self.local.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "open() is only available for locally-listed probes; attach through \
-                 Session.auto_attach() or Lister.open(selector).attach() instead",
-            )
-        })?;
-        let probe = info.open().map_err(to_py_err)?;
+        if let Some(info) = &self.local {
+            let probe = info.open().map_err(to_py_err)?;
+            return Ok(ProbePy {
+                inner: Some(probe),
+                selector: Some(probe_rs::probe::DebugProbeSelector {
+                    vendor_id: self.vendor_id,
+                    product_id: self.product_id,
+                    serial_number: self.serial_number.clone(),
+                    interface: self.interface,
+                }),
+                dry_run: false,
+                speed_khz: None,
+                protocol: None,
+                enumerated_remotely: false,
+            });
+        }
+        if self.inaccessible {
+            return Err(py_err_with_kind(
+                format!(
+                    "probe {} is not accessible (check permissions, e.g. udev rules)",
+                    self.identifier
+                ),
+                "Probe",
+            ));
+        }
         Ok(ProbePy {
-            inner: Some(probe),
+            inner: None,
             selector: Some(probe_rs::probe::DebugProbeSelector {
                 vendor_id: self.vendor_id,
                 product_id: self.product_id,
                 serial_number: self.serial_number.clone(),
-                interface: None,
+                interface: self.interface,
             }),
             dry_run: false,
             speed_khz: None,
             protocol: None,
+            enumerated_remotely: true,
         })
     }
 
@@ -172,6 +201,22 @@ impl ProbeInfo {
             "ProbeInfo(vid={:#06x}, pid={:#06x}, serial={:?}, type={})",
             self.vendor_id, self.product_id, self.serial_number, self.probe_type
         )
+    }
+}
+
+/// Error for a `Probe` without a local handle: either it was consumed by
+/// `attach()`, or it was enumerated by the server and only supports
+/// `attach()`/`attach_under_reset()`.
+fn no_local_handle(enumerated_remotely: bool) -> PyErr {
+    if enumerated_remotely {
+        py_err_with_kind(
+            "this probe was enumerated by the server and has no local handle; \
+             call attach(target) to use it"
+                .into(),
+            "Probe",
+        )
+    } else {
+        py_err_with_kind("Probe consumed".into(), "Probe")
     }
 }
 
@@ -193,6 +238,10 @@ pub struct ProbePy {
     /// because the server owns the real probe handle after attach.
     pub(crate) speed_khz: Option<u32>,
     pub(crate) protocol: Option<WireProtocolProxy>,
+    /// True for a probe opened from a server listing: it carries only a
+    /// selector, so probe-level operations raise and `attach()` is the way
+    /// to use it.
+    pub(crate) enumerated_remotely: bool,
 }
 
 impl From<Probe> for ProbePy {
@@ -203,6 +252,7 @@ impl From<Probe> for ProbePy {
             dry_run: false,
             speed_khz: None,
             protocol: None,
+            enumerated_remotely: false,
         }
     }
 }
@@ -232,7 +282,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.set_speed(khz).map_err(to_py_err)?;
         self.speed_khz = Some(khz);
         Ok(khz)
@@ -246,7 +296,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.select_protocol(wp).map_err(to_py_err)?;
         self.protocol = Some(protocol);
         Ok(())
@@ -256,7 +306,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.protocol().map(|p| match p {
             WireProtocol::Swd => WireProtocolProxy::Swd,
             WireProtocol::Jtag => WireProtocolProxy::Jtag,
@@ -267,7 +317,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.detach().map_err(to_py_err)
     }
 
@@ -275,7 +325,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.target_reset().map_err(to_py_err)
     }
 
@@ -283,7 +333,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.target_reset_assert().map_err(to_py_err)
     }
 
@@ -291,7 +341,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.target_reset_deassert().map_err(to_py_err)
     }
 
@@ -299,7 +349,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         probe.get_target_voltage().map_err(to_py_err)
     }
 
@@ -307,7 +357,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.get_name())
     }
 
@@ -315,7 +365,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.speed_khz())
     }
 
@@ -323,7 +373,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.has_arm_debug_interface())
     }
 
@@ -331,7 +381,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.has_riscv_interface())
     }
 
@@ -339,7 +389,7 @@ impl ProbePy {
         let probe = self
             .inner
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Probe consumed"))?;
+            .ok_or_else(|| no_local_handle(self.enumerated_remotely))?;
         Ok(probe.has_xtensa_interface())
     }
 
@@ -356,6 +406,7 @@ impl ProbePy {
             dry_run: true,
             speed_khz: None,
             protocol: None,
+            enumerated_remotely: false,
         })
     }
 
@@ -439,6 +490,7 @@ impl FakeProbePy {
             dry_run: true,
             speed_khz: None,
             protocol: None,
+            enumerated_remotely: false,
         })
     }
 }

@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 use crate::error::{BridgeError, py_err_with_kind, to_bridge_err};
 use crate::events::{ChannelRing, RttPoller, SubscribedChannel};
 use crate::rpc::{Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
-use crate::types::ChannelModeProxy;
+use crate::types::{ChannelModeProxy, channel_mode_to_wire};
 
 /// Bridge deadline for one down-channel write. The server retries the write
 /// itself while the target's buffer is full; this only bounds the round trip.
@@ -48,8 +48,8 @@ fn rtt_err(e: BridgeError) -> PyErr {
 fn live_mode_unsupported() -> PyErr {
     py_err_with_kind(
         "the RPC wire cannot read or change the RTT channel mode after \
-         attach; the mode is fixed by the attach-time channel configuration \
-         (pyprobe-rs keeps the target's own configuration)"
+         attach; pass modes={channel_number: ChannelMode} to \
+         Session.attach_rtt() to configure it at attach time"
             .into(),
         "NotImplemented",
     )
@@ -64,13 +64,19 @@ fn buffer_size_unsupported() -> PyErr {
 }
 
 /// Attach to RTT on the session's core, optionally at a known control-block
-/// pointer.
+/// pointer and with per-channel buffering modes applied at attach time.
 ///
 /// Creates the server-side RTT client — scanning exactly `ptr` when given,
-/// all RAM otherwise — and snapshots the channel list. Channels keep the
-/// target's own buffering mode: the wire applies channel configuration only
-/// at attach time and has no live mode endpoint.
-pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyResult<Rtt> {
+/// all RAM otherwise — and snapshots the channel list. `modes` maps an
+/// up-channel number to the mode the server applies when it configures the
+/// channel (the wire has no live mode endpoint). Channels without an entry
+/// keep the target's own buffering mode.
+pub(crate) fn attach(
+    conn: Arc<Connection>,
+    core: u32,
+    ptr: Option<u64>,
+    modes: Vec<(usize, ChannelModeProxy)>,
+) -> PyResult<Rtt> {
     // The wire derives the polled core from the scan region (an exact pointer
     // pins its core, the default RAM scan covers core 0); a `core` index
     // without a pointer has no wire field to land in, so it stays advisory.
@@ -79,8 +85,21 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
         Some(addr) => ScanRegion::Exact(addr),
         None => ScanRegion::default(),
     };
-    // No channel overrides: the default config keeps `mode: None`, i.e. the
-    // target's own buffering mode for every channel.
+    // The server indexes its mode table by UP-channel number, so the config
+    // vector must be dense up to the highest configured channel.
+    let config: Vec<RttChannelConfig> = match modes.iter().map(|(n, _)| *n).max() {
+        Some(max) => (0..=max)
+            .map(|n| RttChannelConfig {
+                channel_number: Some(n as u32),
+                mode: modes
+                    .iter()
+                    .find(|(m, _)| *m == n)
+                    .map(|(_, mode)| channel_mode_to_wire(*mode)),
+                ..RttChannelConfig::default()
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let default_config = RttChannelConfig::default();
 
     let (handle, channels) = Python::attach(|py| {
@@ -96,7 +115,7 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
                         "rtt attach",
                         conn.session()?.create_rtt_client(
                             scan.clone(),
-                            Vec::new(),
+                            config.clone(),
                             default_config.clone(),
                         ),
                     )
@@ -115,12 +134,19 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
         )
     })?;
 
-    let state = |metas: &[RttChannelMeta]| -> Vec<ChannelState> {
+    let mode_of = |n: u32| {
+        modes
+            .iter()
+            .find(|(m, _)| *m as u32 == n)
+            .map(|(_, mode)| *mode)
+    };
+    let state = |metas: &[RttChannelMeta], with_modes: bool| -> Vec<ChannelState> {
         metas
             .iter()
             .map(|m| ChannelState {
                 number: m.number,
                 name: Some(m.name.clone()),
+                mode: if with_modes { mode_of(m.number) } else { None },
                 ring: Arc::new(ChannelRing::new()),
             })
             .collect()
@@ -129,8 +155,9 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
     Ok(Rtt {
         conn,
         rtt: handle,
-        up: state(&channels.up),
-        down: state(&channels.down),
+        ptr,
+        up: state(&channels.up, true),
+        down: state(&channels.down, false),
         poller: None,
     })
 }
@@ -139,6 +166,10 @@ pub(crate) fn attach(conn: Arc<Connection>, core: u32, ptr: Option<u64>) -> PyRe
 struct ChannelState {
     number: u32,
     name: Option<String>,
+    /// Mode configured at attach time, when the caller overrode it. `None`
+    /// means the channel kept the target's own mode (which the wire cannot
+    /// report), so `mode()` stays unavailable for it.
+    mode: Option<ChannelModeProxy>,
     /// Host-side drop-oldest ring fed by the background poller; always
     /// present so `pop()` works before, during, and after streaming.
     ring: Arc<ChannelRing>,
@@ -181,6 +212,9 @@ impl ChannelInfo {
 pub struct Rtt {
     conn: Arc<Connection>,
     rtt: Key<RttClient>,
+    /// Control-block address pinned by the caller, when one was given:
+    /// `ScanRegion::Exact` attaches there, so it is authoritative.
+    ptr: Option<u64>,
     up: Vec<ChannelState>,
     down: Vec<ChannelState>,
     /// Background poller started by `start_streaming`; `None` until then.
@@ -237,14 +271,18 @@ impl Rtt {
         })
     }
 
-    /// Control-block address. The RPC wire does not expose it.
+    /// Control-block address. Known only when `attach_rtt(ptr=...)` pinned it;
+    /// the wire does not report the address found by a scan.
     fn ptr(&self) -> PyResult<u64> {
-        Err(py_err_with_kind(
-            "the RPC wire does not expose the RTT control block address; \
-             pass ptr= to Session.attach_rtt() when you know it"
-                .into(),
-            "NotImplemented",
-        ))
+        self.ptr.ok_or_else(|| {
+            py_err_with_kind(
+                "the RTT control block address is only known when \
+                 attach_rtt(ptr=...) pinned it; the RPC wire does not report \
+                 the address found by a RAM scan"
+                    .into(),
+                "NotImplemented",
+            )
+        })
     }
 
     /// Keep every up channel drained in the background while Python runs
@@ -394,9 +432,19 @@ impl UpChannel {
         Err(buffer_size_unsupported())
     }
 
-    /// The channel's buffering mode. The RPC wire cannot read it live.
-    fn mode(&self) -> PyResult<ChannelModeProxy> {
-        Err(live_mode_unsupported())
+    /// The channel's buffering mode, when it was set at attach time.
+    ///
+    /// The wire cannot read the live mode, so a channel left at the target's
+    /// own configuration reports `NotImplemented`; pass `modes=` to
+    /// `Session.attach_rtt()` to make it known.
+    fn mode(&self, py: Python<'_>) -> PyResult<ChannelModeProxy> {
+        self.rtt
+            .bind(py)
+            .borrow()
+            .up
+            .get(self.channel_number)
+            .and_then(|c| c.mode)
+            .ok_or_else(live_mode_unsupported)
     }
 
     /// Set the buffering mode for this channel. The RPC wire has no live
