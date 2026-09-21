@@ -93,12 +93,21 @@ async fn attach_impl(ctx: RpcSpawnContext, request: AttachRequest) -> RpcResult<
     let lease = if dry_run {
         None
     } else {
-        let acquire = ctx.probe_broker().acquire(selector.clone());
+        let acquire = ctx
+            .probe_broker()
+            .acquire(selector.clone(), request.client.clone());
 
         tokio::select! {
             granted = tokio::time::timeout(wait_for_probe, acquire) => match granted {
                 Ok(lease) => Some(lease),
-                Err(_) => return Ok(AttachResult::ProbeInUse),
+                // Name the holder when it described itself: the caller is
+                // otherwise left to guess which of its several processes owns
+                // the probe (a leftover kernel, another agent, a stale run).
+                Err(_) => {
+                    return Ok(AttachResult::ProbeInUse {
+                        holder: ctx.probe_broker().holder(&selector),
+                    })
+                }
             },
             _ = cancel.cancelled() => return Err("attach cancelled".into()),
         }

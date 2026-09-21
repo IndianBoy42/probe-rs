@@ -24,11 +24,17 @@ struct Lane {
     occupied: bool,
     waiters: VecDeque<Waiter>,
     next_ticket: u64,
+    /// Self-description of whoever holds the probe right now (pid, cwd, argv),
+    /// so a refused attach can name the process to stop instead of only
+    /// reporting "in use".
+    holder: Option<String>,
 }
 
 struct Waiter {
     ticket: u64,
     grant: oneshot::Sender<()>,
+    /// The waiter's own description; moved into `Lane::holder` on handover.
+    holder: Option<String>,
 }
 
 /// Exclusive use of one probe. Dropping it passes the probe to the next waiter.
@@ -54,8 +60,15 @@ impl ProbeBroker {
 
     /// Wait until the probe is free, then take it.
     ///
+    /// `holder` is the caller's self-description (pid, cwd, argv); it is stored
+    /// on the lane so a client refused this probe can be told who holds it.
+    ///
     /// Drop the future to leave the queue.
-    pub async fn acquire(self: &Arc<Self>, selector: DebugProbeSelector) -> ProbeLease {
+    pub async fn acquire(
+        self: &Arc<Self>,
+        selector: DebugProbeSelector,
+        holder: Option<String>,
+    ) -> ProbeLease {
         let (ticket, granted) = {
             let mut inner = self.inner.lock();
             let lane = inner.lanes.entry(selector.clone()).or_default();
@@ -65,11 +78,16 @@ impl ProbeBroker {
 
             if !lane.occupied && lane.waiters.is_empty() {
                 lane.occupied = true;
+                lane.holder = holder;
                 return self.lease(selector);
             }
 
             let (grant, granted) = oneshot::channel();
-            lane.waiters.push_back(Waiter { ticket, grant });
+            lane.waiters.push_back(Waiter {
+                ticket,
+                grant,
+                holder,
+            });
             (ticket, granted)
         };
 
@@ -86,6 +104,15 @@ impl ProbeBroker {
         guard.defused = true;
 
         self.lease(selector)
+    }
+
+    /// Who holds this probe, when the holder described itself.
+    pub fn holder(&self, selector: &DebugProbeSelector) -> Option<String> {
+        self.inner
+            .lock()
+            .lanes
+            .get(selector)
+            .and_then(|lane| lane.holder.clone())
     }
 
     #[cfg(test)]
@@ -113,12 +140,15 @@ impl ProbeBroker {
 
         while let Some(waiter) = lane.waiters.pop_front() {
             if waiter.grant.send(()).is_ok() {
-                // The lane stays occupied: ownership moved to that waiter.
+                // The lane stays occupied: ownership moved to that waiter, and
+                // so does the holder description a refused client would read.
+                lane.holder = waiter.holder;
                 return;
             }
         }
 
         lane.occupied = false;
+        lane.holder = None;
         inner.lanes.remove(selector);
     }
 }
@@ -198,36 +228,36 @@ mod tests {
     #[tokio::test]
     async fn free_probe_is_granted_immediately() {
         let broker = Arc::new(ProbeBroker::new());
-        let lease = timeout(Duration::ZERO, broker.acquire(selector("a"))).await;
+        let lease = timeout(Duration::ZERO, broker.acquire(selector("a"), None)).await;
         assert!(lease.is_ok());
     }
 
     #[tokio::test]
     async fn busy_probe_is_not_granted_immediately() {
         let broker = Arc::new(ProbeBroker::new());
-        let _lease = broker.acquire(selector("a")).await;
+        let _lease = broker.acquire(selector("a"), None).await;
 
-        let denied = timeout(Duration::ZERO, broker.acquire(selector("a"))).await;
+        let denied = timeout(Duration::ZERO, broker.acquire(selector("a"), None)).await;
         assert!(denied.is_err());
     }
 
     #[tokio::test]
     async fn different_probes_do_not_block_each_other() {
         let broker = Arc::new(ProbeBroker::new());
-        let _lease = broker.acquire(selector("a")).await;
+        let _lease = broker.acquire(selector("a"), None).await;
 
-        let other = timeout(Duration::ZERO, broker.acquire(selector("b"))).await;
+        let other = timeout(Duration::ZERO, broker.acquire(selector("b"), None)).await;
         assert!(other.is_ok());
     }
 
     #[tokio::test]
     async fn release_on_drop_wakes_next_waiter() {
         let broker = Arc::new(ProbeBroker::new());
-        let lease = broker.acquire(selector("a")).await;
+        let lease = broker.acquire(selector("a"), None).await;
 
         let waiter = tokio::spawn({
             let broker = Arc::clone(&broker);
-            async move { broker.acquire(selector("a")).await }
+            async move { broker.acquire(selector("a"), None).await }
         });
 
         tokio::task::yield_now().await;
@@ -239,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn waiters_are_served_in_order() {
         let broker = Arc::new(ProbeBroker::new());
-        let lease = broker.acquire(selector("a")).await;
+        let lease = broker.acquire(selector("a"), None).await;
 
         let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut waiters = Vec::new();
@@ -247,7 +277,7 @@ mod tests {
             let broker = Arc::clone(&broker);
             let order_tx = order_tx.clone();
             waiters.push(tokio::spawn(async move {
-                let lease = broker.acquire(selector("a")).await;
+                let lease = broker.acquire(selector("a"), None).await;
                 order_tx.send(id).unwrap();
                 lease
             }));
@@ -275,17 +305,17 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_waiter_removes_it_from_the_queue() {
         let broker = Arc::new(ProbeBroker::new());
-        let lease = broker.acquire(selector("a")).await;
+        let lease = broker.acquire(selector("a"), None).await;
 
         // This waiter gives up before the probe is free.
-        timeout(Duration::from_millis(10), broker.acquire(selector("a")))
+        timeout(Duration::from_millis(10), broker.acquire(selector("a"), None))
             .await
             .unwrap_err();
         assert_eq!(broker.queued(&selector("a")), 0);
 
         let waiter = tokio::spawn({
             let broker = Arc::clone(&broker);
-            async move { broker.acquire(selector("a")).await }
+            async move { broker.acquire(selector("a"), None).await }
         });
         tokio::task::yield_now().await;
         drop(lease);

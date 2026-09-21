@@ -190,14 +190,17 @@ impl Connection {
             .map_err(|e| BridgeError::from_client(e, Phase::Call))?;
         match result {
             AttachResult::Success(sessid) => Ok(SessionInterface::new(client, sessid)),
-            AttachResult::ProbeInUse => Err(BridgeError::ProbeBusy(
-                "the probe is claimed by another session on this server; close \
+            AttachResult::ProbeInUse { holder } => Err(BridgeError::ProbeBusy(format!(
+                "the probe is claimed by another session on this server{}; close \
                  that session first (pyprobe_rs.close_all() closes every session \
                  this process holds; a stale session on a server pyprobe-rs \
                  spawned is restarted automatically on the next attach; if the \
-                 server was adopted, pr.shutdown_server(force=True) restarts it)"
-                    .to_string(),
-            )),
+                 server was adopted, pr.shutdown_server(force=True) restarts it)",
+                match &holder {
+                    Some(holder) => format!(" — holder: {holder}"),
+                    None => String::new(),
+                }
+            ))),
             AttachResult::ProbeNotFound => Err(BridgeError::Attach(
                 "no debug probe found; connect one and check pyprobe_rs.list_probes()".into(),
                 "Probe",
@@ -456,6 +459,7 @@ pub(crate) mod test_support {
             allow_erase_all: false,
             resume_target: false,
             wait_for_probe: None,
+            client: None,
         }
     }
     pub(crate) fn for_tests() -> Arc<Connection> {

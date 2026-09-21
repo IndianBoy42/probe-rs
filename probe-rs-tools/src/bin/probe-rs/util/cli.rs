@@ -114,6 +114,7 @@ pub async fn attach_probe(
         allow_erase_all: probe_options.allow_erase_all,
         resume_target,
         wait_for_probe: probe_options.attach_timeout,
+        client: Some(client_label()),
     }))
     .await?;
 
@@ -128,7 +129,7 @@ pub async fn attach_probe(
             Err(FailedToOpenProbe(error).into())
         }
         // A busy probe is accessible, so no setup hint here.
-        AttachResult::ProbeInUse => Err(ProbeInUse.into()),
+        AttachResult::ProbeInUse { holder } => Err(ProbeInUse { holder }.into()),
         AttachResult::TargetAttachFailed {
             message,
             connect_under_reset,
@@ -269,8 +270,35 @@ pub struct ProbeNotFound;
 
 /// The selected probe is held by another session.
 #[derive(Debug, thiserror::Error)]
-#[error("Probe is already in use")]
-pub struct ProbeInUse;
+#[error("Probe is already in use{}", holder_suffix(.holder))]
+pub struct ProbeInUse {
+    /// The holder's self-description, when its client supplied one.
+    pub holder: Option<String>,
+}
+
+/// ` by <holder>`, or nothing when the holder did not identify itself.
+fn holder_suffix(holder: &Option<String>) -> String {
+    match holder {
+        Some(holder) => format!(" by {holder}"),
+        None => String::new(),
+    }
+}
+
+/// Self-description sent with every attach: another client refused this probe
+/// reads it, so it should say which process to look for.
+fn client_label() -> String {
+    let pid = std::process::id();
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".to_owned());
+    let argv: Vec<String> = std::env::args().collect();
+    let mut label = format!("probe-rs pid {pid} cwd {cwd} ({})", argv.join(" "));
+    label.truncate(LABEL_MAX);
+    label
+}
+
+/// Bound on the holder label: it travels in every refused attach.
+const LABEL_MAX: usize = 256;
 
 /// Opening the probe failed before a chip attach was attempted.
 #[derive(Debug, thiserror::Error)]

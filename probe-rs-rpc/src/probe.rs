@@ -77,7 +77,10 @@ pub enum AttachResult {
     Success(Key<Session>),
     ProbeNotFound,
     FailedToOpenProbe(String),
-    ProbeInUse,
+    /// The probe is held by another session. `holder` is that session's own
+    /// description of itself when its client supplied one (pid, cwd, argv) —
+    /// enough to find the process instead of guessing at it.
+    ProbeInUse { holder: Option<String> },
     /// The probe opened, but attaching to the chip failed.
     TargetAttachFailed {
         message: String,
@@ -116,6 +119,11 @@ pub struct AttachRequest {
     pub allow_erase_all: bool,
     pub resume_target: bool,
     pub wait_for_probe: Option<Duration>,
+    /// Free-form description of the calling client, e.g.
+    /// `pyprobe-rs pid 659594 cwd /home/u/proj (python -u runner.py)`. Reported
+    /// back to other clients that are denied this probe, so a refusal names the
+    /// holder instead of leaving them to hunt for it.
+    pub client: Option<String>,
 }
 
 pub type AttachResponse = RpcResult<AttachResult>;

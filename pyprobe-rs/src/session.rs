@@ -899,6 +899,24 @@ fn swo_unavailable() -> PyErr {
 
 /// Attach helper shared by the first attempt and the heal retry.
 // Every parameter is a distinct attach-policy axis shared by both callers.
+/// Self-description sent with every attach. It travels back to *other* clients
+/// that are refused this probe, so it must say which process to look for.
+fn client_label() -> String {
+    let pid = std::process::id();
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".to_owned());
+    let argv: Vec<String> = std::env::args().collect();
+    let mut label = format!("pyprobe-rs pid {pid} cwd {cwd} ({})", argv.join(" "));
+    label.truncate(CLIENT_LABEL_MAX);
+    label
+}
+
+/// Bound on the holder label: it travels in every refused attach.
+const CLIENT_LABEL_MAX: usize = 256;
+
+/// Attach helper shared by the first attempt and the heal retry.
+// Every parameter is a distinct attach-policy axis shared by both callers.
 #[allow(clippy::too_many_arguments)]
 fn attach_with(
     py: Python<'_>,
@@ -924,6 +942,7 @@ fn attach_with(
             allow_erase_all: allow_erase,
             resume_target: false,
             wait_for_probe: wait,
+            client: Some(client_label()),
         };
         // The reattach recovery rebuilds the transport from the same source
         // (module-managed server or remote host) as the original attach.
