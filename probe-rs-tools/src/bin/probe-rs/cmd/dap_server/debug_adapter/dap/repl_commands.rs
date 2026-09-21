@@ -1,4 +1,6 @@
-use super::{dap_types::EvaluateArguments, repl_types::*};
+use super::{
+    dap_types::EvaluateArguments, repl_commands_helpers::build_expanded_commands, repl_types::*,
+};
 use crate::cmd::dap_server::{
     DebuggerError,
     backend::rpc::RpcBackend,
@@ -8,6 +10,7 @@ use crate::cmd::dap_server::{
     },
     server::core_data::CoreData,
 };
+use crate::util::style::ReplCommandName;
 use linkme::distributed_slice;
 use std::fmt::Display;
 use std::future::Future;
@@ -74,20 +77,47 @@ pub(crate) struct ReplCommand {
     pub(crate) handler: ReplHandler,
 }
 
+impl ReplCommand {
+    /// Formats the command for the help output, with optional ANSI styling.
+    pub(crate) fn help(&self, colorize: bool) -> ReplCommandHelp<'_> {
+        ReplCommandHelp {
+            command: self,
+            colorize,
+        }
+    }
+}
+
 impl Display for ReplCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.command)?;
-        if !self.sub_commands.is_empty() {
+        self.help(false).fmt(f)
+    }
+}
+
+/// A [`ReplCommand`] rendered for the help output.
+pub(crate) struct ReplCommandHelp<'a> {
+    command: &'a ReplCommand,
+    colorize: bool,
+}
+
+impl Display for ReplCommandHelp<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let command = self.command;
+        write!(
+            f,
+            "{}",
+            ReplCommandName::new(command.command).colorize(self.colorize)
+        )?;
+        if !command.sub_commands.is_empty() {
             write!(f, " <subcommand>")?;
         }
-        for arg in self.args {
+        for arg in command.args {
             write!(f, " {arg}")?;
         }
-        write!(f, ": {}", self.help_text)?;
-        if !self.sub_commands.is_empty() {
+        write!(f, ": {}", command.help_text)?;
+        if !command.sub_commands.is_empty() {
             write!(f, "\n  Subcommands:")?;
-            for sub_command in self.sub_commands {
-                write!(f, "\n  - {sub_command}")?;
+            for sub_command in command.sub_commands {
+                write!(f, "\n  - {}", sub_command.help(self.colorize))?;
             }
         }
         Ok(())
@@ -100,10 +130,10 @@ pub(crate) static REPL_COMMANDS: [ReplCommand];
 #[distributed_slice(REPL_COMMANDS)]
 static HELP: ReplCommand = ReplCommand {
     command: "help",
-    help_text: "Information about available commands and how to use them.",
+    help_text: "Information about available commands, or about a specific command.",
     requires_target_halted: false,
     sub_commands: &[],
-    args: &[],
+    args: &[ReplCommandArgs::Optional("command")],
     handler: async_fn!(print_help),
 };
 
@@ -120,22 +150,53 @@ static QUIT: ReplCommand = ReplCommand {
 async fn print_help<'a>(
     _backend: &'a mut RpcBackend,
     core_data: &'a mut CoreData,
-    _: &'a str,
+    command_arguments: &'a str,
     _: &'a EvaluateArguments,
-    _: &'a mut DebugAdapter,
+    debug_adapter: &'a mut DebugAdapter,
 ) -> EvalResult {
-    let mut help_text =
-        "Usage:\t- Use <Ctrl+Space> to get a list of available commands.".to_string();
-    help_text.push_str("\n\t- Use <Up/DownArrows> to navigate through the command list.");
-    help_text.push_str("\n\t- Use <Hab> to insert the currently selected command.");
-    help_text.push_str(
-        "\n\t- Note: This implementation is a subset of gdb commands, and is intended to behave similarly.",
-    );
-    help_text.push_str("\nAvailable commands:");
-    for command in core_data.repl_commands.iter() {
-        help_text.push_str(&format!("\n{command}"));
+    Ok(EvalResponse::Message(help_text(
+        &core_data.repl_commands,
+        command_arguments,
+        debug_adapter.supports_ansi_styling,
+    )?))
+}
+
+fn help_text(
+    commands: &[ReplCommand],
+    topic: &str,
+    colorize: bool,
+) -> Result<String, DebuggerError> {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        let mut help_text = "Usage:".to_string();
+        help_text.push_str("\n  - Use <Ctrl+Space> to get a list of available commands.");
+        help_text.push_str("\n  - Use <Up/Down arrows> to navigate through the command list.");
+        help_text.push_str("\n  - Use <Hab> to insert the currently selected command.");
+        help_text.push_str("\nAvailable commands:");
+        for command in commands {
+            help_text.push_str(&format!("\n{}", command.help(colorize)));
+        }
+        return Ok(help_text);
     }
-    Ok(EvalResponse::Message(help_text))
+
+    let (_root, last_piece, matches) = build_expanded_commands(commands, topic);
+    let selected: Vec<&ReplCommand> =
+        if let Some(exact) = matches.iter().find(|command| command.command == last_piece) {
+            vec![exact]
+        } else {
+            matches.iter().collect()
+        };
+    if selected.is_empty() {
+        return Err(DebuggerError::UserMessage(format!(
+            "Unknown command: {topic}."
+        )));
+    }
+
+    Ok(selected
+        .iter()
+        .map(|command| command.help(colorize).to_string())
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 async fn need_subcommand<'a>(
@@ -180,3 +241,43 @@ pub enum EvalResponse {
 }
 
 pub type EvalResult = Result<EvalResponse, DebuggerError>;
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn help_output_styles_the_command_name_only_when_the_client_supports_ansi() {
+        assert_eq!(
+            HELP.help(false).to_string(),
+            "help [command]: Information about available commands, or about a specific command."
+        );
+        assert_eq!(
+            HELP.help(true).to_string(),
+            "\u{1b}[1mhelp\u{1b}[0m [command]: Information about available commands, or about a specific command."
+        );
+    }
+
+    #[test]
+    fn help_topic_prints_one_command() {
+        let text = help_text(&REPL_COMMANDS, "quit", false).unwrap();
+        assert_eq!(text, QUIT.help(false).to_string());
+        assert!(!text.contains("Available commands:"));
+    }
+
+    #[test]
+    fn help_topic_prints_a_subcommand() {
+        let text = help_text(&REPL_COMMANDS, "info locals", false).unwrap();
+        assert!(text.contains("List local variables of the selected frame."));
+        assert!(!text.contains("List all static variables."));
+    }
+
+    #[test]
+    fn help_topic_rejects_unknown_commands() {
+        let error = help_text(&REPL_COMMANDS, "not-a-command", false).unwrap_err();
+        assert!(matches!(
+            error,
+            DebuggerError::UserMessage(message) if message.contains("not-a-command")
+        ));
+    }
+}

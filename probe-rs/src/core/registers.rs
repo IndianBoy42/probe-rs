@@ -106,6 +106,9 @@ pub enum UnwindRule {
 pub struct CoreRegister {
     /// Some architectures have multiple names for the same register, depending on the context and the role of the register.
     pub id: RegisterId,
+    /// The DWARF register number, if the architecture assigns one.
+    #[serde(skip_serializing)]
+    pub dwarf_id: Option<u16>,
     /// If the register plays a special role (one or more) during program execution and exception handling, this array will contain the appropriate [`RegisterRole`] entry/entries.
     pub roles: &'static [RegisterRole],
     /// The data type of the register
@@ -157,6 +160,11 @@ impl CoreRegister {
     /// Get the id of this register
     pub fn id(&self) -> RegisterId {
         self.id
+    }
+
+    /// Get the DWARF register number of this register, if the architecture assigns one.
+    pub fn dwarf_id(&self) -> Option<u16> {
+        self.dwarf_id
     }
 
     /// Get the type of data stored in this register
@@ -498,7 +506,9 @@ impl CoreRegisters {
         use crate::architecture::riscv::registers64::{
             RISCV64_CORE_REGISTERS, RISCV64_WITH_FP_CORE_REGISTERS,
         };
-        use crate::architecture::xtensa::registers::XTENSA_CORE_REGISTERS;
+        use crate::architecture::xtensa::registers::{
+            XTENSA_CORE_REGISTERS, XTENSA_WITH_FP_CORE_REGISTERS,
+        };
 
         match core_type {
             CoreType::Armv6m => &CORTEX_M_CORE_REGISTERS,
@@ -532,7 +542,13 @@ impl CoreRegisters {
                     &RISCV64_CORE_REGISTERS
                 }
             }
-            CoreType::Xtensa => &XTENSA_CORE_REGISTERS,
+            CoreType::Xtensa => {
+                if fpu_support {
+                    &XTENSA_WITH_FP_CORE_REGISTERS
+                } else {
+                    &XTENSA_CORE_REGISTERS
+                }
+            }
         }
     }
 

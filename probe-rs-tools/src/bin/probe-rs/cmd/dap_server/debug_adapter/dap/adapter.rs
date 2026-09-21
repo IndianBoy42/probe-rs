@@ -734,7 +734,9 @@ impl DebugAdapter {
                 )
             {
                 let program_counter = session_data.backend.program_counter(core_index).await;
-                let (reason, description) = current_core_status.short_long_status(program_counter);
+                let (reason, description) = current_core_status
+                    .short_long_status(&session_data.backend, program_counter, false)
+                    .await;
                 let event_body = Some(StoppedEventBody {
                     reason: reason.to_owned(),
                     description: Some(description),
@@ -1466,13 +1468,13 @@ impl DebugAdapter {
                 self.send_event("continued", event_body)?;
             } else {
                 self.send_response::<()>(request, Ok(None))?;
+                let description = CoreStatus::Halted(HaltReason::External)
+                    .short_long_status(&session_data.backend, None, false)
+                    .await
+                    .1;
                 let event_body = Some(StoppedEventBody {
                     reason: "restart".to_owned(),
-                    description: Some(
-                        CoreStatus::Halted(HaltReason::External)
-                            .short_long_status(None)
-                            .1,
-                    ),
+                    description: Some(description),
                     thread_id: Some(core_index as i64),
                     preserve_focus_hint: None,
                     text: None,
@@ -1482,13 +1484,13 @@ impl DebugAdapter {
                 self.send_event("stopped", event_body)?;
             }
         } else if self.configuration_is_done() {
+            let description = CoreStatus::Halted(HaltReason::External)
+                .short_long_status(&session_data.backend, Some(core_info.pc), false)
+                .await
+                .1;
             let event_body = Some(StoppedEventBody {
                 reason: "restart".to_owned(),
-                description: Some(
-                    CoreStatus::Halted(HaltReason::External)
-                        .short_long_status(Some(core_info.pc))
-                        .1,
-                ),
+                description: Some(description),
                 thread_id: Some(core_index as i64),
                 preserve_focus_hint: None,
                 text: None,
@@ -1721,9 +1723,13 @@ impl DebugAdapter {
         core_data.invalidate_stack_frame_cache();
         let cpu_info = backend.halt(core_index, Duration::from_millis(500)).await?;
         let new_status = CoreStatus::Halted(HaltReason::Request);
+        let description = new_status
+            .short_long_status(backend, Some(cpu_info.pc), false)
+            .await
+            .1;
         let event_body = Some(StoppedEventBody {
             reason: "pause".to_owned(),
-            description: Some(new_status.short_long_status(Some(cpu_info.pc)).1),
+            description: Some(description),
             thread_id: Some(core_index as i64),
             preserve_focus_hint: Some(false),
             text: None,
@@ -1820,17 +1826,19 @@ impl DebugAdapter {
         // otherwise surface as a "BreakPoint" halt reason.
         core_data.last_known_status = CoreStatus::Halted(HaltReason::Step);
         if matches!(new_status, CoreStatus::Halted(_)) {
+            let reason = core_data
+                .last_known_status
+                .short_long_status(backend, None, false)
+                .await
+                .0
+                .to_string();
+            let description = CoreStatus::Halted(HaltReason::Step)
+                .short_long_status(backend, Some(program_counter), false)
+                .await
+                .1;
             let event_body = StoppedEventBody {
-                reason: core_data
-                    .last_known_status
-                    .short_long_status(None)
-                    .0
-                    .to_string(),
-                description: Some(
-                    CoreStatus::Halted(HaltReason::Step)
-                        .short_long_status(Some(program_counter))
-                        .1,
-                ),
+                reason,
+                description: Some(description),
                 thread_id: Some(core_index as i64),
                 preserve_focus_hint: None,
                 text: None,
@@ -1980,6 +1988,7 @@ mod tests {
     static U32_ROLES: [RegisterRole; 1] = [RegisterRole::Core("r0")];
     static U32_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(0),
+        dwarf_id: None,
         roles: &U32_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -1988,6 +1997,7 @@ mod tests {
     static U64_ROLES: [RegisterRole; 1] = [RegisterRole::Core("x0")];
     static U64_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(1),
+        dwarf_id: None,
         roles: &U64_ROLES,
         data_type: RegisterDataType::UnsignedInteger(64),
         unwind_rule: UnwindRule::Clear,
@@ -1996,6 +2006,7 @@ mod tests {
     static U128_ROLES: [RegisterRole; 1] = [RegisterRole::Core("v0")];
     static U128_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(2),
+        dwarf_id: None,
         roles: &U128_ROLES,
         data_type: RegisterDataType::UnsignedInteger(128),
         unwind_rule: UnwindRule::Clear,
@@ -2004,6 +2015,7 @@ mod tests {
     static FP_ROLES: [RegisterRole; 1] = [RegisterRole::Core("f0")];
     static FP_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(3),
+        dwarf_id: None,
         roles: &FP_ROLES,
         data_type: RegisterDataType::FloatingPoint(32),
         unwind_rule: UnwindRule::Clear,
@@ -2012,6 +2024,7 @@ mod tests {
     static PC_ROLES: [RegisterRole; 2] = [RegisterRole::Core("pc"), RegisterRole::ProgramCounter];
     static PC_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(4),
+        dwarf_id: None,
         roles: &PC_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -2020,6 +2033,7 @@ mod tests {
     static A0_ROLES: [RegisterRole; 2] = [RegisterRole::Core("a0"), RegisterRole::Other("x10")];
     static A0_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(10),
+        dwarf_id: None,
         roles: &A0_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -2029,6 +2043,7 @@ mod tests {
         [RegisterRole::Core("xpsr"), RegisterRole::ProcessorStatus];
     static STATUS_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(16),
+        dwarf_id: None,
         roles: &STATUS_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -2037,6 +2052,7 @@ mod tests {
     static SP_ROLES: [RegisterRole; 2] = [RegisterRole::Core("sp"), RegisterRole::StackPointer];
     static SP_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(17),
+        dwarf_id: None,
         roles: &SP_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -2045,6 +2061,7 @@ mod tests {
     static LR_ROLES: [RegisterRole; 2] = [RegisterRole::Core("lr"), RegisterRole::ReturnAddress];
     static LR_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(18),
+        dwarf_id: None,
         roles: &LR_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Clear,
@@ -2053,6 +2070,7 @@ mod tests {
     static PRESERVED_ROLES: [RegisterRole; 1] = [RegisterRole::Core("r4")];
     static PRESERVED_REGISTER: CoreRegister = CoreRegister {
         id: RegisterId(19),
+        dwarf_id: None,
         roles: &PRESERVED_ROLES,
         data_type: RegisterDataType::UnsignedInteger(32),
         unwind_rule: UnwindRule::Preserve,

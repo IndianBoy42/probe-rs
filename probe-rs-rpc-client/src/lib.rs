@@ -4,10 +4,12 @@
 //! Enable the `remote` feature for websocket, SSH, and unix socket transport.
 
 use postcard_rpc::{
-    Topic,
+    Topic, TopicDirection,
     header::{VarSeq, VarSeqKind},
-    host_client::{HostClient, HostClientConfig, HostErr, IoClosed, Subscription},
-    standard_icd::WireError,
+    host_client::{
+        HostClient, HostClientConfig, HostErr, IoClosed, SchemaError, SchemaReport, Subscription,
+    },
+    standard_icd::{GetAllSchemaDataTopic, GetAllSchemasEndpoint, OwnedSchemaData, WireError},
 };
 use postcard_schema::Schema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -213,28 +215,51 @@ where
 /// - `socket://`, followed by a path: a unix socket. Unix only.
 #[cfg(feature = "remote")]
 pub async fn connect(
-    host: &str,
+    connection_string: &str,
     token: Option<&str>,
     user_agent: &str,
 ) -> Result<RpcClient, ClientError> {
-    use http::Uri;
+    use http::{Uri, uri::PathAndQuery};
     use rustls::ClientConfig;
     use std::str::FromStr;
     use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::ClientRequestBuilder};
 
-    #[cfg(unix)]
-    if let Some(path) = host.strip_prefix("socket://") {
-        tracing::debug!("Socket path detected, will connect via Unix socket.");
+    let mut parts = Uri::from_str(connection_string)
+        .map_err(|_| ClientError::InvalidRemoteHost)?
+        .into_parts();
 
-        return connect_unix(path).await;
+    let authority = parts
+        .authority
+        .clone()
+        .ok_or(ClientError::InvalidRemoteHost)?;
+    let scheme = parts
+        .scheme
+        .as_ref()
+        .ok_or(ClientError::InvalidRemoteHost)?;
+    let path_and_query = parts.path_and_query.ok_or(ClientError::InvalidRemoteHost)?;
+
+    match scheme.as_str() {
+        #[cfg(unix)]
+        "socket" => {
+            tracing::debug!("Socket path detected, will connect via Unix socket.");
+
+            return connect_unix(path_and_query.path()).await;
+        }
+        "ssh" => {
+            return ssh::connect(authority.host(), token, user_agent).await;
+        }
+        "ws" | "wss" => {
+            if path_and_query != PathAndQuery::from_static("/") {
+                Err(ClientError::InvalidRemoteHost)?
+            }
+        }
+        _ => Err(ClientError::InvalidRemoteHost)?,
     }
 
-    if let Some(ssh_host) = host.strip_prefix("ssh://") {
-        return ssh::connect(ssh_host, token, user_agent).await;
-    }
-
-    let uri =
-        Uri::from_str(&format!("{host}/worker")).map_err(|_| ClientError::InvalidRemoteHost)?;
+    let uri = {
+        parts.path_and_query = Some(PathAndQuery::from_static("/worker"));
+        Uri::from_parts(parts).map_err(|_| ClientError::InvalidRemoteHost)?
+    };
 
     // We could check the host address for localhost and then set the `is_localhost` option, but
     // there are setups where the user uses port forwarding and the file actually needs to be
@@ -259,7 +284,7 @@ pub async fn connect(
         ))),
     )
     .await
-    .map_err(|_| TransportError::Message(format!("Failed to connect to {host}")))?;
+    .map_err(|_| TransportError::Message(format!("Failed to connect to {}", authority.host())))?;
 
     // Respond to the challenge
     let challenge = resp
@@ -410,26 +435,100 @@ impl RpcClient {
         Ok(self)
     }
 
+    async fn get_schema_report(
+        &self,
+        expected: &SchemaReport,
+    ) -> Result<SchemaReport, SchemaError<WireError>> {
+        // Our own copy of hostClient::get_schema_report so that we can tune capacity.
+        let expected_messages =
+            expected.endpoints.len() + expected.topics_in.len() + expected.topics_out.len();
+        let Ok(mut sub) = self
+            .client
+            .subscribe_multi::<GetAllSchemaDataTopic>(expected_messages)
+            .await
+        else {
+            return Err(SchemaError::Comms(HostErr::Closed));
+        };
+
+        let collect_task = tokio::task::spawn({
+            async move {
+                let mut got = vec![];
+                while let Ok(Ok(val)) =
+                    tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+                {
+                    got.push(val);
+                }
+                got
+            }
+        });
+        let trigger_task = self.client.send_resp::<GetAllSchemasEndpoint>(&()).await;
+        let data = collect_task.await;
+        let (resp, data) = match (trigger_task, data) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Ok(_), Err(_)) => return Err(SchemaError::TaskError),
+            (Err(e), Ok(_)) => return Err(SchemaError::Comms(e)),
+            (Err(e1), Err(_e2)) => return Err(SchemaError::Comms(e1)),
+        };
+        let mut rpt = SchemaReport::default();
+        let mut e_and_t = vec![];
+
+        for d in data {
+            match d {
+                OwnedSchemaData::Type(d) => {
+                    rpt.add_type(d);
+                }
+                e @ OwnedSchemaData::Endpoint { .. } => e_and_t.push(e),
+                t @ OwnedSchemaData::Topic { .. } => e_and_t.push(t),
+            }
+        }
+
+        for e in e_and_t {
+            match e {
+                OwnedSchemaData::Type(_) => unreachable!(),
+                OwnedSchemaData::Endpoint {
+                    path,
+                    request_key,
+                    response_key,
+                } => {
+                    rpt.add_endpoint(path, request_key, response_key)?;
+                }
+                OwnedSchemaData::Topic {
+                    path,
+                    key,
+                    direction,
+                } => match direction {
+                    TopicDirection::ToServer => rpt.add_topic_in(path, key)?,
+                    TopicDirection::ToClient => rpt.add_topic_out(path, key)?,
+                },
+            }
+        }
+
+        let mut data_matches = true;
+        data_matches &= resp.endpoints_sent as usize == rpt.endpoints.len();
+        data_matches &= resp.topics_in_sent as usize == rpt.topics_in.len();
+        data_matches &= resp.topics_out_sent as usize == rpt.topics_out.len();
+        data_matches &= resp.errors == 0;
+
+        if data_matches {
+            // TODO: filter primitive types out?
+            Ok(rpt)
+        } else {
+            Err(SchemaError::LostData)
+        }
+    }
+
     /// Fetch the schema of the server and compare it with the schema of this
     /// client.
     pub async fn check_compatibility(&self) -> Result<(), ClientError> {
         let expected = schema::expected_schema_report()?;
         let actual = self
-            .client
-            .get_schema_report()
+            .get_schema_report(&expected)
             .await
             .map_err(schema::from_schema_err)?;
 
         if schema::schema_reports_match(&expected, &actual) {
             Ok(())
         } else {
-            tracing::error!(
-                expected_endpoints = expected.endpoints.len(),
-                actual_endpoints = actual.endpoints.len(),
-                expected_types = expected.types.len(),
-                actual_types = actual.types.len(),
-                "RPC schema of the server does not match this client"
-            );
             Err(ClientError::IncompatibleServer)
         }
     }

@@ -21,7 +21,7 @@ test:
   cargo nextest run --all-features
 
 msrv:
-  cargo +1.89 check --all-features
+  cargo +1.95 check --all-features
 
 # Stripped server binary embedded into the pyprobe-rs extension.
 build-serve-bin:
