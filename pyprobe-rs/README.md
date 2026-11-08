@@ -140,7 +140,10 @@ PYPROBE_RS_PY_HIL_CONFIG=/path/to/dut.toml uv run pytest tests/ -m hil
 
 See [USAGE.md](USAGE.md) for the complete guide: configuration, registers,
 breakpoints, flashing options and progress callbacks, RTT streaming, the DWARF
-debug surface, core dumps, and error handling.
+debug surface, core dumps, and error handling. For running long-lived
+hardware-in-the-loop campaigns — session discipline, probe/bus failure modes,
+RTT as a command transport, halt budgets, and target forensics — read
+[HIL.md](HIL.md).
 
 ## License
 
