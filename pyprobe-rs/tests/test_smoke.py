@@ -1,4 +1,11 @@
-"""No-hardware smoke test for pyprobe-rs using FakeProbe + Cortex-M4 builtin target."""
+"""pyprobe-rs API smoke tests.
+
+Hardware-free tests cover the pure API surface (version, target registry,
+enum proxies, option defaults) plus the protocol contract that dry-run attach
+is gone. Tests that need a session take the probe-gated `session` fixture from
+``conftest.py`` and skip without a DUT; the hardware behavior itself is
+covered by the HIL suite (``test_hil.py``).
+"""
 
 import re
 from pathlib import Path
@@ -21,34 +28,15 @@ def test_list_targets_includes_cortex_m4():
     assert "Cortex-M4" in targets, f"Cortex-M4 not in {targets[:5]}..."
 
 
-def test_fake_probe_attach_and_core():
+def test_fake_probe_attach_is_rejected():
+    """A FakeProbe still yields a local handle, but the RPC protocol has no
+    fake-probe attach, so attaching through it must fail loudly."""
     fp = pr.FakeProbe.with_mocked_core()
     probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    assert sess is not None
-    cores = sess.list_cores()
-    assert len(cores) > 0
-    core = sess.core(0)
-    assert core is not None
-    core.halt(1000)
-    status = core.status()
-    assert status.is_halted, f"Expected halted, got {status.state}"
-    core.run()
-    status = core.status()
-    assert status.is_running, f"Expected running, got {status.state}"
-
-
-def test_memory_round_trip():
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    core = sess.core(0)
-    core.halt(1000)
-    core.write_word_32(0x2000_0000, 0xDEADBEEF)
-    val = core.read_word_32(0x2000_0000)
-    # MockCore doesn't persist RAM across separate reads, but the API call must complete
-    # without error (per plan contingency).
-    assert isinstance(val, int)
+    with pytest.raises(pr.ProbeRsError) as excinfo:
+        probe.attach("Cortex-M4", pr.Permissions())
+    assert excinfo.value.kind == "NotImplemented"
+    assert "dry-run" in str(excinfo.value)
 
 
 def test_registry():
@@ -62,34 +50,9 @@ def test_get_target_by_name():
     assert t.name == "Cortex-M4"
 
 
-def test_status_enum():
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    core = sess.core(0)
-    core.halt(1000)
-    status = core.status()
-    assert status.state == pr.CoreState.Halted
-    assert not status.is_running
-
-
 def test_target_cores_typed():
     t = pr.get_target_by_name("Cortex-M4")
     assert t.cores[0][1] == pr.CoreType.Armv7em
-
-
-def test_error_taxonomy():
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    # On the mocked core RTT may attach or fail cleanly; either way it must
-    # never kill the connection (that would be a ServerGone).
-    try:
-        rtt = sess.attach_rtt(0)
-        assert isinstance(rtt.up_channels(), list)
-        rtt.stop_streaming()
-    except pr.ProbeRsError as e:
-        assert e.kind not in ("ServerGone",), e
 
 
 def test_download_options_ram_chunk_size():
@@ -99,21 +62,9 @@ def test_download_options_ram_chunk_size():
     assert opts.ram_chunk_size == 4096
 
 
-def test_setup_tracing_takes_trace_sink():
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    # The mock DAP aborts on real trace setup, so only exercise the argument
-    # contract: magic strings are no longer accepted, the enum is required.
-    with pytest.raises(TypeError):
-        sess.setup_tracing(0, "swo")
-
-
-def test_register_lookup_and_width():
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    core = sess.core(0)
+# ── session-dependent contracts (probe-gated) ──────────────────────────
+def test_register_lookup_and_width(session):
+    core = session.core(0)
     core.halt(1000)
     # Case-insensitive canonical names and common aliases resolve.
     for name in ("R0", "r0", "xpsr", "PC", "sp", "lr"):
@@ -126,29 +77,38 @@ def test_register_lookup_and_width():
     assert excinfo.value.kind == "Register"
     assert "known:" in str(excinfo.value)
     # Writes are validated against the register's width.
-    with pytest.raises(OverflowError):
-        core.write_core_reg("R0", 1 << 32)
-    core.write_core_reg("pc", 0x1000)  # alias write path
+    pc = core.read_core_reg("pc")
+    try:
+        with pytest.raises(OverflowError):
+            core.write_core_reg("R0", 1 << 32)
+    finally:
+        core.write_core_reg("pc", pc)
 
 
-def test_bin_base_address_rejected_for_elf(tmp_path):
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
+def test_setup_tracing_takes_trace_sink(session):
+    # Magic strings are no longer accepted; the enum is required, and the
+    # check happens before any probe work.
+    with pytest.raises(TypeError):
+        session.setup_tracing(0, "swo")
+
+
+def test_bin_base_address_rejected_for_elf(session, tmp_path):
     elf = tmp_path / "fw.elf"
     elf.write_bytes(b"\x7fELF placeholder")
     with pytest.raises(ValueError, match="bin"):
-        pr.download_file(sess, str(elf), "elf", base_address=0x1000)
+        pr.download_file(session, str(elf), "elf", base_address=0x1000)
     with pytest.raises(ValueError, match="bin"):
-        pr.build_loader(sess, str(elf), "elf", skip=16)
+        pr.build_loader(session, str(elf), "elf", skip=16)
 
 
-def test_coredump_capture_roundtrip(tmp_path):
-    fp = pr.FakeProbe.with_mocked_core()
-    probe = pr.Probe.from_fake(fp)
-    sess = probe.attach("Cortex-M4", pr.Permissions())
-    sess.core(0).halt(1000)
-    dump = pr.CoreDump.capture(sess, 0, [(0x2000_0000, 0x2000_0100)])
+def test_coredump_capture_roundtrip(session, tmp_path):
+    core = session.core(0)
+    core.halt(1000)
+    # Capture below the current stack pointer: always RAM, and nothing else
+    # runs while the core is halted.
+    sp = core.read_core_reg("sp")
+    start = (sp - 0x100) & ~0x3
+    dump = pr.CoreDump.capture(session, 0, [(start, start + 0x100)])
     path = tmp_path / "dump.coredump"
     dump.store(str(path))
     loaded = pr.CoreDump.load(str(path))
@@ -164,28 +124,14 @@ if __name__ == "__main__":
     print("✓ version")
     test_list_targets_includes_cortex_m4()
     print("✓ list_targets")
-    test_fake_probe_attach_and_core()
-    print("✓ fake probe + core")
-    test_memory_round_trip()
-    print("✓ memory round-trip")
+    test_fake_probe_attach_is_rejected()
+    print("✓ fake probe attach rejected")
     test_registry()
     print("✓ registry")
     test_get_target_by_name()
     print("✓ get_target_by_name")
-    test_status_enum()
-    print("✓ status enum")
     test_target_cores_typed()
     print("✓ target cores typed")
-    test_error_taxonomy()
-    print("✓ error taxonomy")
     test_download_options_ram_chunk_size()
     print("✓ download options ram_chunk_size")
-    test_setup_tracing_takes_trace_sink()
-    print("✓ setup_tracing TraceSink")
-    test_register_lookup_and_width()
-    print("✓ register lookup + width")
-    test_bin_base_address_rejected_for_elf(tmp)
-    print("✓ bin base_address validation")
-    test_coredump_capture_roundtrip(tmp)
-    print("✓ coredump capture round-trip")
-    print("\nAll tests passed!")
+    print("\nAll hardware-free tests passed! (session tests need PYPROBE_RS_PY_HIL_CONFIG)")

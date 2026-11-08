@@ -2,11 +2,11 @@ use crate::{
     Core, CoreType, Error,
     architecture::{
         arm::{
-            ArmError, FullyQualifiedApAddress, SwoReader,
-            communication_interface::ArmDebugInterface,
+            ArmError, DapAccess, FullyQualifiedApAddress, SwoAccess, SwoConfig, SwoReader,
+            communication_interface::{ArmDebugInterface, SwdSequence},
             component::{TraceSink, get_arm_components},
-            dp::DpAddress,
-            memory::CoresightComponent,
+            dp::{DpAddress, DpRegisterAddress},
+            memory::{ArmMemoryInterface, CoresightComponent},
             sequences::{ArmDebugSequence, DefaultArmSequence},
         },
         riscv::{
@@ -19,13 +19,17 @@ use crate::{
             XtensaCommunicationInterface, XtensaDebugInterfaceState, XtensaError,
         },
     },
-    config::{CoreExt, DebugSequence, RegistryError, Target, TargetSelector, registry::Registry},
+    config::{
+        DebugSequence, MemoryApExt, RegistryError, Target, TargetSelector, registry::Registry,
+    },
     core::{Architecture, CombinedCoreState},
+    memory_port::MemoryAccessPort,
     probe::{
-        AttachMethod, DebugProbeError, Probe, ProbeCreationError, WireProtocol,
-        fake_probe::FakeProbe, list::Lister,
+        AttachMethod, BitSequence, DebugProbe, DebugProbeError, Probe, ProbeCreationError,
+        WireProtocol, list::Lister,
     },
 };
+use std::collections::BTreeSet;
 use std::ops::DerefMut;
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -130,7 +134,7 @@ impl fmt::Debug for ArchitectureInterface {
 impl ArchitectureInterface {
     fn attach<'probe, 'target: 'probe>(
         &'probe mut self,
-        target: &'probe Target,
+        target: &'probe mut Target,
         combined_state: &'probe mut CombinedCoreState,
     ) -> Result<Core<'probe>, Error> {
         match self {
@@ -203,7 +207,7 @@ impl Session {
 
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
-        let mut session = if target.default_core().memory_ap().is_some() {
+        let mut session = if target.uses_arm_debug_interface() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
@@ -239,6 +243,10 @@ impl Session {
             _ => unreachable!("DAP path only used for ARM or RISC-V-over-mem-AP targets"),
         };
 
+        if probe.protocol() == Some(WireProtocol::Jtag) && !target.jtag_reaches_any_core() {
+            return Err(Error::NoCoreOnJtagScanChain(target.name.clone()));
+        }
+
         if AttachMethod::UnderReset == attach_method {
             let _span = tracing::debug_span!("Asserting hardware reset").entered();
 
@@ -260,7 +268,11 @@ impl Session {
             && let Some(scan_chain) = jtag.scan_chain.clone()
             && let Some(mut chain) = probe.try_as_jtag_chain()
         {
+            // CMSIS-DAP's `configure_jtag` reads only the expected chain, forced or not.
             chain.set_expected(&scan_chain);
+            if jtag.force_scan_chain {
+                chain.set_chain(&scan_chain);
+            }
         }
 
         probe.attach_to_unspecified()?;
@@ -634,6 +646,37 @@ impl Session {
             .ok_or(Error::CoreNotFound(core))
     }
 
+    /// Attaches to a memory access port with the given index number.
+    pub fn memory_access_port(&mut self, index: usize) -> Result<MemoryAccessPort<'_>, Error> {
+        let memory_port = self
+            .target
+            .memory_ports
+            .get(index)
+            .ok_or(Error::MemoryAccessPortNotFound(index))?;
+        match &mut self.interfaces {
+            ArchitectureInterface::Arm(arm_debug_interface) => {
+                let memory_ap = memory_port
+                    .memory_ap()
+                    .ok_or(Error::MemoryAccessPortNotFound(index))?;
+                let memory_interface = arm_debug_interface.memory_interface(&memory_ap)?;
+                Ok(MemoryAccessPort::new_for_arm_memory_interface(
+                    index,
+                    &memory_port.name,
+                    memory_interface,
+                ))
+            }
+            ArchitectureInterface::Jtag(_, _) => Err(Error::NotImplemented(
+                "Memory port access on RISC-V and Xtensa",
+            )),
+            ArchitectureInterface::ArmWithRiscv {
+                arm: _,
+                riscv_mem_ap_cores: _,
+            } => Err(Error::NotImplemented(
+                "Memory port access on ARM with RiscV",
+            )),
+        }
+    }
+
     /// Attaches to the core with the given number.
     ///
     /// ## Usage
@@ -658,7 +701,7 @@ impl Session {
             .ok_or(Error::CoreNotFound(core_index))?;
 
         self.interfaces
-            .attach(&self.target, combined_state)
+            .attach(&mut self.target, combined_state)
             .map_err(|e| {
                 if matches!(
                     e,
@@ -790,17 +833,13 @@ impl Session {
         interface: &mut Box<dyn ArmDebugInterface>,
         debug_sequence: &Arc<dyn ArmDebugSequence>,
     ) -> Result<(), Error> {
-        use crate::probe::DebugProbe;
-
         let current_dp = interface.current_debug_port();
 
         // In order to re-attach we need an owned instance to the interface
         // but we only have &mut. We can work around that by first creating
         // an instance of a Dummy and then swapping it out for the real one.
         // perform the re-attach and then swap it back.
-        let mut tmp_interface = Box::<FakeProbe>::default()
-            .try_get_arm_debug_interface(DefaultArmSequence::create())
-            .unwrap();
+        let mut tmp_interface: Box<dyn ArmDebugInterface> = Box::new(PlaceholderArmInterface);
 
         std::mem::swap(interface, &mut tmp_interface);
 
@@ -838,6 +877,21 @@ impl Session {
             }
             DebugSequence::Xtensa(xtensa_debug_sequence) => {
                 xtensa_debug_sequence.prepare_running_on_ram(self, vector_table_addr, core_id)
+            }
+        }
+    }
+
+    /// Prepares the target before an image that boots from RAM is written.
+    pub(crate) fn prepare_loading_to_ram(&mut self) -> Result<(), crate::Error> {
+        match self.target.debug_sequence.clone() {
+            DebugSequence::Arm(arm_debug_sequence) => {
+                arm_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Riscv(riscv_debug_sequence) => {
+                riscv_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Xtensa(xtensa_debug_sequence) => {
+                xtensa_debug_sequence.prepare_loading_to_ram(self)
             }
         }
     }
@@ -921,6 +975,20 @@ impl Session {
     /// Get the target description of the connected target.
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    /// Returns the probe driver. Downcast it through [`Any`](std::any::Any) to use a specific
+    /// driver's own API.
+    ///
+    /// Commands sent through it reach the probe after everything the session did before.
+    /// Commands that reset or reconfigure the debug interface can invalidate the session's
+    /// cached state. Reattach before further target access after such a command.
+    pub fn driver_mut(&mut self) -> Option<&mut dyn DebugProbe> {
+        match &mut self.interfaces {
+            ArchitectureInterface::Arm(interface)
+            | ArchitectureInterface::ArmWithRiscv { arm: interface, .. } => interface.driver_mut(),
+            ArchitectureInterface::Jtag(probe, _) => Some(probe.driver_mut()),
+        }
     }
 
     /// Configure the target and probe for serial wire view (SWV) tracing.
@@ -1090,7 +1158,7 @@ fn get_target_from_selector(
 ) -> Result<(Probe, Target), Error> {
     let target = match target {
         TargetSelector::Unspecified(name) => registry.get_target_by_name(name)?,
-        TargetSelector::Specified(target) => target,
+        TargetSelector::Specified(target) => *target,
         TargetSelector::Auto => {
             // At this point we do not know what the target is, so we cannot use the chip specific reset sequence.
             // Thus, we try just using a normal reset for target detection if we want to do so under reset.
@@ -1121,7 +1189,7 @@ fn get_target_from_selector(
 }
 
 /// The `Permissions` struct represents what a [Session] is allowed to do with a target.
-/// Some operations can be irreversible, so need to be explicitly allowed by the user.
+/// Some operations can be irreversible, so they need to be explicitly allowed by the user.
 ///
 /// # Example
 ///
@@ -1168,3 +1236,108 @@ impl Permissions {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("An operation could not be performed because it lacked the permission to do so: {0}")]
 pub struct MissingPermissions(pub String);
+
+/// Takes the place of the ARM interface while the session re-attaches the real one.
+///
+/// If the re-attach fails, the placeholder stays. Then all operations fail with
+/// [`DebugProbeError::NotAttached`], and `close` panics.
+struct PlaceholderArmInterface;
+
+const NOT_ATTACHED: ArmError = ArmError::Probe(DebugProbeError::NotAttached);
+
+impl ArmDebugInterface for PlaceholderArmInterface {
+    fn reinitialize(&mut self) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn access_ports(
+        &mut self,
+        _dp: DpAddress,
+    ) -> Result<BTreeSet<FullyQualifiedApAddress>, ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn close(self: Box<Self>) -> Probe {
+        panic!("the ARM interface was not re-attached")
+    }
+
+    fn select_debug_port(&mut self, _dp: DpAddress) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn current_debug_port(&self) -> Option<DpAddress> {
+        None
+    }
+
+    fn memory_interface(
+        &mut self,
+        _access_port_address: &FullyQualifiedApAddress,
+    ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
+        Err(NOT_ATTACHED)
+    }
+}
+
+impl DapAccess for PlaceholderArmInterface {
+    fn read_raw_dp_register(
+        &mut self,
+        _dp: DpAddress,
+        _address: DpRegisterAddress,
+    ) -> Result<u32, ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn write_raw_dp_register(
+        &mut self,
+        _dp: DpAddress,
+        _address: DpRegisterAddress,
+        _value: u32,
+    ) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn read_raw_ap_register(
+        &mut self,
+        _ap: &FullyQualifiedApAddress,
+        _address: u64,
+    ) -> Result<u32, ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn write_raw_ap_register(
+        &mut self,
+        _ap: &FullyQualifiedApAddress,
+        _address: u64,
+        _value: u32,
+    ) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+}
+
+impl SwdSequence for PlaceholderArmInterface {
+    fn swj_sequence(&mut self, _bits: &BitSequence) -> Result<(), DebugProbeError> {
+        Err(DebugProbeError::NotAttached)
+    }
+
+    fn swj_pins(
+        &mut self,
+        _pin_out: u32,
+        _pin_select: u32,
+        _pin_wait: u32,
+    ) -> Result<u32, DebugProbeError> {
+        Err(DebugProbeError::NotAttached)
+    }
+}
+
+impl SwoAccess for PlaceholderArmInterface {
+    fn enable_swo(&mut self, _config: &SwoConfig) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn disable_swo(&mut self) -> Result<(), ArmError> {
+        Err(NOT_ATTACHED)
+    }
+
+    fn read_swo_timeout(&mut self, _timeout: Duration) -> Result<Vec<u8>, ArmError> {
+        Err(NOT_ATTACHED)
+    }
+}

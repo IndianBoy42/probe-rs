@@ -106,6 +106,7 @@ pub enum Architecture {
 
 /// Instruction set used by a core
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SerializedInstructionSet")]
 pub enum InstructionSet {
     /// ARM Thumb 2 instruction set
     Thumb2,
@@ -113,16 +114,55 @@ pub enum InstructionSet {
     A32,
     /// ARM A64 (aarch64) instruction set
     A64,
-    /// RISC-V 32-bit uncompressed instruction sets (RV32) - covers all ISA variants that use 32-bit instructions.
-    RV32,
-    /// RISC-V 32-bit compressed instruction sets (RV32C) - covers all ISA variants that allow compressed 16-bit instructions.
-    RV32C,
-    /// RISC-V 64-bit uncompressed instruction sets (RV64) - covers all ISA variants that use 32-bit instructions in 64-bit mode.
-    RV64,
-    /// RISC-V 64-bit compressed instruction sets (RV64C) - covers all ISA variants that allow compressed 16-bit instructions in 64-bit mode.
-    RV64C,
+    /// RISC-V instruction set
+    Riscv {
+        /// The register width.
+        xlen: Xlen,
+        /// The C extension: compressed 16-bit instructions.
+        c: bool,
+        /// The F extension: single-precision floating point. Also set for the D and Q extensions,
+        /// which depend on F.
+        f: bool,
+    },
     /// Xtensa instruction set
     Xtensa,
+}
+
+/// The deserialized form of [`InstructionSet`]. It also accepts the RISC-V variants of earlier
+/// versions, so that earlier core dumps load.
+#[derive(Deserialize)]
+enum SerializedInstructionSet {
+    Thumb2,
+    A32,
+    A64,
+    Riscv {
+        xlen: Xlen,
+        c: bool,
+        #[serde(default)]
+        f: bool,
+    },
+    Xtensa,
+    RV32,
+    RV32C,
+    RV64,
+    RV64C,
+}
+
+impl From<SerializedInstructionSet> for InstructionSet {
+    fn from(value: SerializedInstructionSet) -> Self {
+        let riscv = |xlen, c| InstructionSet::Riscv { xlen, c, f: false };
+        match value {
+            SerializedInstructionSet::Thumb2 => InstructionSet::Thumb2,
+            SerializedInstructionSet::A32 => InstructionSet::A32,
+            SerializedInstructionSet::A64 => InstructionSet::A64,
+            SerializedInstructionSet::Riscv { xlen, c, f } => InstructionSet::Riscv { xlen, c, f },
+            SerializedInstructionSet::Xtensa => InstructionSet::Xtensa,
+            SerializedInstructionSet::RV32 => riscv(Xlen::X32, false),
+            SerializedInstructionSet::RV32C => riscv(Xlen::X32, true),
+            SerializedInstructionSet::RV64 => riscv(Xlen::X64, false),
+            SerializedInstructionSet::RV64C => riscv(Xlen::X64, true),
+        }
+    }
 }
 
 impl InstructionSet {
@@ -134,21 +174,17 @@ impl InstructionSet {
             "aarch64" => Some(InstructionSet::A64),
             "xtensa" => Some(InstructionSet::Xtensa),
             other => {
-                if let Some(features) = other.strip_prefix("riscv32") {
-                    if features.contains('c') {
-                        Some(InstructionSet::RV32C)
-                    } else {
-                        Some(InstructionSet::RV32)
-                    }
-                } else if let Some(features) = other.strip_prefix("riscv64") {
-                    if features.contains('c') {
-                        Some(InstructionSet::RV64C)
-                    } else {
-                        Some(InstructionSet::RV64)
-                    }
+                let (xlen, features) = if let Some(features) = other.strip_prefix("riscv32") {
+                    (Xlen::X32, features)
                 } else {
-                    None
-                }
+                    (Xlen::X64, other.strip_prefix("riscv64")?)
+                };
+                Some(InstructionSet::Riscv {
+                    xlen,
+                    c: features.contains('c'),
+                    // G is IMAFD.
+                    f: features.contains('f') || features.contains('g'),
+                })
             }
         }
     }
@@ -162,11 +198,9 @@ impl InstructionSet {
             }
             InstructionSet::A32 => 4,
             InstructionSet::A64 => 4,
-            InstructionSet::RV32 => 4,
-            InstructionSet::RV32C => 2,
-            // RV64 uses 32-bit base instructions; compressed mode allows 16-bit instructions
-            InstructionSet::RV64 => 4,
-            InstructionSet::RV64C => 2,
+            // The C extension allows 16-bit instructions
+            InstructionSet::Riscv { c: true, .. } => 2,
+            InstructionSet::Riscv { c: false, .. } => 4,
             InstructionSet::Xtensa => 2,
         }
     }
@@ -182,12 +216,27 @@ impl InstructionSet {
             return true;
         }
 
-        matches!(
-            (self, instr_set),
-            (InstructionSet::RV32C, InstructionSet::RV32)
-                | (InstructionSet::RV64C, InstructionSet::RV64)
-        )
+        match (*self, instr_set) {
+            (
+                InstructionSet::Riscv { xlen, c, f },
+                InstructionSet::Riscv {
+                    xlen: image_xlen,
+                    c: image_c,
+                    f: image_f,
+                },
+            ) => xlen == image_xlen && (c || !image_c) && (f || !image_f),
+            _ => false,
+        }
     }
+}
+
+/// The register width of a RISC-V core
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Xlen {
+    /// 32-bit registers (RV32)
+    X32,
+    /// 64-bit registers (RV64)
+    X64,
 }
 
 /// The current endianness of a core
@@ -248,6 +297,7 @@ impl ChipFamily {
         self.ensure_algorithms_exist()?;
         self.ensure_at_least_one_core()?;
         self.reject_incorrect_core_access_options()?;
+        self.reject_ambiguous_memory_port_names()?;
         self.validate_memory_regions()?;
         self.validate_rtt_scan_regions()?;
 
@@ -377,6 +427,27 @@ impl ChipFamily {
         Ok(())
     }
 
+    /// Memory regions name cores and memory ports in the same way, so a memory port must not
+    /// share its name with a core or another memory port.
+    fn reject_ambiguous_memory_port_names(&self) -> Result<(), String> {
+        for variant in &self.variants {
+            for (index, port) in variant.memory_ports.iter().enumerate() {
+                let is_core = variant.cores.iter().any(|core| core.name == port.name);
+                let is_duplicate = variant.memory_ports[..index]
+                    .iter()
+                    .any(|other| other.name == port.name);
+                if is_core || is_duplicate {
+                    return Err(format!(
+                        "Variant {}, memory port name {} is not unique among cores and memory ports",
+                        variant.name, port.name
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Ensures that the memory is assigned to a core, and that all the cores exist
     fn validate_memory_regions(&self) -> Result<(), String> {
         for variant in &self.variants {
@@ -399,6 +470,15 @@ impl ChipFamily {
                         return Err(format!(
                             "Variant {}, memory region {:?} is assigned to a non-existent core {}",
                             variant.name, memory, core
+                        ));
+                    }
+                }
+
+                for port in memory.memory_ports() {
+                    if !variant.memory_ports.iter().any(|p| &p.name == port) {
+                        return Err(format!(
+                            "Variant {}, memory region {:?} is assigned to a non-existent memory port {}",
+                            variant.name, memory, port
                         ));
                     }
                 }
@@ -493,5 +573,107 @@ impl ChipFamily {
                 ..algo.clone()
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn riscv_target_triples() {
+        let riscv = |xlen, c, f| Some(InstructionSet::Riscv { xlen, c, f });
+        let from = InstructionSet::from_target_triple;
+        assert_eq!(
+            from("riscv32imac-unknown-none-elf"),
+            riscv(Xlen::X32, true, false)
+        );
+        assert_eq!(
+            from("riscv32imafc-unknown-none-elf"),
+            riscv(Xlen::X32, true, true)
+        );
+        assert_eq!(
+            from("riscv64gc-unknown-none-elf"),
+            riscv(Xlen::X64, true, true)
+        );
+    }
+
+    #[test]
+    fn riscv_f_compatibility() {
+        let riscv = |f| InstructionSet::Riscv {
+            xlen: Xlen::X32,
+            c: true,
+            f,
+        };
+        assert!(riscv(true).is_compatible(riscv(false)));
+        assert!(!riscv(false).is_compatible(riscv(true)));
+    }
+
+    fn family_with_region_port(port: &str) -> ChipFamily {
+        family(&["ahb-ap"], port)
+    }
+
+    fn family(ports: &[&str], region_port: &str) -> ChipFamily {
+        let ports = ports
+            .iter()
+            .map(|port| {
+                format!("  - name: {port}\n    memory_port_options: !Arm\n      ap: !v1 0\n")
+            })
+            .collect::<String>();
+        let yaml = format!(
+            r#"
+name: Test Family
+variants:
+- name: TestChip
+  cores:
+  - name: core0
+    type: armv7a
+    core_access_options: !Arm
+      ap: !v1 1
+      debug_base: 0x80090000
+  memory_ports:
+{ports}  memory_map:
+  - !Ram
+    range:
+      start: 0x0
+      end: 0x1000
+    cores:
+    - core0
+    memory_ports:
+    - {region_port}
+"#
+        );
+        yaml_serde::from_str(&yaml).expect("test family YAML should parse")
+    }
+
+    #[test]
+    fn memory_region_with_known_port_is_valid() {
+        family_with_region_port("ahb-ap")
+            .validate()
+            .expect("region with existing memory port should be valid");
+    }
+
+    #[test]
+    fn memory_region_with_unknown_port_is_rejected() {
+        let error = family_with_region_port("does-not-exist")
+            .validate()
+            .expect_err("region with unknown memory port should be rejected");
+        assert!(error.contains("non-existent memory port does-not-exist"));
+    }
+
+    #[test]
+    fn memory_port_named_like_a_core_is_rejected() {
+        let error = family(&["core0"], "core0")
+            .validate()
+            .expect_err("memory port named like a core should be rejected");
+        assert!(error.contains("memory port name core0 is not unique"));
+    }
+
+    #[test]
+    fn duplicate_memory_port_names_are_rejected() {
+        let error = family(&["ahb-ap", "ahb-ap"], "ahb-ap")
+            .validate()
+            .expect_err("duplicate memory port names should be rejected");
+        assert!(error.contains("memory port name ahb-ap is not unique"));
     }
 }

@@ -53,7 +53,7 @@ pub struct DebugInfo {
 }
 
 impl DebugInfo {
-    /// Read debug info directly from a ELF file.
+    /// Read debug info directly from an ELF file.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<DebugInfo, DebugError> {
         let data = std::fs::read(path.as_ref())?;
 
@@ -814,10 +814,15 @@ impl DebugInfo {
                     exception_handler,
                 ) {
                     Err(error) => {
-                        tracing::error!("{:?}", &error);
+                        tracing::warn!(
+                            "Failed to unwind register {} for frame at {frame_pc:#010x}: {error}",
+                            debug_register.core_register
+                        );
                         if let Some(first_frame) = stack_frames.last_mut() {
-                            first_frame.function_name =
-                                format!("{} : ERROR: {error}", first_frame.function_name);
+                            first_frame.function_name = format!(
+                                "{} (unwinding stopped due to an error)",
+                                first_frame.function_name
+                            );
                         };
                         break 'unwind;
                     }
@@ -1659,11 +1664,11 @@ pub fn unwind_program_counter_register(
                         "PC=(unwound (LR - 2) & !0b1) (dwarf Undefined)",
                     )
                 }
-                Some(InstructionSet::RV32C) => (
+                Some(InstructionSet::Riscv { c: true, .. }) => (
                     Some(RegisterValue::U32(return_address - 2)),
                     "PC=(unwound x1 - 2) (dwarf Undefined)",
                 ),
-                Some(InstructionSet::RV32) => (
+                Some(InstructionSet::Riscv { c: false, .. }) => (
                     Some(RegisterValue::U32(return_address - 4)),
                     "PC=(unwound x1 - 4) (dwarf Undefined)",
                 ),
@@ -1749,7 +1754,7 @@ mod test {
 
     use gimli::RegisterRule;
     use probe_rs::{
-        CoreDump, InstructionSet, MemoryInterface, RegisterRole, RegisterValue,
+        CoreDump, InstructionSet, MemoryInterface, RegisterRole, RegisterValue, Xlen,
         architecture::{
             arm::core::registers::cortex_m::{self, CORTEX_M_CORE_REGISTERS},
             riscv::registers::RISCV_CORE_REGISTERS,
@@ -2680,13 +2685,18 @@ mod test {
     #[test]
     fn unwind_pc_from_csr_skips_call_adjustment() {
         let mepc = RegisterValue::U32(0x8000_1234);
+        let rv32 = Some(InstructionSet::Riscv {
+            xlen: Xlen::X32,
+            c: false,
+            f: false,
+        });
 
         assert_eq!(
-            unwind_program_counter_register(mepc, 0x8000_2000, Some(InstructionSet::RV32), true),
+            unwind_program_counter_register(mepc, 0x8000_2000, rv32, true),
             Some(mepc)
         );
         assert_eq!(
-            unwind_program_counter_register(mepc, 0x8000_2000, Some(InstructionSet::RV32), false),
+            unwind_program_counter_register(mepc, 0x8000_2000, rv32, false),
             Some(RegisterValue::U32(0x8000_1230))
         );
     }

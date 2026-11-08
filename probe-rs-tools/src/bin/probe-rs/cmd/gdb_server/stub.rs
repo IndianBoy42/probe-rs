@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{Context, bail};
 use indexmap::IndexMap;
 use probe_rs::CoreType;
 use probe_rs_rpc_client::SessionInterface;
@@ -6,6 +6,8 @@ use tokio::runtime::Handle;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Child;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::GdbSessionContext;
@@ -28,13 +30,16 @@ impl GdbInstanceConfiguration {
     pub fn from_context(
         context: &GdbSessionContext,
         connection_string: Option<impl AsRef<str>>,
-    ) -> Vec<Self> {
+    ) -> anyhow::Result<Vec<Self>> {
         let connection_string = connection_string
             .as_ref()
             .map(|s| s.as_ref())
             .unwrap_or(CONNECTION_STRING);
 
-        let addrs: Vec<SocketAddr> = connection_string.to_socket_addrs().unwrap().collect();
+        let addrs: Vec<SocketAddr> = connection_string
+            .to_socket_addrs()
+            .with_context(|| format!("invalid GDB connection string '{connection_string}'"))?
+            .collect();
 
         let mut groups = IndexMap::new();
         for core in &context.cores {
@@ -44,7 +49,7 @@ impl GdbInstanceConfiguration {
                 .push(core.index);
         }
 
-        groups
+        Ok(groups
             .into_iter()
             .enumerate()
             .map(|(i, (core_type, cores))| GdbInstanceConfiguration {
@@ -52,7 +57,7 @@ impl GdbInstanceConfiguration {
                 cores,
                 socket_addrs: adjust_addrs(&addrs, i),
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -63,6 +68,7 @@ pub fn run<'a>(
     context: GdbSessionContext,
     instances: impl Iterator<Item = &'a GdbInstanceConfiguration>,
     mut gdb_process: Option<Child>,
+    shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut targets = instances
         .map(|instance| {
@@ -81,6 +87,14 @@ pub fn run<'a>(
     }
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            if let Some(gdb_process) = &mut gdb_process {
+                _ = gdb_process.kill();
+                _ = gdb_process.wait();
+            }
+            return Ok(());
+        }
+
         if let Some(gdb_process) = &mut gdb_process
             && let Some(exit_status) = gdb_process.try_wait()?
         {
@@ -96,7 +110,7 @@ pub fn run<'a>(
             wait_time = wait_time.min(target.process()?);
         }
 
-        std::thread::sleep(wait_time);
+        std::thread::sleep(wait_time.min(Duration::from_millis(100)));
     }
 }
 

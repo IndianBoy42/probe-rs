@@ -42,6 +42,10 @@ const SD_TAP_DEFAULT: u32 = (1 << 20) | (1 << 8) | (1 << 6) | (1 << 3);
 /// * [7] KEEPPOWEREDINTLR - Don't reset the ICEPICK in JTAG Test-Logic Reset
 const SYSCTRL_DEFAULT: u32 = 0x80;
 
+/// Run-Test/Idle clocks after selecting a secondary TAP. The TAP joins the scan chain on these
+/// clocks, and a run of only a few leaves it unable to answer.
+const JOIN_IDLE_CLOCKS: u32 = 64;
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
 enum IcepickRoutingRegister {
@@ -51,7 +55,19 @@ enum IcepickRoutingRegister {
     SdTap(u8),
 }
 
+impl IcepickRoutingRegister {
+    /// The router data register that writes `payload` to this register.
+    ///
+    /// Bit 31 selects a write, bits 30 to 24 address the register and the low 24 bits carry the
+    /// payload. The ICEPick addresses a register by a three-bit block and a four-bit register
+    /// within it, which is what the seven address bits hold.
+    fn write(self, payload: u32) -> u32 {
+        (1 << 31) | (u32::from(self) << 24) | (payload & 0xFF_FFFF)
+    }
+}
+
 impl From<IcepickRoutingRegister> for u32 {
+    /// Block in bits 6 to 4, register in bits 3 to 0.
     fn from(value: IcepickRoutingRegister) -> Self {
         match value {
             IcepickRoutingRegister::Sysctrl => 1u32,
@@ -75,11 +91,23 @@ impl<'a> Icepick<'a> {
 
         let mut this = Icepick { probe: chain };
 
+        // Reset the JTAG bus, which removes all TAPs except the main ICEPICK.
         {
             let mut batch = JtagBatch::new();
             this.probe.tap_reset(&mut batch);
             this.probe.run(batch).map_err(ArmError::Probe)?;
         }
+
+        // A chain left from an earlier setup still pads for the secondary TAP that the reset
+        // just removed.
+        this.probe.set_chain(&[ScanChainElement {
+            name: Some("ICEPICK".to_owned()),
+            ir_len: Some(IR_LEN_IN_BITS),
+        }]);
+        tracing::info!("Selecting target 0");
+        this.probe
+            .select(0)
+            .inspect_err(|e| tracing::error!("Unable to select target 0: {e}"))?;
 
         if protocol == DefaultProtocol::CJtag {
             this.ctag_to_jtag()?;
@@ -93,15 +121,7 @@ impl<'a> Icepick<'a> {
             return Err(ArmError::Probe(DebugProbeError::TargetNotFound));
         }
 
-        this.probe.set_chain(&[ScanChainElement {
-            name: Some("ICEPICK".to_owned()),
-            ir_len: Some(IR_LEN_IN_BITS),
-        }]);
-        tracing::info!("Selecting target 0");
-        this.probe
-            .select(0)
-            .inspect_err(|e| tracing::error!("Unable to select target 0: {e}"))?;
-
+        // Enable write by setting the `ConnectKey` to 0b1001 (0x9) as per TRM section 6.3.3
         {
             let mut batch = JtagBatch::new();
             let ir = BitSequence::from_bytes(&IR_CONNECT.to_le_bytes(), IR_LEN_IN_BITS as usize);
@@ -125,16 +145,18 @@ impl<'a> Icepick<'a> {
         let mut tap_count = 0;
         tracing::trace!("Scan of JTAG bus:");
 
+        // Capture-DR must run only once: each pass through it reloads the IDCODEs, so the
+        // scan stays in Shift-DR until the TAPs have shifted out all of them.
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::ShiftDr);
         for index in 0..255 {
-            let mut batch = JtagBatch::new();
-            batch.enter(TapState::ShiftDr);
             let handle = batch.exchange(BitSequence::repeat(false, 32));
-            batch.enter(TapState::RunTestIdle);
             let mut results = self.probe.run(batch).map_err(ArmError::Probe)?;
+            batch = JtagBatch::new();
             let idcode_bits = results
                 .take(handle)
                 .map_err(|_| ArmError::Probe(DebugProbeError::Other("missing IDCODE".into())))?;
-            let idcode = idcode_bits.as_bits().load_be::<u32>();
+            let idcode = idcode_bits.as_bits().load_le::<u32>();
 
             tracing::trace!("    TAP index {index}: 0x{idcode:08x}");
             if idcode == 0 {
@@ -143,7 +165,31 @@ impl<'a> Icepick<'a> {
             tap_count += 1;
         }
 
+        batch.enter(TapState::RunTestIdle);
+        self.probe.run(batch).map_err(ArmError::Probe)?;
+
         Ok(tap_count)
+    }
+
+    /// Selects a secondary TAP and leaves the ICEPick in BYPASS, in one pass.
+    ///
+    /// The TAP joins the scan chain at the next Run-Test/Idle, and only if the TAP controller
+    /// stays there for a run of clocks. From then on every scan needs a TAP more of padding, so
+    /// the ICEPick's BYPASS instruction goes out first, while the chain is still short.
+    fn select_secondary_tap(&mut self, tap: u8, payload: u32) -> Result<(), ArmError> {
+        let dr = IcepickRoutingRegister::SdTap(tap).write(payload);
+
+        let mut batch = JtagBatch::new();
+        let router = BitSequence::from_bytes(&IR_ROUTER.to_le_bytes(), IR_LEN_IN_BITS as usize);
+        self.probe.shift_ir(&mut batch, &router);
+        self.probe
+            .exchange_dr(&mut batch, &BitSequence::from_bytes(&dr.to_le_bytes(), 32));
+
+        let bypass = BitSequence::from_bytes(&IR_BYPASS.to_le_bytes(), IR_LEN_IN_BITS as usize);
+        self.probe.shift_ir(&mut batch, &bypass);
+        self.probe.run_test_idle(&mut batch, JOIN_IDLE_CLOCKS);
+        self.probe.run(batch).map_err(ArmError::Probe)?;
+        Ok(())
     }
 
     /// Reads or writes a given register using the ICEPICK router
@@ -152,7 +198,7 @@ impl<'a> Icepick<'a> {
     /// and connect a given data register to the TDO.
     ///
     /// This is a direct port from the openocd implementation:
-    /// <https://github.com/openocd-org/openocd/blob/master/tcl/target/icepick.cfg#L56-L70>
+    /// <https://github.com/openocd-org/openocd/blob/master/tcl/target/ti/icepick.cfg#L56-L70>
     ///
     /// * `register`  - The register to access
     /// * `payload`   - The data to write to the register
@@ -161,8 +207,7 @@ impl<'a> Icepick<'a> {
         register: IcepickRoutingRegister,
         payload: u32,
     ) -> Result<(), ArmError> {
-        let rw = 1;
-        let dr = (rw << 31) | (u32::from(register) << 24) | (payload & 0xFFFFFF);
+        let dr = register.write(payload);
         let dr_bits = BitSequence::from_bytes(&dr.to_le_bytes(), 32);
         let zero = BitSequence::from_bytes(&0u32.to_le_bytes(), 32);
         let ir = BitSequence::from_bytes(&IR_ROUTER.to_le_bytes(), IR_LEN_IN_BITS as usize);
@@ -192,27 +237,16 @@ impl<'a> Icepick<'a> {
     /// present on the scan chain.
     ///
     /// This is a direct port of the openocd implementation:
-    /// <https://github.com/openocd-org/openocd/blob/master/tcl/target/icepick.cfg#L81-L124>
+    /// <https://github.com/openocd-org/openocd/blob/master/tcl/target/ti/icepick.cfg#L81-L124>
     /// A few things were removed to fit the cc13xx_cc26xx family.
     pub(crate) fn select_tap(&mut self, secondary_tap: u8, tap_name: &str) -> Result<(), ArmError> {
         tracing::trace!("Selecting secondary tap {secondary_tap}");
-        self.icepick_router(IcepickRoutingRegister::SdTap(secondary_tap), SD_TAP_DEFAULT)?;
+        self.select_secondary_tap(secondary_tap, SD_TAP_DEFAULT)?;
 
-        // Stay in Run/Test Idle for at least three cycles to activate the TAP
-        // Enter the bypass state to remove the ICEPick from the scan chain.
-        // This will insert three cycles after the configuration in order to make
-        // the target TAP appear.
-        {
-            let mut batch = JtagBatch::new();
-            let ir = BitSequence::from_bytes(&IR_BYPASS.to_le_bytes(), IR_LEN_IN_BITS as usize);
-            self.probe.shift_ir(&mut batch, &ir);
-            self.probe
-                .exchange_dr(&mut batch, &BitSequence::repeat(false, 1));
-            self.probe.run_test_idle(&mut batch, 3);
-            self.probe.run(batch).map_err(ArmError::Probe)?;
-        }
-
-        self.probe.set_expected(&[
+        // The secondary TAP now sits in front of the ICEPick, so every later scan needs a
+        // different amount of padding. Measuring the chain means entering Test-Logic-Reset,
+        // which would deselect the TAP, so it is declared instead.
+        let chain = [
             ScanChainElement {
                 name: Some(tap_name.to_owned()),
                 ir_len: Some(4),
@@ -221,10 +255,12 @@ impl<'a> Icepick<'a> {
                 name: Some("ICEPICK".to_owned()),
                 ir_len: Some(IR_LEN_IN_BITS),
             },
-        ]);
-
-        tracing::trace!("Should be active now");
-        self.scan_jtag()?;
+        ];
+        self.probe.set_chain(&chain);
+        self.probe.select(0).map_err(ArmError::Probe)?;
+        // The callers' `configure_jtag(true)` rebuilds the chain from the expected one on
+        // CMSIS-DAP, and a target's YAML may list the ICEPick alone.
+        self.probe.set_expected(&chain);
 
         Ok(())
     }
@@ -264,16 +300,204 @@ impl<'a> Icepick<'a> {
     pub(crate) fn ctag_to_jtag(&mut self) -> Result<(), ArmError> {
         self.shift_ir_value(IR_BYPASS)?;
 
+        // cJTAG: Open Command Window
+        // This is described in section 6.2.2.1 of this document:
+        // <https://www.ti.com/lit/ug/swcu185f/swcu185f.pdf>
+        // Also refer to the openocd implementation:
+        // <https://github.com/openocd-org/openocd/blob/60d11a881fb2d1f34584ba975749feb6fc1c9d03/tcl/target/ti/cjtag.cfg#L6-L35>
         self.zero_bit_scan()?;
         self.zero_bit_scan()?;
         self.exchange_dr_value(BitSequence::from_u64(1, 0xff))?;
 
+        // cJTAG: Switch to 4 pin
+        // This is described in section 6.2.2.2 of this document:
+        // <https://www.ti.com/lit/ug/swcu185f/swcu185f.pdf>
+        // Also refer to the openocd implementation:
+        // <https://github.com/openocd-org/openocd/blob/60d11a881fb2d1f34584ba975749feb6fc1c9d03/tcl/target/ti/cjtag.cfg#L6-L35>
         self.exchange_dr_value(BitSequence::from_u64(2, 0xff))?;
         self.exchange_dr_value(BitSequence::from_u64(9, 0xff))?;
 
+        // Load IR with BYPASS so that future state transitions don't affect IR
         self.shift_ir_value(IR_BYPASS)?;
+
+        // Load IR with IDCODE to support scanning
         self.shift_ir_value(IR_IDCODE)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use bitvec::vec::BitVec;
+
+    use super::Icepick;
+    use crate::probe::jtag::golden::{OldJtagState, RegisterState};
+    use crate::probe::{
+        BitbangJtag, DebugProbe, DebugProbeError, JtagChain, JtagChainAccess, JtagChainState,
+        TapState, WireProtocol,
+    };
+
+    /// A chain of TAPs whose data registers hold their IDCODEs, as after a TAP reset.
+    #[derive(Debug)]
+    struct IdcodeChain {
+        idcodes: Vec<u32>,
+        tap: OldJtagState,
+        dr: VecDeque<bool>,
+        captured: BitVec,
+        captures: usize,
+        tms: String,
+        jtag_state: JtagChainState,
+    }
+
+    impl IdcodeChain {
+        /// A chain at rest in Run-Test/Idle.
+        fn new(idcodes: Vec<u32>) -> Self {
+            Self {
+                idcodes,
+                tap: OldJtagState::Idle,
+                dr: VecDeque::new(),
+                captured: BitVec::new(),
+                captures: 0,
+                tms: String::new(),
+                jtag_state: JtagChainState {
+                    tap_state: TapState::RunTestIdle,
+                    ..JtagChainState::default()
+                },
+            }
+        }
+    }
+
+    impl DebugProbe for IdcodeChain {
+        fn get_name(&self) -> &str {
+            "IDCODE chain"
+        }
+
+        fn speed_khz(&self) -> u32 {
+            0
+        }
+
+        fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
+            Ok(speed_khz)
+        }
+
+        fn attach(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn detach(&mut self) -> Result<(), crate::Error> {
+            Ok(())
+        }
+
+        fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn set_reset_line_connected(&mut self, _connected: bool) {}
+
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn select_protocol(&mut self, _protocol: WireProtocol) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn active_protocol(&self) -> Option<WireProtocol> {
+            Some(WireProtocol::Jtag)
+        }
+
+        fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
+            self
+        }
+    }
+
+    impl BitbangJtag for IdcodeChain {
+        fn tap_state(&mut self) -> &mut TapState {
+            &mut self.jtag_state.tap_state
+        }
+
+        fn shift(&mut self, tms: bool, _tdi: bool, capture: bool) -> Result<(), DebugProbeError> {
+            self.tms.push(if tms { '1' } else { '0' });
+            if self.tap == OldJtagState::Dr(RegisterState::Shift) {
+                let tdo = self.dr.pop_front().unwrap_or(false);
+                if capture {
+                    self.captured.push(tdo);
+                }
+            }
+            self.tap.update(tms);
+            if self.tap == OldJtagState::Dr(RegisterState::Capture) {
+                self.captures += 1;
+                self.dr = self
+                    .idcodes
+                    .iter()
+                    .flat_map(|idcode| (0..32).map(move |bit| idcode & (1 << bit) != 0))
+                    .collect();
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn captured(&mut self) -> Result<BitVec, DebugProbeError> {
+            Ok(std::mem::take(&mut self.captured))
+        }
+    }
+
+    impl JtagChainAccess for IdcodeChain {
+        fn chain_state(&mut self) -> &mut JtagChainState {
+            &mut self.jtag_state
+        }
+
+        fn chain_state_ref(&self) -> &JtagChainState {
+            &self.jtag_state
+        }
+    }
+
+    #[test]
+    fn the_scan_captures_once_and_counts_every_tap() {
+        let mut chain = IdcodeChain::new(vec![0x0B9B_E02F, 0x4BA0_0477]);
+        let mut icepick = Icepick {
+            probe: JtagChain::new(&mut chain),
+        };
+
+        assert_eq!(icepick.scan_jtag().unwrap(), 2);
+        assert_eq!(chain.captures, 1);
+        assert_eq!(chain.tms, format!("100{}110", "0".repeat(3 * 32)));
+        assert_eq!(chain.tap, OldJtagState::Idle);
+        assert_eq!(chain.jtag_state.tap_state, TapState::RunTestIdle);
+    }
+
+    #[test]
+    fn selecting_a_tap_pads_later_scans_for_it() {
+        let mut chain = IdcodeChain::new(vec![0x0B9B_E02F]);
+        let mut icepick = Icepick {
+            probe: JtagChain::new(&mut chain),
+        };
+
+        icepick.select_tap(0, "CPU").unwrap();
+
+        // The secondary TAP is in front of the ICEPick, whose six instruction bits and one
+        // bypass bit every later scan now has to shift past.
+        let params = icepick.probe.params();
+        assert_eq!(
+            (
+                params.index,
+                params.irpre,
+                params.irpost,
+                params.drpre,
+                params.drpost,
+                params.irlen
+            ),
+            (0, 0, super::IR_LEN_IN_BITS as usize, 0, 1, 4)
+        );
     }
 }

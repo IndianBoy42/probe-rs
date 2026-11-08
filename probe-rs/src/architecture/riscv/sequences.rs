@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::flashing::DebugFlashSequence;
+use crate::flashing::{DebugFlashSequence, FlashCompare};
 
 /// A interface to operate debug sequences for RISC-V targets.
 ///
@@ -94,6 +94,13 @@ pub trait RiscvDebugSequence: Send + Sync + Debug {
         None
     }
 
+    /// Return the flash compare method of this target, if it has one.
+    ///
+    /// See [`FlashCompare`] for the rules.
+    fn flash_compare(&self) -> Option<Arc<dyn FlashCompare>> {
+        None
+    }
+
     /// This sequence is called if an image was flashed to RAM directly. It should perform the
     /// necessary preparation to run that image on the core with the ID passed to the function.
     ///
@@ -107,6 +114,12 @@ pub trait RiscvDebugSequence: Send + Sync + Debug {
         Err(crate::Error::NotImplemented(
             "RAM running on RISC-V targets",
         ))
+    }
+
+    /// This sequence is called before an image that boots from RAM is written, after the cores
+    /// that boot from it were reset and halted.
+    fn prepare_loading_to_ram(&self, _session: &mut crate::Session) -> Result<(), crate::Error> {
+        Ok(())
     }
 }
 

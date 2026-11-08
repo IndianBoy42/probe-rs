@@ -12,7 +12,7 @@ use crate::rpc::{
     functions::{
         RpcContext, RpcSpawnContext, WireTxImpl,
         convert::lift,
-        monitor::{MonitorSender, RttPoller},
+        monitor::{MonitorSender, RttPoller, discard_serial_input, with_serial_forwarding},
     },
     utils::{
         run_loop::{ReturnReason, RunLoop, VectorCatchConfig},
@@ -34,10 +34,7 @@ pub async fn list_tests(
         .await
         .map_err(crate::rpc::functions::convert::rpc_error_anyhow);
 
-    sender
-        .reply::<ListTestsEndpoint>(header.seq_no, &resp)
-        .await
-        .unwrap();
+    crate::rpc::functions::reply::<ListTestsEndpoint>(&sender, header, &resp).await;
 }
 
 fn list_tests_impl(
@@ -46,9 +43,10 @@ fn list_tests_impl(
     sender: MonitorSender,
 ) -> anyhow::Result<Tests> {
     let shared_session = ctx.shared_session(request.sessid);
-    let mut list_handler = ListEventHandler::new(request.semihosting_options, |event| {
-        sender.send_semihosting_event(event).unwrap()
-    });
+    let mut list_handler = ListEventHandler::new(
+        ctx.semihosting_options(request.semihosting_options)?,
+        |event| _ = sender.send_semihosting_event(event),
+    );
 
     let core_id = request
         .rtt_client
@@ -116,10 +114,7 @@ pub async fn run_test(
         .await
         .map_err(crate::rpc::functions::convert::rpc_error_anyhow);
 
-    sender
-        .reply::<RunTestEndpoint>(header.seq_no, &resp)
-        .await
-        .unwrap();
+    crate::rpc::functions::reply::<RunTestEndpoint>(&sender, header, &resp).await;
 }
 
 fn run_test_impl(
@@ -128,6 +123,8 @@ fn run_test_impl(
     sender: MonitorSender,
 ) -> anyhow::Result<TestResult> {
     tracing::info!("Running test {}", request.test.name);
+
+    let semihosting_options = ctx.semihosting_options(request.semihosting_options)?;
 
     let timeout = request.test.timeout.map(|t| Duration::from_secs(t as u64));
     let timeout = timeout.unwrap_or(Duration::from_secs(60));
@@ -139,6 +136,12 @@ fn run_test_impl(
         .map(|rtt_client| ctx.object_mut_blocking(rtt_client).core_id())
         .unwrap_or(0);
 
+    let target_serial = shared_session.target_serial();
+    if let Some(serial) = &target_serial {
+        // Drop the output from before this test.
+        discard_serial_input(serial);
+    }
+
     {
         let mut session = shared_session.session_blocking();
         let mut core = session.core(core_id)?;
@@ -146,10 +149,9 @@ fn run_test_impl(
     }
 
     let expected_outcome = request.test.expected_outcome;
-    let mut run_handler =
-        RunEventHandler::new(request.test, request.semihosting_options, |event| {
-            sender.send_semihosting_event(event).unwrap()
-        });
+    let mut run_handler = RunEventHandler::new(request.test, semihosting_options, |event| {
+        _ = sender.send_semihosting_event(event)
+    });
 
     let mut run_loop = RunLoop {
         core_id,
@@ -166,18 +168,21 @@ fn run_test_impl(
         },
     });
 
-    match run_loop.run_until(
-        &shared_session,
-        VectorCatchConfig {
-            catch_hardfault: true,
-            catch_reset: true,
-            catch_svc: true,
-            catch_hlt: true,
-        },
-        poller,
-        Some(timeout),
-        |halt_reason, core| run_handler.handle_halt(halt_reason, core),
-    )? {
+    let return_reason = with_serial_forwarding(target_serial.as_ref(), &sender, || {
+        run_loop.run_until(
+            &shared_session,
+            VectorCatchConfig {
+                catch_hardfault: true,
+                catch_reset: true,
+                catch_svc: true,
+                catch_hlt: true,
+            },
+            poller,
+            Some(timeout),
+            |halt_reason, core| run_handler.handle_halt(halt_reason, core),
+        )
+    })?;
+    match return_reason {
         ReturnReason::Timeout => Ok(TestResult::Failed(format!(
             "Test timed out after {timeout:?}"
         ))),

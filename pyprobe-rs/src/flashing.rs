@@ -229,18 +229,16 @@ fn wire_format_options(
     })
 }
 
-/// Map the Python options onto the wire struct. `dry_run` has no
-/// per-download wire form — the server derives it from the attached
-/// session — so a user-set `dry_run` is rejected loudly rather than
-/// silently ignored on a destructive operation. `preverify` is implemented
-/// client-side via `SessionInterface::verify` (skip the write when the
-/// image already matches flash).
+/// Map the Python options onto the wire struct. `dry_run` has no wire form:
+/// probe-rs removed dry runs from the RPC protocol, so a user-set `dry_run` is
+/// rejected loudly rather than silently ignored on a destructive operation.
+/// `preverify` is implemented client-side via `SessionInterface::verify` (skip
+/// the write when the image already matches flash).
 fn wire_download_options(opts: &DownloadOptions) -> PyResult<WireDownloadOptions> {
     if opts.dry_run {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "DownloadOptions.dry_run is no longer a per-download switch; \
-             attach a hardwareless session with \
-             Session.auto_attach(..., dry_run=True) instead",
+            "DownloadOptions.dry_run is not supported: probe-rs removed dry runs \
+             from the RPC protocol, so a download cannot be simulated",
         ));
     }
     Ok(WireDownloadOptions {
@@ -330,11 +328,6 @@ fn flash_once(
             conn.session()?
                 .flash(wire, built.loader, progress_forward(pump.as_ref())),
         )?;
-    }
-    // A dry-run session's boot sequence times out on the mocked core; the
-    // dry run ends with the cores halted.
-    if conn.dry_run {
-        return Ok(());
     }
     // The two boot futures are distinct opaque types, so each branch runs
     // its own bridge call instead of unifying into one.
@@ -519,10 +512,7 @@ impl FlashLoader {
                         .flash(wire, key, progress_forward(pump.as_ref())),
                 )?;
             }
-            // A dry-run session's boot sequence times out on the mocked core.
-            if !conn.dry_run {
-                rpc_call(DEFAULT_TIMEOUT, "boot", conn.session()?.boot(boot_info, 0))?;
-            }
+            rpc_call(DEFAULT_TIMEOUT, "boot", conn.session()?.boot(boot_info, 0))?;
             Ok(())
         })
         .map_err(to_bridge_err)?;

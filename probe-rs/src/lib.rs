@@ -78,6 +78,7 @@ mod error;
 pub mod flashing;
 pub mod integration;
 mod memory;
+mod memory_port;
 #[cfg(feature = "object")]
 pub mod meta;
 pub mod probe;
@@ -89,7 +90,7 @@ mod session;
 #[cfg(any(test, feature = "test"))]
 pub mod test;
 
-pub use crate::config::{CoreType, Endian, InstructionSet, Target};
+pub use crate::config::{CoreType, Endian, InstructionSet, Target, Xlen};
 #[cfg(feature = "coredump")]
 pub use crate::core::dump::{CoreDump, CoreDumpError};
 pub use crate::core::registers::RegisterDataType;
@@ -100,7 +101,8 @@ pub use crate::core::{
     RegisterRole, RegisterValue, SpecificCoreState, VectorCatchCondition,
 };
 pub use crate::error::{BreakpointError, Error};
-pub use crate::memory::MemoryInterface;
+pub use crate::memory::{MemoryInterface, Operation, OperationKind};
+pub use crate::memory_port::MemoryAccessPort;
 pub use crate::session::{Permissions, Session, SessionConfig};
 
 #[doc = include_str!("../../README.md")]

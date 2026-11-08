@@ -2,14 +2,17 @@
 //!
 //! The information is passed as a stream of messages to the provided emitter.
 
+use std::any::Any;
+
 use anyhow::anyhow;
+use jep106::JEP106Code;
 use postcard_rpc::header::{VarHeader, VarSeq};
 use probe_rs::{
     MemoryMappedRegister as _,
     architecture::{
         arm::{
-            self, ApAddress, ApV2Address, ArmDebugInterface,
-            ap::{ApClass, ApRegister, ApType, IDR},
+            self, ApAddress, ApV2Address, ArmDebugInterface, ArmError,
+            ap::{ApClass, ApRegister, ApType, BASE, IDR},
             armv6m::Demcr,
             component::Scs,
             dp::{self, Ctrl, DLPIDR, DPIDR, DpRegister, TARGETID},
@@ -19,6 +22,12 @@ use probe_rs::{
             },
             sequences::DefaultArmSequence,
         },
+        riscv::{
+            Dmcontrol,
+            communication_interface::{
+                DebugModuleVersion, RiscvCommunicationInterface, RiscvError,
+            },
+        },
         xtensa::communication_interface::{
             XtensaCommunicationInterface, XtensaDebugInterfaceState,
         },
@@ -27,8 +36,9 @@ use probe_rs::{
 };
 use probe_rs_rpc::info::{
     ApInfo, ComponentTreeNode, DebugPortId, DebugPortInfo, DebugPortInfoNode, DebugPortVersion,
-    DpAddress, FullyQualifiedApAddress, InfoEvent, MinDpSupport, TargetInfoRequest,
-    TargetMetadataRequest, WireFlashSector, WireSessionCore, WireSessionTargetMetadata,
+    DpAddress, FullyQualifiedApAddress, InfoEvent, JtagTapInfo, MinDpSupport, RiscvDebugModuleInfo,
+    RiscvDebugModuleVersion, RiscvHartInfo, RiscvHartIsa, TargetInfoRequest, TargetMetadataRequest,
+    WireFlashSector, WireSessionCore, WireSessionTargetMetadata,
 };
 use probe_rs_rpc::{NoResponse, TargetInfoDataTopic, probe::WireProtocol};
 use probe_rs_target::ScanChainElement;
@@ -70,20 +80,31 @@ pub async fn target_metadata(
 }
 
 /// Deduplicated absolute flash sectors for GDB memory-map XML.
+///
+/// Sectors are clipped to the target's NVM regions: a flash algorithm's address range may cover
+/// more than the flash the target has, and GDB ignores a memory map with overlapping regions.
 fn wire_flash_sectors(target: &probe_rs::Target) -> Vec<WireFlashSector> {
+    use probe_rs::config::MemoryRegion;
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
 
     let mut regions = BTreeMap::new();
     for algo in target.flash_algorithms.iter() {
         let start = algo.flash_properties.address_range.start;
-        let end = if let Some(region) =
-            target.memory_region_by_address(algo.flash_properties.address_range.start)
-        {
-            region.address_range().end
-        } else {
-            algo.flash_properties.address_range.end
-        };
+        let end = algo.flash_properties.address_range.end;
+
+        let windows = target
+            .memory_map
+            .iter()
+            .filter_map(|region| match region {
+                MemoryRegion::Nvm(nvm) => {
+                    let window = nvm.range.start.max(start)..nvm.range.end.min(end);
+                    (window.start < window.end).then_some(window)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
         let mut sectors = algo.flash_properties.sectors.clone();
         sectors.sort_by_key(|s| s.address);
         sectors.push(probe_rs::config::SectorDescription {
@@ -91,18 +112,25 @@ fn wire_flash_sectors(target: &probe_rs::Target) -> Vec<WireFlashSector> {
             address: end - start,
         });
         for (current, next) in sectors.iter().zip(sectors.iter().skip(1)) {
-            let sector = WireFlashSector {
-                start: start + current.address,
-                length: next.address - current.address,
-                blocksize: current.size,
-            };
-            match regions.entry(sector.start) {
-                Entry::Vacant(e) => {
-                    e.insert(sector);
+            for window in &windows {
+                let sector_start = (start + current.address).max(window.start);
+                let sector_end = (start + next.address).min(window.end);
+                if sector_start >= sector_end {
+                    continue;
                 }
-                Entry::Occupied(mut e) => {
-                    if sector.blocksize < e.get().blocksize {
+                let sector = WireFlashSector {
+                    start: sector_start,
+                    length: sector_end - sector_start,
+                    blocksize: current.size,
+                };
+                match regions.entry(sector.start) {
+                    Entry::Vacant(e) => {
                         e.insert(sector);
+                    }
+                    Entry::Occupied(mut e) => {
+                        if sector.blocksize < e.get().blocksize {
+                            e.insert(sector);
+                        }
                     }
                 }
             }
@@ -175,6 +203,12 @@ async fn try_show_info(
         probe.attach_to_unspecified()?;
     }
 
+    if protocol == WireProtocol::Jtag
+        && let Some(taps) = read_jtag_scan_chain(&mut probe)
+    {
+        return show_jtag_scan_chain_info(ctx, probe, taps).await;
+    }
+
     if probe.has_arm_debug_interface() {
         let dp_addr = if let Some(target_sel) = target_sel {
             vec![dp::DpAddress::Multidrop(target_sel)]
@@ -188,7 +222,7 @@ async fn try_show_info(
         };
 
         for address in dp_addr {
-            match try_show_arm_dp_info(ctx, probe, address).await {
+            match try_show_arm_dp_info(ctx, probe, address, true).await {
                 (probe_moved, Ok(dp_version)) => {
                     probe = probe_moved;
                     if dp_version < dp::DebugPortVersion::DPv2 && target_sel.is_none() {
@@ -254,6 +288,286 @@ async fn try_show_info(
     Ok(())
 }
 
+/// Returns the TAPs of the JTAG scan chain, or `None` when the probe cannot see the chain.
+fn read_jtag_scan_chain(probe: &mut Probe) -> Option<Vec<JtagTapInfo>> {
+    let mut chain = probe.try_as_jtag_chain()?;
+
+    let ir_lens = match chain.scan_chain() {
+        Ok(elements) if !elements.is_empty() => {
+            elements.iter().map(|e| e.ir_len()).collect::<Vec<_>>()
+        }
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!("Unable to scan the JTAG chain: {error}");
+            return None;
+        }
+    };
+
+    // A chain that was set without a scan has no IDCODEs.
+    let idcodes = chain
+        .idcodes()
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(None));
+
+    Some(
+        ir_lens
+            .into_iter()
+            .zip(idcodes)
+            .map(|(ir_len, idcode)| JtagTapInfo { idcode, ir_len })
+            .collect(),
+    )
+}
+
+/// The debug interfaces that a TAP can have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapKind {
+    Arm,
+    Riscv,
+    Xtensa,
+    RiscvOrXtensa,
+    Unsupported,
+}
+
+impl TapKind {
+    fn classify(tap: &JtagTapInfo) -> Self {
+        let designer = tap.idcode.map(idcode_designer);
+
+        // ADIv5 and ADIv6 set the IR length of a JTAG-DP to 4. The RISC-V and Xtensa TAPs that
+        // probe-rs supports have an IR length of 5. The RISC-V DTM instructions do other things
+        // on other TAPs, for example they start the configuration of a Xilinx FPGA.
+        match (tap.ir_len, designer) {
+            (_, Some(JEP_ST)) => Self::Unsupported,
+            (4, _) => Self::Arm,
+            (5, Some(JEP_TENSILICA)) => Self::Xtensa,
+            (5, Some(_)) => Self::Riscv,
+            (5, None) => Self::RiscvOrXtensa,
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+/// STM32 and GD32 devices put a boundary-scan TAP with this designer next to the JTAG-DP.
+const JEP_ST: JEP106Code = JEP106Code::new(0, 0x20);
+const JEP_TENSILICA: JEP106Code = JEP106Code::new(4, 0x72);
+
+fn idcode_designer(idcode: u32) -> JEP106Code {
+    let manufacturer = (idcode >> 1) & 0x7ff;
+    JEP106Code::new((manufacturer >> 7) as u8, (manufacturer & 0x7f) as u8)
+}
+
+async fn show_jtag_scan_chain_info(
+    ctx: &mut RpcContext,
+    mut probe: Probe,
+    taps: Vec<JtagTapInfo>,
+) -> anyhow::Result<()> {
+    ctx.publish::<TargetInfoDataTopic>(VarSeq::Seq2(0), &InfoEvent::JtagScanChain(taps.clone()))
+        .await?;
+
+    for (index, tap) in taps.iter().enumerate() {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::JtagTap {
+                index: index as u32,
+            },
+        )
+        .await?;
+
+        if let Some(mut chain) = probe.try_as_jtag_chain()
+            && let Err(error) = chain.select(index)
+        {
+            ctx.publish::<TargetInfoDataTopic>(
+                VarSeq::Seq2(0),
+                &InfoEvent::Message(format!("Unable to select the TAP: {error}")),
+            )
+            .await?;
+            continue;
+        }
+
+        match TapKind::classify(tap) {
+            TapKind::Arm => probe = show_arm_tap_info(ctx, probe).await?,
+            TapKind::Riscv => {
+                if !show_riscv_tap_info(ctx, &mut probe).await? {
+                    show_unsupported_tap(ctx).await?;
+                }
+            }
+            TapKind::Xtensa => show_xtensa_tap_info(ctx, &mut probe).await?,
+            TapKind::RiscvOrXtensa => {
+                if !show_riscv_tap_info(ctx, &mut probe).await? {
+                    show_xtensa_tap_info(ctx, &mut probe).await?;
+                }
+            }
+            TapKind::Unsupported => show_unsupported_tap(ctx).await?,
+        }
+    }
+
+    Ok(())
+}
+
+async fn show_unsupported_tap(ctx: &mut RpcContext) -> anyhow::Result<()> {
+    ctx.publish::<TargetInfoDataTopic>(
+        VarSeq::Seq2(0),
+        &InfoEvent::Message("No supported debug interface.".to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn show_arm_tap_info(ctx: &mut RpcContext, probe: Probe) -> anyhow::Result<Probe> {
+    if !probe.has_arm_debug_interface() {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::ProbeInterfaceMissing {
+                interface: "DAP".to_string(),
+                architecture: "ARM".to_string(),
+            },
+        )
+        .await?;
+        return Ok(probe);
+    }
+
+    let address = dp::DpAddress::Default;
+    let (probe, result) = try_show_arm_dp_info(ctx, probe, address, false).await;
+    if let Err(e) = result {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::ArmError {
+                dp_addr: convert::to_wire_dp_address(address),
+                error: format!("{e:?}"),
+            },
+        )
+        .await?;
+    }
+
+    Ok(probe)
+}
+
+/// Shows the RISC-V debug module of the selected TAP. Returns `false` when the TAP is not a RISC-V
+/// DTM, and shows nothing then.
+async fn show_riscv_tap_info(ctx: &mut RpcContext, probe: &mut Probe) -> anyhow::Result<bool> {
+    if !probe.has_riscv_interface() {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::ProbeInterfaceMissing {
+                interface: "RISC-V".to_string(),
+                architecture: "RISC-V".to_string(),
+            },
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    tracing::debug!("Trying to show RISC-V debug module information");
+    let info = match probe.try_get_riscv_interface_builder() {
+        Ok(factory) => {
+            let mut state = factory.create_state();
+            factory
+                .attach(&mut state)
+                .map_err(RiscvError::from)
+                .and_then(|mut interface| read_riscv_debug_module(&mut interface))
+        }
+        Err(error) => Err(error),
+    };
+
+    let event = match info {
+        Ok(info) => InfoEvent::RiscvDebugModule(info),
+        Err(error) if is_not_riscv_dtm(&error) => return Ok(false),
+        Err(error) => InfoEvent::Error {
+            architecture: "RISC-V".to_string(),
+            error: format!("{error:?}"),
+        },
+    };
+    ctx.publish::<TargetInfoDataTopic>(VarSeq::Seq2(0), &event)
+        .await?;
+
+    Ok(true)
+}
+
+fn is_not_riscv_dtm(error: &RiscvError) -> bool {
+    matches!(
+        error,
+        RiscvError::NoRiscvTarget
+            | RiscvError::UnsupportedDebugTransportModuleVersion(_)
+            | RiscvError::UnsupportedDebugModuleVersion(DebugModuleVersion::NoModule)
+    )
+}
+
+fn read_riscv_debug_module(
+    interface: &mut RiscvCommunicationInterface,
+) -> Result<RiscvDebugModuleInfo, RiscvError> {
+    let info = interface.enter_debug_mode().map(|()| {
+        let version = convert::to_wire_debug_module_version(interface.debug_module_version());
+        let harts = (0..interface.num_harts())
+            .map(|index| RiscvHartInfo {
+                index,
+                isa: read_hart_isa(interface, index),
+            })
+            .collect();
+
+        RiscvDebugModuleInfo { version, harts }
+    });
+
+    // `enter_debug_mode` activates the debug module before it can fail.
+    if !info.as_ref().is_err_and(is_not_riscv_dtm)
+        && let Err(error) = deactivate_debug_module(interface)
+    {
+        tracing::warn!("Unable to deactivate the RISC-V debug module: {error:?}");
+    }
+
+    info
+}
+
+/// Gives the debug module back in its reset state.
+///
+/// [`RiscvCommunicationInterface::disable_debug_module`] is not used, because it halts the hart.
+fn deactivate_debug_module(interface: &mut RiscvCommunicationInterface) -> Result<(), RiscvError> {
+    // `enter_debug_mode` asks hart 0 of a version 1.0 debug module to stay out of low-power
+    // states.
+    if interface.debug_module_version() == DebugModuleVersion::Version1_0 {
+        let mut control = Dmcontrol(0);
+        control.set_dmactive(true);
+        control.set_clrkeepalive(true);
+        interface.write_dm_register(control)?;
+    }
+
+    interface.write_dm_register(Dmcontrol(0))
+}
+
+fn read_hart_isa(interface: &mut RiscvCommunicationInterface, hart: u32) -> RiscvHartIsa {
+    if !interface.hart_enabled(hart) {
+        return RiscvHartIsa::Unavailable;
+    }
+
+    let isa = interface
+        .select_hart(hart)
+        .and_then(|_| interface.read_hart_isa());
+
+    match isa {
+        Ok(Some(isa)) => RiscvHartIsa::Isa {
+            xlen: isa.xlen,
+            extensions: isa.extensions,
+        },
+        Ok(None) => RiscvHartIsa::NotImplemented,
+        Err(RiscvError::HartUnavailable) => RiscvHartIsa::Unavailable,
+        Err(error) => RiscvHartIsa::Error(format!("{error:?}")),
+    }
+}
+
+async fn show_xtensa_tap_info(ctx: &mut RpcContext, probe: &mut Probe) -> anyhow::Result<()> {
+    if let Err(error) = try_read_xtensa_info(ctx, probe, WireProtocol::Jtag).await {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::Error {
+                architecture: "Xtensa".to_string(),
+                error: format!("{error:?}"),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn try_read_riscv_info(
     ctx: &mut RpcContext,
     probe: &mut Probe,
@@ -264,8 +578,8 @@ async fn try_read_riscv_info(
 
         // WCH-Link probes don't expose a real JTAG IDCODE; report the chip
         // family and ID from the probe's AttachChip response instead.
-        if let Some(wch_info) = probe
-            .try_into::<WchLink>()
+        if let Some(wch_info) = (probe.driver_mut() as &mut dyn Any)
+            .downcast_mut::<WchLink>()
             .map(|wlink| (wlink.chip_family(), wlink.chip_id()))
         {
             let (family, chip_id) = wch_info;
@@ -348,6 +662,7 @@ async fn try_show_arm_dp_info(
     ctx: &mut RpcContext,
     probe: Probe,
     dp_address: dp::DpAddress,
+    announce_dp: bool,
 ) -> (Probe, anyhow::Result<dp::DebugPortVersion>) {
     tracing::debug!("Trying to show ARM chip information");
 
@@ -363,22 +678,49 @@ async fn try_show_arm_dp_info(
         return (interface.close(), Err(anyhow!(err)));
     }
 
-    let res = show_arm_info(ctx, &mut *interface, dp_address).await;
+    let res = show_arm_info(ctx, &mut *interface, dp_address, announce_dp).await;
     (interface.close(), res)
 }
 
 /// Try to show information about the ARM chip, connected to a DP at the given address.
+///
+/// Shows the DP address in a heading when `announce_dp` is set.
 ///
 /// Returns the version of the DP.
 async fn show_arm_info(
     ctx: &mut RpcContext,
     interface: &mut dyn ArmDebugInterface,
     dp: dp::DpAddress,
+    announce_dp: bool,
 ) -> anyhow::Result<dp::DebugPortVersion> {
-    let dp_info = interface.read_raw_dp_register(dp, DPIDR::ADDRESS)?;
-    let dp_info = dp::DebugPortId::from(DPIDR(dp_info));
+    let dp_info = match interface.read_raw_dp_register(dp, DPIDR::ADDRESS) {
+        Ok(dp_info) => dp::DebugPortId::from(DPIDR(dp_info)),
+        Err(ArmError::NotImplemented(_)) => {
+            ctx.publish::<TargetInfoDataTopic>(
+                VarSeq::Seq2(0),
+                &InfoEvent::Message(
+                    "This probe does not implement DAP register access, ID'ing target via memory access instead.".to_string(),
+                ),
+            )
+            .await?;
 
-    let dpinfo = if dp_info.version == dp::DebugPortVersion::DPv2 {
+            // We aren't a real Debug Port, so SWD multidrop can't work.
+            // Return a fake DPv0 DebugPortId to stop try_show_info from probing SWD multidrop after this.
+            dp::DebugPortId {
+                revision: 0,
+                part_no: 0,
+                version: dp::DebugPortVersion::DPv0,
+                min_dp_support: dp::MinDpSupport::NotImplemented,
+                designer: jep106::JEP106Code::new(0, 0),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let dpinfo = if matches!(
+        dp_info.version,
+        dp::DebugPortVersion::DPv2 | dp::DebugPortVersion::DPv3
+    ) {
         let targetid = interface.read_raw_dp_register(dp, TARGETID::ADDRESS)?;
 
         // Read Instance ID
@@ -407,11 +749,13 @@ async fn show_arm_info(
         aps: vec![],
     };
 
-    ctx.publish::<TargetInfoDataTopic>(
-        VarSeq::Seq2(0),
-        &InfoEvent::Message(format!("ARM Chip with debug port {dp:x?}:")),
-    )
-    .await?;
+    if announce_dp {
+        ctx.publish::<TargetInfoDataTopic>(
+            VarSeq::Seq2(0),
+            &InfoEvent::Message(format!("ARM Chip with debug port {dp:x?}:")),
+        )
+        .await?;
+    }
 
     if dp_info.version != dp::DebugPortVersion::DPv3 {
         let access_ports = interface.access_ports(dp)?;
@@ -481,6 +825,8 @@ fn handle_memory_ap(
     let component = {
         let raw_idr = interface.read_raw_ap_register(access_port, IDR::ADDRESS)?;
         let idr: IDR = raw_idr.try_into()?;
+        let raw_base = interface.read_raw_ap_register(access_port, BASE::ADDRESS)?;
+        let base: BASE = raw_base.try_into()?;
         let mut memory = interface.memory_interface(access_port)?;
 
         // Check if the AP is accessible
@@ -489,6 +835,11 @@ fn handle_memory_ap(
             *parent = ComponentTreeNode::new(
                 "Memory AP is not accessible, DeviceEn bit not set".to_string(),
             );
+            return Ok(());
+        }
+
+        if !base.present() {
+            parent.push("No debug components, BASE register reports no debug entry".to_string());
             return Ok(());
         }
 
@@ -766,11 +1117,17 @@ async fn show_xtensa_info(
 }
 
 pub(crate) mod convert {
-    use super::{DebugPortId, DebugPortVersion, DpAddress, MinDpSupport, TargetInfoRequest};
+    use super::{
+        DebugPortId, DebugPortVersion, DpAddress, MinDpSupport, RiscvDebugModuleVersion,
+        TargetInfoRequest,
+    };
     use crate::rpc::functions::chip::convert::to_wire_jep106_code;
     use crate::rpc::functions::probe::convert::from_wire_debug_probe_selector;
     use crate::util::common_options::ProbeOptions;
-    use probe_rs::{architecture::arm::dp, probe::WireProtocol as ProbeRsWireProtocol};
+    use probe_rs::{
+        architecture::{arm::dp, riscv::communication_interface::DebugModuleVersion},
+        probe::WireProtocol as ProbeRsWireProtocol,
+    };
     use probe_rs_rpc::probe::WireProtocol;
 
     impl From<&TargetInfoRequest> for ProbeOptions {
@@ -787,9 +1144,9 @@ pub(crate) mod convert {
                 speed: request.speed,
                 connect_under_reset: request.connect_under_reset,
                 cycle_power: false,
-                dry_run: request.dry_run,
                 allow_erase_all: false,
                 attach_timeout: None,
+                target_serial: false,
             }
         }
     }
@@ -822,5 +1179,80 @@ pub(crate) mod convert {
             dp::DebugPortVersion::DPv3 => DebugPortVersion::DPv3,
             dp::DebugPortVersion::Unsupported(v) => DebugPortVersion::Unsupported(v),
         }
+    }
+
+    pub(crate) fn to_wire_debug_module_version(
+        version: DebugModuleVersion,
+    ) -> RiscvDebugModuleVersion {
+        let (major, minor) = match version {
+            DebugModuleVersion::NoModule => return RiscvDebugModuleVersion::NoModule,
+            DebugModuleVersion::NonConforming => return RiscvDebugModuleVersion::NonConforming,
+            DebugModuleVersion::Unknown(v) => return RiscvDebugModuleVersion::Unknown(v),
+            DebugModuleVersion::Version0_11 => (0, 11),
+            DebugModuleVersion::Version0_13 => (0, 13),
+            DebugModuleVersion::Version1_0 => (1, 0),
+        };
+        RiscvDebugModuleVersion::Version { major, minor }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JEP_ST, JEP_TENSILICA, JtagTapInfo, TapKind, wire_flash_sectors};
+    use probe_rs::config::Registry;
+
+    fn kind(ir_len: u8, idcode: Option<u32>) -> TapKind {
+        TapKind::classify(&JtagTapInfo { idcode, ir_len })
+    }
+
+    #[test]
+    fn jep_codes() {
+        assert_eq!(JEP_ST.get(), Some("STMicroelectronics"));
+        assert_eq!(JEP_TENSILICA.get(), Some("Tensilica"));
+    }
+
+    #[test]
+    fn classify_taps() {
+        assert_eq!(kind(4, Some(0x4ba0_0477)), TapKind::Arm);
+        assert_eq!(kind(4, None), TapKind::Arm);
+        assert_eq!(kind(3, Some(0x0000_0001)), TapKind::Unsupported);
+        // ESP32
+        assert_eq!(kind(5, Some(0x1200_34e5)), TapKind::Xtensa);
+        // ESP32-C3
+        assert_eq!(kind(5, Some(0x0000_5c25)), TapKind::Riscv);
+        assert_eq!(kind(5, None), TapKind::RiscvOrXtensa);
+        // STM32F4 boundary scan
+        assert_eq!(kind(5, Some(0x0641_3041)), TapKind::Unsupported);
+        // Xilinx Zynq-7000 PL
+        assert_eq!(kind(6, Some(0x0372_7093)), TapKind::Unsupported);
+        assert_eq!(kind(8, None), TapKind::Unsupported);
+    }
+
+    fn flash_sectors(target: &str) -> Vec<(u64, u64, u64)> {
+        let registry = Registry::from_builtin_families();
+        let target = registry.get_target_by_name(target).unwrap();
+        wire_flash_sectors(&target)
+            .iter()
+            .map(|s| (s.start, s.length, s.blocksize))
+            .collect()
+    }
+
+    #[test]
+    fn flash_sectors_follow_nvm() {
+        assert_eq!(
+            flash_sectors("nRF52840_xxAA"),
+            [
+                (0x0000_0000, 0x0010_0000, 0x1000),
+                (0x1000_1000, 0x0000_1000, 0x1000)
+            ]
+        );
+    }
+
+    #[test]
+    fn flash_sectors_clipped_to_nvm() {
+        assert_eq!(
+            flash_sectors("SF32LB52"),
+            [(0x1200_0000, 0x0E00_0000, 0x1_0000)]
+        );
     }
 }

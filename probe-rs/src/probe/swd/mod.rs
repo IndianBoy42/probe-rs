@@ -33,11 +33,11 @@ pub struct SwdSettings {
     /// low.
     pub num_idle_cycles_between_writes: usize,
 
-    /// How often a SWD transfer is retried when a WAIT response
+    /// How often an SWD transfer is retried when a WAIT response
     /// is received.
     pub num_retries_after_wait: usize,
 
-    /// When a SWD transfer is retried due to a WAIT response, the idle
+    /// When an SWD transfer is retried due to a WAIT response, the idle
     /// cycle amount is doubled every time as a backoff. This sets a maximum
     /// cap to the cycle amount.
     pub max_retry_idle_cycles_after_wait: usize,
@@ -79,7 +79,7 @@ pub use port::{SwdPort, SwdPortError};
 bitfield::bitfield! {
     /// A struct to describe the default CMSIS-DAP pins that one can toggle from the host.
     #[derive(Copy, Clone)]
-    pub struct Pins(u8);
+    pub struct Pins(pub u8);
     impl Debug;
     /// The active low reset of the debug probe.
     pub nreset, set_nreset: 7;
@@ -149,6 +149,9 @@ pub enum SwdOp {
         cycles: u32,
     },
     /// Drive the CMSIS-DAP SWJ pins.
+    ///
+    /// A probe that reads the pin levels back returns them as [`CommandResult::U8`]. A probe
+    /// that cannot read them returns no result.
     Pins {
         /// The output levels.
         out: Pins,
@@ -165,16 +168,24 @@ pub type SwdBatch = Batch<SwdOp, DebugProbeError>;
 impl SwdBatch {
     /// Schedule a read and return a handle for the captured value.
     pub fn read(&mut self, port: Port, addr: u8) -> Handle<u32> {
-        self.schedule(SwdOp::Transfer {
-            port,
-            addr,
-            direction: Direction::Read,
-            data: 0,
-        })
-        .map(|result| match result {
-            CommandResult::U32(value) => value,
-            _ => panic!("unexpected CommandResult variant for an SWD read"),
-        })
+        // Not `map`: its closure would capture, and allocate, the conversion it wraps.
+        let id = HandleId::new();
+        let _ = self.schedule_preserved(
+            id.clone(),
+            SwdOp::Transfer {
+                port,
+                addr,
+                direction: Direction::Read,
+                data: 0,
+            },
+        );
+        Handle::from_parts(
+            id,
+            Box::new(|result| match result {
+                CommandResult::U32(value) => value,
+                _ => panic!("unexpected CommandResult variant for an SWD read"),
+            }),
+        )
     }
 
     /// Schedule a write.
@@ -195,6 +206,17 @@ impl SwdBatch {
     /// Schedule idle clock cycles with SWDIO driven low.
     pub fn idle(&mut self, cycles: u32) {
         let _ = self.schedule(SwdOp::Idle { cycles });
+    }
+
+    /// Schedule a pins operation and return a handle for the pin levels.
+    ///
+    /// The handle has no result when the probe cannot read the pins.
+    pub fn pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Handle<Pins> {
+        self.schedule(SwdOp::Pins { out, select, wait })
+            .map(|result| match result {
+                CommandResult::U8(levels) => Pins(levels),
+                _ => panic!("unexpected CommandResult variant for an SWJ pins operation"),
+            })
     }
 }
 
@@ -353,6 +375,24 @@ pub trait BitbangSwd: DebugProbe {
             command_name: "swj_pins",
         })
     }
+}
+
+/// Returns the levels of an [`IoSequenceItem`] sequence that only drives SWDIO.
+///
+/// A probe with JTAG wiring drives these levels on TMS. It has no bidirectional SWDIO, so it
+/// cannot sample the line, and it cannot run an SWD transfer.
+pub(crate) fn output_levels(
+    swdio: impl IntoIterator<Item = IoSequenceItem>,
+) -> Result<Vec<bool>, DebugProbeError> {
+    swdio
+        .into_iter()
+        .map(|item| match item {
+            IoSequenceItem::Output(level) => Ok(level),
+            IoSequenceItem::Input => Err(DebugProbeError::CommandNotSupportedByProbe {
+                command_name: "SWD transfer",
+            }),
+        })
+        .collect()
 }
 
 /// A transfer whose response the next [`BitbangSwd::swd_io`] call returns.
@@ -628,6 +668,8 @@ mod tests {
                 command_name: "target_reset_assert",
             })
         }
+
+        fn set_reset_line_connected(&mut self, _connected: bool) {}
 
         fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
             Ok(())

@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::bytes::Bytes;
 
 use crate::transport::{
-    Deframer, frame,
+    Closer, Deframer, MAX_REPLY_LEN, frame,
     memory::{PostcardReceiver, PostcardSender},
 };
 
@@ -27,15 +27,29 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
     pub fn new(inner: S) -> Self {
+        Self::with_max_len(inner, MAX_REPLY_LEN)
+    }
+
+    /// Creates a receiver that ends the stream at a message of more than `max_len` bytes.
+    pub fn with_max_len(inner: S, max_len: usize) -> Self {
         Self {
             inner,
-            deframer: Deframer::default(),
+            deframer: Deframer::new(max_len),
             _marker: PhantomData,
         }
     }
 
+    /// Changes the longest message that the receiver accepts.
+    pub fn set_max_len(&mut self, max_len: usize) {
+        self.deframer.set_max_len(max_len);
+    }
+
     async fn receive_inner(&mut self) -> Option<Result<Vec<u8>, E>> {
         loop {
+            if self.deframer.next_is_too_long() {
+                return None;
+            }
+
             // Drain buffered messages first: a single websocket packet may carry
             // more than one, and the next packet may never arrive.
             if let Some(message) = self.deframer.next_message() {
@@ -77,14 +91,45 @@ where
 }
 
 // Sends length-prefixed binary messages to a websocket stream
-pub struct WebsocketTx<S> {
+pub struct WebsocketTx<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+{
     writer: Arc<Mutex<S>>,
 }
-impl<S> WebsocketTx<S> {
+impl<S> WebsocketTx<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+{
     pub fn new(writer: S) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),
         }
+    }
+
+    /// Returns a handle that sends a close frame.
+    pub fn closer(&self) -> Closer {
+        let writer = self.writer.clone();
+        Closer::new(move || {
+            let writer = writer.clone();
+            Box::pin(async move {
+                _ = writer.lock().await.close().await;
+            })
+        })
+    }
+}
+
+impl<S> Drop for WebsocketTx<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+{
+    fn drop(&mut self) {
+        // Send a close frame, so that the peer can tell a clean exit from a lost connection.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let closer = self.closer();
+        runtime.spawn(async move { closer.close().await });
     }
 }
 

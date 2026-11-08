@@ -231,6 +231,10 @@ impl Op {
         }
     }
 
+    fn is_ap_write(self) -> bool {
+        matches!(self, Op::Write { register, .. } if register.is_ap())
+    }
+
     fn encode(self, out: &mut Vec<u8>) {
         out.push(self.sub());
         match self {
@@ -414,6 +418,54 @@ struct Transfer {
     op: Op,
 }
 
+/// Inserts an RDBUFF read before every AP write that follows a posted AP read: an AP write
+/// leaves RDBUFF UNKNOWN, so the posted value would be lost. The RDBUFF read takes the batch
+/// index of the AP read it fetches for, so a failure is reported there.
+fn fetch_posted_before_ap_writes(transfers: &mut Vec<Transfer>) {
+    let mut posted = None;
+    let mut position = 0;
+    while position < transfers.len() {
+        let op = transfers[position].op;
+        if op.is_ap_write()
+            && let Some(index) = posted.take()
+        {
+            let fetch = Transfer {
+                index,
+                id: HandleId::new(),
+                op: Op::read(Register::DP_C),
+            };
+            transfers.insert(position, fetch);
+            position += 1;
+        }
+        match op.reads() {
+            Some(register) if register.is_ap() => posted = Some(transfers[position].index),
+            Some(Register::DP_C) => posted = None,
+            _ => {}
+        }
+        position += 1;
+    }
+}
+
+/// Whether a batch can be retried from its first WAITed access. A WAITed access was not
+/// performed, so only the accesses that went through after it matter: a write ran out of order,
+/// and an AP or RDBUFF read after a WAITed write saw the AP without that write.
+fn replayable(ops: &[Op], waited: &[usize]) -> bool {
+    let Some(&first) = waited.first() else {
+        return true;
+    };
+    let mut write_waited = false;
+    ops.iter().enumerate().skip(first).all(|(position, &op)| {
+        if waited.contains(&position) {
+            write_waited |= matches!(op, Op::Write { .. });
+            return true;
+        }
+        match op.reads() {
+            Some(register) if register.is_ap() || register == Register::DP_C => !write_waited,
+            _ => op.harmless(),
+        }
+    })
+}
+
 impl Ch347Device {
     fn batch(&self, tail: Option<Op>) -> Batch {
         Batch::accesses(self.swd_clock(), tail)
@@ -496,7 +548,7 @@ impl Ch347Device {
                 });
             };
             self.resync();
-            if retries == WAIT_RETRIES || !batch.ops[first + 1..].iter().all(|op| op.harmless()) {
+            if retries == WAIT_RETRIES || !replayable(&batch.ops, &waited) {
                 self.abort_wait();
                 let at = failed_at(&values, outstanding.get(first).copied(), posted);
                 return Ok(Run {
@@ -579,32 +631,35 @@ impl Ch347Device {
         let mut results = Results::new();
         let mut transfers = Vec::new();
         for (index, (id, op)) in batch.iter().enumerate() {
+            if let SwdOp::Transfer {
+                port,
+                addr,
+                direction,
+                data,
+            } = *op
+            {
+                let register = Register::new(port, addr);
+                let op = match direction {
+                    Direction::Read => Op::read(register),
+                    Direction::Write => Op::write(register, data),
+                };
+                transfers.push(Transfer {
+                    index,
+                    id: id.clone(),
+                    op,
+                });
+                continue;
+            }
+
+            self.run_transfers(&mut transfers, &mut results)?;
             let line = match *op {
-                SwdOp::Transfer {
-                    port,
-                    addr,
-                    direction,
-                    data,
-                } => {
-                    let register = Register::new(port, addr);
-                    let op = match direction {
-                        Direction::Read => Op::read(register),
-                        Direction::Write => Op::write(register, data),
-                    };
-                    transfers.push(Transfer {
-                        index,
-                        id: id.clone(),
-                        op,
-                    });
-                    continue;
-                }
                 SwdOp::Sequence(ref bits) => self.line_sequence(bits),
                 SwdOp::Idle { cycles } => {
                     self.line_sequence(&BitSequence::repeat(false, cycles as usize))
                 }
                 SwdOp::Pins { out, select, wait } => self.swj_pins(out, select, wait),
+                SwdOp::Transfer { .. } => unreachable!("transfers are queued above"),
             };
-            self.run_transfers(&mut transfers, &mut results)?;
             if let Err(error) = line {
                 return Err(BatchExecutionError::new_from_debug_probe_at(
                     error, results, index,
@@ -621,6 +676,7 @@ impl Ch347Device {
         transfers: &mut Vec<Transfer>,
         results: &mut Results,
     ) -> Result<(), BatchExecutionError<DebugProbeError>> {
+        fetch_posted_before_ap_writes(transfers);
         while !transfers.is_empty() {
             let posted_reads = transfers
                 .iter()
@@ -638,10 +694,11 @@ impl Ch347Device {
                 .run(batch)
                 .map_err(|error| probe_error(error, results))?;
 
+            // `at` is a position in the chunk, like the values, not a host batch index.
             let stop = run.failed.map_or(usize::MAX, |(at, _)| at);
-            for (transfer, value) in chunk.iter().zip(run.values) {
+            for (position, (transfer, value)) in chunk.iter().zip(run.values).enumerate() {
                 if let Some(value) = value
-                    && transfer.index < stop
+                    && position < stop
                     && transfer.id.should_capture()
                 {
                     results.push(&transfer.id, CommandResult::U32(value));
@@ -695,6 +752,10 @@ mod tests {
     const CSW: Register = Register {
         port: Port::Ap,
         addr: 0x0,
+    };
+    const TAR: Register = Register {
+        port: Port::Ap,
+        addr: 0x4,
     };
     const DRW: Register = Register {
         port: Port::Ap,
@@ -930,6 +991,152 @@ mod tests {
     }
 
     #[test]
+    fn an_ap_write_after_an_ap_read_fetches_the_posted_value_first() {
+        // A block read crossing the TAR auto-increment boundary rewrites TAR between two
+        // DRW reads. The AP write leaves RDBUFF UNKNOWN, so the first word is fetched before it.
+        let (mut dev, script) = device(&[(
+            &req(&[
+                Op::read(DRW),
+                Op::read(RDBUFF),
+                Op::write(TAR, 0x2000_0400),
+                Op::read(DRW),
+                Op::read(RDBUFF),
+            ]),
+            &reply(&[
+                ok(0xDEAD_BEEF),
+                ok(0x4444_4444),
+                wrote(ACK_OK),
+                ok(0),
+                ok(0x5555_5555),
+            ]),
+        )]);
+        let mut batch = SwdBatch::new();
+        let first = batch.read(Port::Ap, 0xC);
+        batch.write(Port::Ap, 0x4, 0x2000_0400);
+        let second = batch.read(Port::Ap, 0xC);
+        let mut results = dev.run_swd_batch(&batch).unwrap();
+        assert_eq!(results.take(first).ok(), Some(0x4444_4444));
+        assert_eq!(results.take(second).ok(), Some(0x5555_5555));
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn a_wait_after_the_tar_rewrite_keeps_the_trailing_rdbuff() {
+        // The second DRW read WAITs after the inserted RDBUFF fetched the first word. The retry
+        // still needs the trailing RDBUFF to fetch the second word.
+        let mut frames = vec![(
+            req(&[
+                Op::read(DRW),
+                Op::read(RDBUFF),
+                Op::write(TAR, 0x2000_0400),
+                Op::read(DRW),
+                Op::read(RDBUFF),
+            ]),
+            reply(&[ok(0xDEAD_BEEF), ok(1), wrote(ACK_OK), wait(), ok(0)]),
+        )];
+        frames.extend(resync());
+        frames.push((
+            req(&[Op::read(DRW), Op::read(RDBUFF)]),
+            reply(&[ok(0xDEAD_BEEF), ok(2)]),
+        ));
+        let (mut dev, script) = device(&borrowed(&frames));
+        let mut batch = SwdBatch::new();
+        let first = batch.read(Port::Ap, 0xC);
+        batch.write(Port::Ap, 0x4, 0x2000_0400);
+        let second = batch.read(Port::Ap, 0xC);
+        let mut results = dev.run_swd_batch(&batch).unwrap();
+        assert_eq!(results.take(first).ok(), Some(1));
+        assert_eq!(results.take(second).ok(), Some(2));
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn a_wait_on_the_inserted_rdbuff_retries_the_waited_tar_write() {
+        // The AP is still busy with the first DRW read, so everything from the inserted RDBUFF
+        // on WAITs. None of it was performed, so all of it is replayed.
+        let mut frames = vec![(
+            req(&[
+                Op::read(DRW),
+                Op::read(RDBUFF),
+                Op::write(TAR, 0x2000_0400),
+                Op::read(DRW),
+                Op::read(RDBUFF),
+            ]),
+            reply(&[ok(0xDEAD_BEEF), wait(), wrote(ACK_WAIT), wait(), wait()]),
+        )];
+        frames.extend(resync());
+        frames.push((
+            req(&[
+                Op::read(RDBUFF),
+                Op::write(TAR, 0x2000_0400),
+                Op::read(DRW),
+                Op::read(RDBUFF),
+            ]),
+            reply(&[ok(1), wrote(ACK_OK), ok(0), ok(2)]),
+        ));
+        let (mut dev, script) = device(&borrowed(&frames));
+        let mut batch = SwdBatch::new();
+        let first = batch.read(Port::Ap, 0xC);
+        batch.write(Port::Ap, 0x4, 0x2000_0400);
+        let second = batch.read(Port::Ap, 0xC);
+        let mut results = dev.run_swd_batch(&batch).unwrap();
+        assert_eq!(results.take(first).ok(), Some(1));
+        assert_eq!(results.take(second).ok(), Some(2));
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn an_ap_read_after_a_waited_write_is_not_retried() {
+        // The TAR write WAITs, but the AP is free again for the DRW read after it. That read
+        // used the old TAR, so a replay would credit a word from the wrong address.
+        let mut frames = vec![(
+            req(&[
+                Op::read(DRW),
+                Op::read(RDBUFF),
+                Op::write(TAR, 0x2000_0400),
+                Op::read(DRW),
+                Op::read(RDBUFF),
+            ]),
+            reply(&[ok(0xDEAD_BEEF), wait(), wrote(ACK_WAIT), ok(1), ok(2)]),
+        )];
+        frames.extend(resync());
+        frames.push((frame(DAPABORT), frame(WRITE_OK)));
+        let (mut dev, script) = device(&borrowed(&frames));
+        let mut batch = SwdBatch::new();
+        batch.read(Port::Ap, 0xC);
+        batch.write(Port::Ap, 0x4, 0x2000_0400);
+        batch.read(Port::Ap, 0xC);
+        let failure = dev.run_swd_batch(&batch).unwrap_err();
+        assert_eq!(transfer_error(failure), (0, SwdTransferError::WaitResponse));
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn reads_before_a_failure_are_kept_after_a_sequence() {
+        // The idle runs as its own command, so the reads' batch indices are one ahead of their
+        // positions in the access command; the read before the failure is still reported.
+        let mut idle = vec![];
+        Op::sequence(8, 0).encode(&mut idle);
+        let (mut dev, script) = device(&[
+            (&frame(&idle), &frame(&[SUB_SEQUENCE])),
+            (
+                &req(&[Op::read(DPIDR), Op::read(CTRL)]),
+                &reply(&[ok(0x2BA0_1477), read_reply(ACK_NONE, 0)]),
+            ),
+        ]);
+        let mut batch = SwdBatch::new();
+        batch.idle(8);
+        let dpidr = batch.read(Port::Dp, 0x0);
+        let ctrl = batch.read(Port::Dp, 0x4);
+        let failure = dev.run_swd_batch(&batch).unwrap_err();
+        assert_eq!(failure.fault_operation, 2);
+        let mut results = failure.results;
+        assert_eq!(results.take(dpidr).ok(), Some(0x2BA0_1477));
+        assert!(results.take(ctrl).is_err());
+        assert!(script.finished());
+    }
+
+    #[test]
     fn a_write_wait_is_retried_with_backoff_then_gives_up() {
         let request = req(&[Op::write(CSW, 0x12)]);
         // The idle after the write is side-effect free, so the write itself is retried,
@@ -1122,8 +1329,35 @@ mod tests {
     }
 
     #[test]
+    fn line_operations_run_after_the_transfers_before_them() {
+        let (mut dev, script) = device(&[
+            (&req(&[Op::write(SELECT, 0)]), &frame(WRITE_OK)),
+            (&frame(&[0xA1, 8, 0, 0]), &frame(&[SUB_SEQUENCE])),
+            (&req(&[Op::write(SELECT, 1)]), &frame(WRITE_OK)),
+        ]);
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Dp, 0x8, 0);
+        batch.idle(8);
+        batch.write(Port::Dp, 0x8, 1);
+        dev.run_swd_batch(&batch).unwrap();
+        assert!(script.finished());
+    }
+
+    #[test]
+    fn a_failed_transfer_stops_the_line_operations_after_it() {
+        let (mut dev, script) =
+            device(&[(&req(&[Op::read(DPIDR)]), &reply(&[read_reply(ACK_NONE, 0)]))]);
+        let mut batch = SwdBatch::new();
+        let _ = batch.read(Port::Dp, 0x0);
+        batch.idle(8);
+        let failure = dev.run_swd_batch(&batch).unwrap_err();
+        assert_eq!(failure.fault_operation, 0);
+        assert!(script.finished());
+    }
+
+    #[test]
     fn pins_are_not_supported() {
-        // The transfers before the pins op still go out, in order; the op itself is refused.
+        // The transfers before the pins op still go out; the op itself is refused.
         let (mut dev, script) = device(&[(&req(&[Op::write(SELECT, 0)]), &frame(WRITE_OK))]);
         let mut batch = SwdBatch::new();
         batch.write(Port::Dp, 0x8, 0);
@@ -1136,7 +1370,7 @@ mod tests {
         assert_eq!(failure.fault_operation, 1);
         assert!(matches!(
             failure.error,
-            BatchError::Probe(DebugProbeError::CommandNotSupportedByProbe { .. })
+            BatchError::Probe(DebugProbeError::ProbeSpecific(_))
         ));
         assert!(script.finished());
     }

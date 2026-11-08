@@ -4,7 +4,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use crate::architecture::xtensa::Xtensa;
 use crate::architecture::xtensa::communication_interface::XtensaCommunicationInterface;
-use crate::flashing::DebugFlashSequence;
+use crate::flashing::{DebugFlashSequence, FlashCompare};
 use crate::semihosting::{SemihostingCommand, UnknownCommandDetails};
 
 /// A interface to operate debug sequences for Xtensa targets.
@@ -62,11 +62,24 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
         ))
     }
 
+    /// This sequence is called before an image that boots from RAM is written, after the cores
+    /// that boot from it were reset and halted.
+    fn prepare_loading_to_ram(&self, _session: &mut crate::Session) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
     /// Return the host-side flash sequence implementation, if any.
     ///
     /// Override this to enable host-side flashing for Xtensa targets.
     /// The default returns `None`.
     fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
+        None
+    }
+
+    /// Return the flash compare method of this target, if it has one.
+    ///
+    /// See [`FlashCompare`] for the rules.
+    fn flash_compare(&self) -> Option<Arc<dyn FlashCompare>> {
         None
     }
 }

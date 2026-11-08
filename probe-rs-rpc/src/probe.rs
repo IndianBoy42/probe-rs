@@ -26,6 +26,10 @@ pub struct DebugProbeEntry {
     /// The probe was found but the current user cannot access its device
     /// (e.g. a missing udev rule on Linux).
     pub inaccessible: bool,
+
+    /// USB bus ID and device address, if known.
+    /// See `probe_rs::probe::DebugProbeInfo::usb_location`.
+    pub usb_location: Option<(String, u8)>,
 }
 
 impl Display for DebugProbeEntry {
@@ -53,6 +57,7 @@ impl DebugProbeEntry {
             product_id: self.product_id,
             serial_number: Some(self.serial_number.clone()),
             interface: self.interface,
+            usb_location: self.usb_location.clone(),
         }
     }
 }
@@ -73,14 +78,16 @@ pub enum SelectProbeResult {
 pub type SelectProbeResponse = RpcResult<SelectProbeResult>;
 
 #[derive(Serialize, Deserialize, Schema)]
-pub enum AttachResult {
-    Success(Key<Session>),
+pub enum AttachResult<T = Key<Session>> {
+    Success(T),
     ProbeNotFound,
     FailedToOpenProbe(String),
     /// The probe is held by another session. `holder` is that session's own
     /// description of itself when its client supplied one (pid, cwd, argv) —
     /// enough to find the process instead of guessing at it.
-    ProbeInUse { holder: Option<String> },
+    ProbeInUse {
+        holder: Option<String>,
+    },
     /// The probe opened, but attaching to the chip failed.
     TargetAttachFailed {
         message: String,
@@ -106,6 +113,9 @@ pub struct DebugProbeSelector {
     pub interface: Option<u8>,
     /// The the serial number of the debug probe to be used.
     pub serial_number: Option<String>,
+    /// USB bus ID and device address, if known.
+    /// See `probe_rs::probe::DebugProbeInfo::usb_location`.
+    pub usb_location: Option<(String, u8)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Schema)]
@@ -115,7 +125,6 @@ pub struct AttachRequest {
     pub probe: DebugProbeEntry,
     pub speed: Option<u32>,
     pub connect_under_reset: bool,
-    pub dry_run: bool,
     pub allow_erase_all: bool,
     pub resume_target: bool,
     pub wait_for_probe: Option<Duration>,
@@ -124,6 +133,8 @@ pub struct AttachRequest {
     /// back to other clients that are denied this probe, so a refusal names the
     /// holder instead of leaving them to hunt for it.
     pub client: Option<String>,
+    /// Open the serial port to the target.
+    pub target_serial: bool,
 }
 
 pub type AttachResponse = RpcResult<AttachResult>;

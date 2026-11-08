@@ -13,7 +13,7 @@ use std::{
 use probe_rs::probe::{
     DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError, ProbeError,
     list::{ProbeListItem, usb_probe_accessibility},
-    usb_util::BulkReadExt,
+    usb_util::{BulkReadExt, UsbSerialFilter},
 };
 
 use super::EspUsbJtagFactory;
@@ -55,6 +55,8 @@ const MAX_IN_FLIGHT_TRANSFERS: usize = 4;
 // hold a very large number of clock cycles.
 const MAX_BUFFERED_CLOCKS: usize = 16 * 1024;
 const USB_TIMEOUT: Duration = Duration::from_millis(500);
+// The number of zero-length reads in sequence after which a read of capture data fails.
+const MAX_EMPTY_READS: usize = 8;
 const USB_DEVICE_CLASS: u8 = 0xFF;
 const USB_DEVICE_SUBCLASS: u8 = 0xFF;
 const USB_DEVICE_PROTOCOL: u8 = 0x01;
@@ -116,6 +118,9 @@ pub(super) struct ProtocolHandler {
     pub(crate) base_speed_khz: u32,
     pub(crate) div_min: u16,
     pub(crate) div_max: u16,
+
+    /// Selects the CDC-ACM port of the same device. `None` if the device has no such port.
+    pub(crate) serial_filter: Option<UsbSerialFilter>,
 }
 
 impl Debug for ProtocolHandler {
@@ -142,6 +147,15 @@ impl ProtocolHandler {
             .ok_or(ProbeCreationError::NotFound)?;
 
         let is_bridge = device.product_id() == USB_PID_BRIDGE;
+
+        // The built-in USB-Serial-JTAG has a CDC-ACM port on interfaces 0 and 1.
+        let serial_filter =
+            (device.product_id() == USB_PID_BUILTIN_JTAG).then(|| UsbSerialFilter {
+                vendor_id: Some(device.vendor_id()),
+                product_id: Some(device.product_id()),
+                serial_number: device.serial_number().map(str::to_string),
+                interface: Some(0),
+            });
 
         let device_handle = device
             .open()
@@ -297,6 +311,8 @@ impl ProtocolHandler {
             base_speed_khz,
             div_min,
             div_max,
+
+            serial_filter,
         };
 
         this.sync_capture_stream().map_err(|error| match error {
@@ -394,7 +410,8 @@ impl ProtocolHandler {
     }
 
     /// Put a bit on TDI and possibly read one from TDO.
-    /// to receive the bytes from this operations call [`ProtocolHandler::flush`]
+    ///
+    /// To receive the bytes from these operations, call [`ProtocolHandler::flush`].
     ///
     /// Note that if the internal buffer is exceeded bytes will be automatically flushed to usb device
     pub fn shift_bit(&mut self, tms: bool, tdi: bool, cap: bool) -> Result<(), DebugProbeError> {
@@ -702,18 +719,38 @@ impl ProtocolHandler {
         let count = self.pending_in_bits.div_ceil(8).min(IN_EP_BUFFER_SIZE);
         let mut incoming = [0; IN_EP_BUFFER_SIZE];
 
-        let read_bytes = self
-            .ep_in
-            .read_bulk(&mut incoming, USB_TIMEOUT)
-            .map_err(|e| {
+        // A zero-length read gives no capture data. Retry it a limited number of times, so that
+        // the callers that wait for `pending_in_bits` do not loop forever.
+        let mut empty_reads = 0;
+        let read_bytes = loop {
+            let read_bytes = self
+                .ep_in
+                .read_bulk(&mut incoming, USB_TIMEOUT)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "Something went wrong in read_bulk {:?} when trying to read {}bytes - pending_in_bits: {}",
+                        e,
+                        count,
+                        self.pending_in_bits,
+                    );
+                    DebugProbeError::Usb(e)
+                })?;
+
+            if read_bytes > 0 {
+                break read_bytes;
+            }
+
+            empty_reads += 1;
+            if empty_reads == MAX_EMPTY_READS {
                 tracing::warn!(
-                    "Something went wrong in read_bulk {:?} when trying to read {}bytes - pending_in_bits: {}",
-                    e,
-                    count,
-                    self.pending_in_bits,
+                    "The device sent {empty_reads} empty packets - pending_in_bits: {}",
+                    self.pending_in_bits
                 );
-                DebugProbeError::Usb(e)
-            })?;
+                return Err(DebugProbeError::Usb(io::Error::other(
+                    "bulk read returned no data",
+                )));
+            }
+        };
 
         if read_bytes > count {
             tracing::warn!("Read more bytes than expected: {} > {}", read_bytes, count);

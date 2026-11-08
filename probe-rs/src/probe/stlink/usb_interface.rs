@@ -1,11 +1,11 @@
-use nusb::{DeviceInfo, MaybeFuture};
+use nusb::MaybeFuture;
 use std::{sync::LazyLock, time::Duration};
 
 use crate::probe::{stlink::StlinkError, usb_util::InterfaceExt};
 
 use std::collections::HashMap;
 
-use super::tools::{is_stlink_device, read_serial_number};
+use super::tools::is_stlink_device;
 use crate::probe::{DebugProbeSelector, ProbeCreationError};
 
 /// The USB Command packet size.
@@ -85,32 +85,35 @@ pub trait StLinkUsb: std::fmt::Debug {
     fn read_swo(&mut self, read_data: &mut [u8], timeout: Duration) -> Result<usize, StlinkError>;
 }
 
-// Copy of `Selector::matches` except it uses the stlink-specific read_serial_number
-// to handle the broken stlink-v2 serial numbers that need hex-encoding.
-fn selector_matches(selector: &DebugProbeSelector, info: &DeviceInfo) -> bool {
-    info.vendor_id() == selector.vendor_id
-        && info.product_id() == selector.product_id
-        && selector
-            .serial_number
-            .as_ref()
-            .map(|s| {
-                if let Some(serial) = read_serial_number(info) {
-                    serial.as_str() == s
-                } else {
-                    s.is_empty()
-                }
-            })
-            .unwrap_or(true)
-}
-
 impl StLinkUsbDevice {
+    /// ST-Link devices won't take a command if there is a reply in the
+    /// send buffer. Read and drain any replies to unblock it.
+    fn drain_replies(&mut self) -> Result<(), StlinkError> {
+        /// How long the pipe must stay quiet to count as drained.
+        const QUIET: Duration = Duration::from_millis(100);
+        /// Stop here in case the probe never stops sending.
+        const MAX_DRAIN: usize = 64 * 1024;
+
+        let mut buf = [0; 512];
+        let mut drained = 0;
+        while drained < MAX_DRAIN {
+            match self.interface.read_bulk(self.info.ep_in, &mut buf, QUIET) {
+                Ok(read) => drained += read,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(e) => return Err(StlinkError::Usb(e)),
+            }
+        }
+        tracing::debug!("Discarded {drained} bytes from STLink.");
+        Ok(())
+    }
+
     /// Creates and initializes a new USB device.
     pub fn new_from_selector(selector: &DebugProbeSelector) -> Result<Self, ProbeCreationError> {
         let device = nusb::list_devices()
             .wait()
             .map_err(|e| ProbeCreationError::Usb(e.into()))?
             .filter(is_stlink_device)
-            .find(|device| selector_matches(selector, device))
+            .find(|device| selector.matches(device))
             .ok_or(ProbeCreationError::NotFound)?;
 
         let info = &USB_PID_EP_MAP[&device.product_id()];
@@ -277,9 +280,12 @@ impl StLinkUsb for StLinkUsbDevice {
     /// STLink does not respond to USB requests.
     fn reset(&mut self) -> Result<(), StlinkError> {
         tracing::debug!("Resetting USB device of STLink");
-        self.device_handle
-            .reset()
-            .wait()
-            .map_err(|e| StlinkError::Usb(e.into()))
+        match self.device_handle.reset().wait() {
+            Ok(()) => Ok(()),
+            // `.reset()` doesn't work on all targets, so just drain all
+            // pending replies instead.
+            Err(e) if e.kind() == nusb::ErrorKind::Unsupported => self.drain_replies(),
+            Err(e) => Err(StlinkError::Usb(e.into())),
+        }
     }
 }

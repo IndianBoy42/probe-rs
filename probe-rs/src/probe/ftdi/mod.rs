@@ -15,14 +15,18 @@ use crate::{
     probe::{
         BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
         IoSequenceItem, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe,
-        ProbeCreationError, ProbeFactory, SwdProbe, SwdSettings, WireProtocol,
-        jtag::{TapState, distribute_captures, enter_tdi, exchange_leaves_shift},
+        ProbeCreationError, ProbeFactory, ResetLine, SwdProbe, SwdSettings, WireProtocol,
+        jtag::{Step, TapState, distribute_captures, walk_batch},
         list::{ProbeListItem, usb_probe_accessibility},
         queue::{BatchExecutionError, Results},
+        swd::output_levels,
+        target_serial::{HostSerialPort, SerialSettings, TargetSerial},
+        usb_util::UsbSerialFilter,
     },
 };
 use bitvec::prelude::*;
 use nusb::{DeviceInfo, MaybeFuture};
+use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
     sync::Arc,
@@ -130,6 +134,8 @@ impl JtagAdapter {
             (0x0403, 0x6010, "Digilent Adept USB Device") => (0x0088, 0x008b),
             // Built-in Digilent HS1 (on-board)
             (0x0403, 0x6010, "Digilent USB Device") => (0x0088, 0x008b),
+            // TinCanTools Flyswatter2
+            (0x0403, 0x6010, "Flyswatter2") => (0x0538, 0x057b),
             // Other devices:
             // TMS starts high
             // TMS, TDO and TCK are outputs
@@ -317,42 +323,24 @@ fn collect_ftdi_commands(
     start: TapState,
     batch: &Batch<JtagOp, DebugProbeError>,
 ) -> Result<(TapState, Vec<Command>), BatchExecutionError<DebugProbeError>> {
-    let ops: Vec<_> = batch.iter().collect();
     let mut state = start;
     let mut commands = Vec::new();
-    let mut skip_enter_path_bits = 0usize;
-    let results = Results::new();
-
-    for (index, (id, op)) in ops.iter().enumerate() {
-        match op {
-            JtagOp::EnterState(target) => {
-                let target = *target;
-                let path = &state.path_to(target)[skip_enter_path_bits..];
-                skip_enter_path_bits = 0;
-                commands.extend(Command::encode_tms_path(path, enter_tdi(target)));
-                state = target;
+    walk_batch(&mut state, batch, |step| {
+        commands.extend(match step {
+            Step::Tms { path, tdi } => Command::encode_tms_path(path, tdi),
+            Step::Shift {
+                data,
+                exit,
+                capture,
+            } => Command::encode_tdi_exchange(data, exit, capture),
+            Step::Clock { count, tms: true } => {
+                Command::encode_tms_path(&vec![true; count as usize], false)
             }
-            JtagOp::Exchange { data, capture } => {
-                if state != TapState::ShiftIr && state != TapState::ShiftDr {
-                    return Err(BatchExecutionError::new_from_debug_probe(
-                        DebugProbeError::Other(format!(
-                            "Exchange in state {state:?}, but ShiftIr or ShiftDr is required"
-                        )),
-                        results,
-                    ));
-                }
-                let merge_exit = exchange_leaves_shift(state, ops.get(index + 1).map(|(_, op)| op));
-                let do_capture = *capture && id.should_capture();
-                commands.extend(Command::encode_tdi_exchange(data, merge_exit, do_capture));
-                if merge_exit {
-                    skip_enter_path_bits = 1;
-                }
-            }
-            JtagOp::ClockTck { count } => {
-                commands.extend(Command::encode_clock_tck(*count));
-            }
-        }
-    }
+            Step::Clock { count, tms: false } => Command::encode_clock_tck(count),
+        });
+        Ok(())
+    })
+    .map_err(|error| BatchExecutionError::new_from_debug_probe(error, Results::new()))?;
 
     Ok((state, commands))
 }
@@ -400,6 +388,8 @@ impl ProbeFactory for FtdiProbeFactory {
             adapter: JtagAdapter::open(ftdi, probes.pop().unwrap(), selector.interface)?,
             jtag_state: JtagChainState::default(),
             swd_settings: SwdSettings::default(),
+            config: FtdiConfig::default(),
+            reset_line: ResetLine::default(),
         };
         tracing::debug!("opened probe: {:?}", probe);
         Ok(Box::new(probe))
@@ -417,25 +407,70 @@ impl ProbeFactory for FtdiProbeFactory {
         // to select Channel B on an FT2232H, because interface is always None in the
         // listed entries.
         //
-        // Match only on VID, PID, and (optionally) serial number, ignoring interface.
+        // So match as the default does, but ignoring interface.
+        let selector = selector.map(|selector| DebugProbeSelector {
+            interface: None,
+            ..selector.clone()
+        });
         self.list_probes()
             .into_iter()
             .filter(|probe| {
-                selector.as_ref().is_none_or(|s| {
-                    probe.info.vendor_id == s.vendor_id
-                        && probe.info.product_id == s.product_id
-                        && s.serial_number.as_ref().is_none_or(|sn| {
-                            if let Some(probe_sn) = &probe.info.serial_number {
-                                probe_sn == sn
-                            } else {
-                                sn.is_empty()
-                            }
-                        })
-                })
+                selector
+                    .as_ref()
+                    .is_none_or(|s| s.matches_probe(&probe.info))
             })
             .collect()
     }
 }
+
+/// Driver settings of an FTDI probe.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FtdiConfig {
+    /// The channel wired to the UART of the target, for example `b` on ESP32 boards with an
+    /// FT2232H. The driver gives it as the serial port to the target.
+    pub uart: Option<FtdiChannel>,
+    /// The reset circuit on the DTR and RTS lines of the UART channel. The driver resets the
+    /// target with it.
+    pub uart_reset: Option<UartReset>,
+}
+
+/// A channel of an FTDI chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FtdiChannel {
+    /// Channel A, USB interface 0.
+    A,
+    /// Channel B, USB interface 1.
+    B,
+    /// Channel C, USB interface 2.
+    C,
+    /// Channel D, USB interface 3.
+    D,
+}
+
+impl From<FtdiChannel> for ftdaye::Interface {
+    fn from(channel: FtdiChannel) -> Self {
+        match channel {
+            FtdiChannel::A => Self::A,
+            FtdiChannel::B => Self::B,
+            FtdiChannel::C => Self::C,
+            FtdiChannel::D => Self::D,
+        }
+    }
+}
+
+/// A reset circuit on the DTR and RTS lines of a UART.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UartReset {
+    /// The auto-reset circuit of ESP32 boards. RTS pulls EN low and DTR pulls GPIO0 low, only
+    /// while the two lines are different.
+    Esp,
+}
+
+/// How long [`FtdiProbe::target_reset`] holds the target in reset.
+const UART_RESET_PULSE: Duration = Duration::from_millis(100);
 
 /// An FTDI-based debug probe.
 #[derive(Debug)]
@@ -443,6 +478,45 @@ pub struct FtdiProbe {
     adapter: JtagAdapter,
     jtag_state: JtagChainState,
     swd_settings: SwdSettings,
+    config: FtdiConfig,
+    reset_line: ResetLine,
+}
+
+impl FtdiProbe {
+    /// Applies the driver settings. Call this before attach.
+    pub fn configure(&mut self, config: &FtdiConfig) -> Result<(), DebugProbeError> {
+        if let Some(uart) = config.uart
+            && ftdaye::Interface::from(uart) == self.adapter.device.interface()
+        {
+            return Err(DebugProbeError::Other(format!(
+                "The UART channel {uart:?} is the JTAG channel"
+            )));
+        }
+        if config.uart_reset.is_some() && config.uart.is_none() {
+            return Err(DebugProbeError::Other(
+                "`uart_reset` needs the `uart` channel".to_string(),
+            ));
+        }
+        self.config = config.clone();
+        Ok(())
+    }
+
+    /// Sets the reset line of the target through the UART reset circuit.
+    fn set_uart_reset(&mut self, asserted: bool) -> Result<(), DebugProbeError> {
+        let (Some(uart), Some(UartReset::Esp)) = (self.config.uart, self.config.uart_reset) else {
+            return Err(DebugProbeError::NotImplemented {
+                function_name: "target_reset",
+            });
+        };
+        if asserted {
+            self.reset_line.check_assert()?;
+        }
+        // RTS alone pulls EN low. DTR stays low, so that GPIO0 does not select the boot mode.
+        self.adapter
+            .device
+            .set_modem_lines(uart.into(), false, asserted)?;
+        Ok(())
+    }
 }
 
 impl DebugProbe for FtdiProbe {
@@ -470,23 +544,37 @@ impl DebugProbe for FtdiProbe {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
-        // TODO we could add this by using a GPIO. However, different probes may connect
-        // different pins (if any) to the reset line, so we would need to make this configurable.
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset",
-        })
+        self.set_uart_reset(true)?;
+        std::thread::sleep(UART_RESET_PULSE);
+        self.set_uart_reset(false)
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset_assert",
-        })
+        self.set_uart_reset(true)
     }
 
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset_deassert",
-        })
+        self.set_uart_reset(false)
+    }
+
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
+    }
+
+    fn target_serial(&mut self) -> Option<Box<dyn TargetSerial>> {
+        let uart = self.config.uart?;
+        let device = &self.adapter.device;
+        let filter = UsbSerialFilter {
+            vendor_id: Some(device.vendor_id()),
+            product_id: Some(device.product_id()),
+            serial_number: device.serial_number().map(str::to_string),
+            interface: Some(ftdaye::Interface::from(uart).usb_interface()),
+        };
+        // The default line states cannot reset the target: DTR and RTS are equal after open.
+        Some(Box::new(HostSerialPort::new(
+            filter,
+            SerialSettings::default(),
+        )))
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
@@ -577,13 +665,15 @@ impl JtagProbe for FtdiProbe {
 }
 
 impl BitbangSwd for FtdiProbe {
-    fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
+    fn swd_io<S>(&mut self, swdio: S) -> Result<Vec<bool>, DebugProbeError>
     where
         S: IntoIterator<Item = IoSequenceItem>,
     {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swd_io",
-        })
+        let levels = output_levels(swdio)?;
+        self.adapter
+            .append_commands(&Command::encode_tms_path(&levels, false))?;
+        self.adapter.flush()?;
+        Ok(vec![false; levels.len()])
     }
 
     fn swd_settings(&self) -> &SwdSettings {
@@ -723,6 +813,7 @@ fn get_device_info(device: &DeviceInfo) -> Option<ProbeListItem> {
                 probe_factory: &FtdiProbeFactory,
                 is_hid_interface: false,
                 interface: None,
+                usb_location: Some((device.bus_id().to_string(), device.device_address())),
             },
             accessibility: usb_probe_accessibility(device),
         })
@@ -746,12 +837,14 @@ fn list_ftdi_devices() -> Vec<ProbeListItem> {
 mod golden_tests {
     use super::collect_ftdi_commands;
     use super::command_compacter::decoder::decode_commands_full;
+    use crate::probe::BitSequence;
     use crate::probe::jtag::golden::{
-        REGISTER_WRITE_EIGHT_IDLE, SHIFT_DR_ONE_TAP_FORTY_ONE, SHIFT_DR_ONE_TAP_ONE,
+        OldJtagState, REGISTER_WRITE_EIGHT_IDLE, SHIFT_DR_ONE_TAP_FORTY_ONE, SHIFT_DR_ONE_TAP_ONE,
         SHIFT_DR_ONE_TAP_SIXTY_FOUR, SHIFT_DR_ONE_TAP_THIRTY_TWO, SHIFT_DR_THREE_TAP_FORTY_ONE,
         SHIFT_DR_THREE_TAP_ONE, SHIFT_DR_THREE_TAP_SIXTY_FOUR, SHIFT_DR_THREE_TAP_THIRTY_TWO,
         SHIFT_IR_ONE_TAP, SHIFT_IR_THREE_TAP, assert_triples_eq, build_dr_exchange,
-        build_ir_exchange, move_literal, one_tap_params, three_tap_params,
+        build_ir_exchange, clock_in_every_stable_state, lowering_batch, move_literal,
+        one_tap_params, three_tap_params,
     };
     use crate::probe::jtag::{JtagBatch, TapState};
 
@@ -771,6 +864,29 @@ mod golden_tests {
             command.encode(&mut bytes);
         }
         decode_commands_full(&bytes)
+    }
+
+    #[test]
+    fn an_empty_exchange_does_not_shorten_the_next_path() {
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::ShiftDr);
+        batch.exchange_no_capture(BitSequence::new());
+        batch.enter(TapState::RunTestIdle);
+
+        let mut state = OldJtagState::Idle;
+        for (tms, _, _) in triples_for_batch(TapState::RunTestIdle, &batch) {
+            state.update(tms);
+        }
+        assert_eq!(state, OldJtagState::Idle);
+    }
+
+    #[test]
+    fn clocks_match_the_bitbang_lowering() {
+        let batch = clock_in_every_stable_state();
+        assert_eq!(
+            triples_for_batch(TapState::RunTestIdle, &batch),
+            lowering_batch(TapState::RunTestIdle, &batch)
+        );
     }
 
     #[test]

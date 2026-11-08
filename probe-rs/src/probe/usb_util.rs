@@ -1,9 +1,10 @@
-//! USB bulk transfer utilities.
+//! USB bulk transfer and USB serial port utilities.
 
 use nusb::{
     Endpoint, Interface,
     transfer::{Buffer, Bulk, In, Out},
 };
+use serialport::{SerialPortType, UsbPortInfo};
 use std::fmt::Write;
 use std::{io, time::Duration};
 
@@ -42,7 +43,7 @@ impl BulkWriteExt for Endpoint<Bulk, Out> {
             // Request cancellation...
             self.cancel_all();
 
-            // ...and then immediately drain the completion. Whether the the response is the
+            // ...and then immediately drain the completion. Whether the response is the
             // result of the original write, the cancellation, or a timeout of the cancellation, we
             // drop it and return a timeout.
             let _ = self.wait_next_complete(Duration::from_millis(100));
@@ -76,7 +77,7 @@ impl BulkReadExt for Endpoint<Bulk, In> {
             // Request cancellation...
             self.cancel_all();
 
-            // ...and then immediately drain the completion. Whether the the response is the
+            // ...and then immediately drain the completion. Whether the response is the
             // result of the original read, the cancellation, or a timeout of the cancellation, we
             // drop it and return a timeout.
             let _ = self.wait_next_complete(Duration::from_millis(100));
@@ -137,5 +138,270 @@ impl InterfaceExt for Interface {
             .map_err(io::Error::from)?;
 
         endpoint.read_bulk(buf, timeout)
+    }
+}
+
+/// A USB serial port.
+#[derive(Debug, Clone)]
+pub(crate) struct UsbSerialPort {
+    /// The OS name of the port, for example `COM3` or `/dev/ttyACM0`.
+    pub port_name: String,
+    /// The USB information of the port.
+    pub info: UsbPortInfo,
+}
+
+impl UsbSerialPort {
+    /// Returns the USB interface number of the port.
+    ///
+    /// On macOS, the interface number is sometimes `None`. Then this function takes the number
+    /// from the last character of the port name.
+    pub fn interface(&self) -> Option<u8> {
+        if cfg!(target_os = "macos") && self.info.interface.is_none() {
+            return interface_from_port_name(&self.port_name);
+        }
+        if let Some((_, interface)) = self.ftdi_channel() {
+            return Some(interface);
+        }
+        self.info.interface
+    }
+
+    /// Returns the USB serial number of the device.
+    pub fn serial_number(&self) -> Option<&str> {
+        if let Some((serial_number, _)) = self.ftdi_channel() {
+            return Some(serial_number);
+        }
+        self.info.serial_number.as_deref()
+    }
+
+    /// The FTDI driver on Windows does not report the interface. It adds the channel letter to
+    /// the serial number, for example `FT1234B` for channel B of `FT1234`. Returns the serial
+    /// number without the letter, and the interface number of the channel.
+    fn ftdi_channel(&self) -> Option<(&str, u8)> {
+        const FTDI_VID: u16 = 0x0403;
+
+        if self.info.vid != FTDI_VID || self.info.interface.is_some() {
+            return None;
+        }
+        let serial_number = self.info.serial_number.as_deref()?;
+        let (base, letter) = serial_number.split_at(serial_number.len().checked_sub(1)?);
+        let interface = match letter {
+            "A" => 0,
+            "B" => 1,
+            "C" => 2,
+            "D" => 3,
+            _ => return None,
+        };
+        Some((base, interface))
+    }
+}
+
+fn interface_from_port_name(port_name: &str) -> Option<u8> {
+    let digit = port_name.chars().last()?.to_digit(10)?;
+    Some(digit as u8)
+}
+
+/// Lists the USB serial ports.
+///
+/// On macOS, lists only `/dev/cu.*` ports, because each port also has a `/dev/tty.*` copy.
+pub(crate) fn usb_serial_ports() -> Result<Vec<UsbSerialPort>, serialport::Error> {
+    let ports = serialport::available_ports()?
+        .into_iter()
+        .filter(|port| !cfg!(target_os = "macos") || port.port_name.contains("/cu."))
+        .filter_map(|port| match port.port_type {
+            SerialPortType::UsbPort(info) => Some(UsbSerialPort {
+                port_name: port.port_name,
+                info,
+            }),
+            _ => {
+                tracing::trace!("{}: serial port is not USB -- skipping", port.port_name);
+                None
+            }
+        })
+        .collect();
+
+    Ok(ports)
+}
+
+/// Selects USB serial ports. A `None` field matches all ports.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UsbSerialFilter {
+    /// The USB vendor ID.
+    pub vendor_id: Option<u16>,
+    /// The USB product ID.
+    pub product_id: Option<u16>,
+    /// The USB serial number.
+    pub serial_number: Option<String>,
+    /// The number of the CDC communication interface.
+    ///
+    /// On macOS, the CDC data interface (this number + 1) also matches, because macOS reports the
+    /// data interface.
+    pub interface: Option<u8>,
+}
+
+impl std::fmt::Display for UsbSerialFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = |id: Option<u16>| id.map_or("*".to_string(), |id| format!("{id:04x}"));
+        write!(f, "{}:{}", id(self.vendor_id), id(self.product_id))?;
+        if let Some(serial_number) = &self.serial_number {
+            write!(f, ":{serial_number}")?;
+        }
+        if let Some(interface) = self.interface {
+            write!(f, " interface {interface}")?;
+        }
+        Ok(())
+    }
+}
+
+impl UsbSerialFilter {
+    /// Returns `true` if `port` matches all fields of the filter.
+    pub(crate) fn matches(&self, port: &UsbSerialPort) -> bool {
+        let info = &port.info;
+
+        if self.vendor_id.is_some_and(|vid| vid != info.vid) {
+            return false;
+        }
+        if self.product_id.is_some_and(|pid| pid != info.pid) {
+            return false;
+        }
+        if self
+            .serial_number
+            .as_deref()
+            .is_some_and(|sn| port.serial_number() != Some(sn))
+        {
+            return false;
+        }
+        // A port without an interface number matches every interface. The other fields select
+        // it, for example on a device without a serial number behind the FTDI driver on Windows.
+        if let Some(interface) = self.interface
+            && let Some(port_interface) = port.interface()
+        {
+            let data_interface = interface
+                .checked_add(1)
+                .filter(|_| cfg!(target_os = "macos"));
+            if port_interface != interface && Some(port_interface) != data_interface {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn port(name: &str, serial_number: Option<&str>, interface: Option<u8>) -> UsbSerialPort {
+        UsbSerialPort {
+            port_name: name.to_string(),
+            info: UsbPortInfo {
+                vid: 0x1d50,
+                pid: 0x6018,
+                serial_number: serial_number.map(str::to_string),
+                manufacturer: None,
+                product: None,
+                interface,
+            },
+        }
+    }
+
+    #[test]
+    fn empty_filter_matches_all() {
+        assert!(UsbSerialFilter::default().matches(&port("COM3", None, None)));
+    }
+
+    #[test]
+    fn filter_checks_vid_and_pid() {
+        let p = port("COM3", None, Some(0));
+        let filter = UsbSerialFilter {
+            vendor_id: Some(0x1d50),
+            product_id: Some(0x6018),
+            ..Default::default()
+        };
+        assert!(filter.matches(&p));
+
+        let filter = UsbSerialFilter {
+            product_id: Some(0x6017),
+            ..filter
+        };
+        assert!(!filter.matches(&p));
+    }
+
+    #[test]
+    fn filter_checks_serial_number() {
+        let filter = UsbSerialFilter {
+            serial_number: Some("ABC".to_string()),
+            ..Default::default()
+        };
+        assert!(filter.matches(&port("COM3", Some("ABC"), None)));
+        assert!(!filter.matches(&port("COM3", Some("XYZ"), None)));
+        assert!(!filter.matches(&port("COM3", None, None)));
+    }
+
+    #[test]
+    fn port_without_interface_matches_every_interface() {
+        let filter = UsbSerialFilter {
+            interface: Some(1),
+            ..Default::default()
+        };
+        assert!(filter.matches(&port("/dev/ttyX", None, None)));
+    }
+
+    #[test]
+    fn ftdi_channel_comes_from_the_serial_number() {
+        let ftdi = |serial_number: &str| UsbSerialPort {
+            port_name: "COMX".to_string(),
+            info: UsbPortInfo {
+                vid: 0x0403,
+                pid: 0x6010,
+                serial_number: Some(serial_number.to_string()),
+                manufacturer: None,
+                product: None,
+                interface: None,
+            },
+        };
+        let filter = UsbSerialFilter {
+            serial_number: Some("FT1234".to_string()),
+            interface: Some(1),
+            ..Default::default()
+        };
+        assert!(filter.matches(&ftdi("FT1234B")));
+        assert!(!filter.matches(&ftdi("FT1234A")));
+        assert!(!filter.matches(&ftdi("FT9999B")));
+    }
+
+    #[test]
+    fn filter_checks_interface() {
+        let macos = cfg!(target_os = "macos");
+        for interface in [0, 2] {
+            let filter = UsbSerialFilter {
+                interface: Some(interface),
+                ..Default::default()
+            };
+            assert!(filter.matches(&port("COM3", None, Some(interface))));
+            // Only macOS reports the CDC data interface.
+            assert_eq!(
+                filter.matches(&port("COM3", None, Some(interface + 1))),
+                macos
+            );
+            assert!(!filter.matches(&port("COM3", None, Some(interface + 2))));
+        }
+
+        let filter = UsbSerialFilter {
+            interface: Some(255),
+            ..Default::default()
+        };
+        assert!(filter.matches(&port("COM3", None, Some(255))));
+        assert!(!filter.matches(&port("COM3", None, Some(0))));
+    }
+
+    #[test]
+    fn interface_from_name() {
+        assert_eq!(
+            interface_from_port_name("/dev/cu.usbmodem98B724951"),
+            Some(1)
+        );
+        assert_eq!(interface_from_port_name("/dev/cu.usbmodemX"), None);
+        assert_eq!(interface_from_port_name(""), None);
     }
 }

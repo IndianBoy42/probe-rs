@@ -21,7 +21,7 @@ use crate::{
     },
     probe::{
         BitSequence, DebugProbe, DebugProbeError, DebugProbeSelector, Probe, ProbeError,
-        ProbeFactory, WireProtocol,
+        ProbeFactory, ResetLine, WireProtocol,
     },
 };
 
@@ -72,6 +72,7 @@ impl ProbeFactory for StLinkFactory {
             swo_enabled: false,
 
             opened_aps: vec![],
+            reset_line: ResetLine::default(),
         };
 
         stlink.init()?;
@@ -98,6 +99,8 @@ pub struct StLink<D: StLinkUsb> {
 
     /// List of opened APs
     opened_aps: Vec<u8>,
+
+    reset_line: ResetLine,
 }
 
 impl DebugProbe for StLink<StLinkUsbDevice> {
@@ -113,6 +116,12 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
+        // `attach` sets the speed of the other protocol.
+        match self.protocol {
+            WireProtocol::Swd => self.jtag_speed_khz = speed_khz,
+            WireProtocol::Jtag => self.swd_speed_khz = speed_khz,
+        }
+
         match self.hw_version.cmp(&3) {
             Ordering::Less => match self.protocol {
                 WireProtocol::Swd => {
@@ -228,6 +237,7 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let mut buf = [0; 2];
         self.send_jtag_command(
             &[
@@ -244,6 +254,7 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let mut buf = [0; 2];
         self.send_jtag_command(
             &[
@@ -273,6 +284,10 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
         )?;
 
         Ok(())
+    }
+
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
@@ -652,7 +667,7 @@ impl<D: StLinkUsb> StLink<D> {
     /// ST-Links, we can only use AP 0. If an AP other than 0 is used on these
     /// probes, an error is returned.
     fn select_ap(&mut self, ap: u8) -> Result<(), DebugProbeError> {
-        // Check if we can use APs other an AP 0.
+        // Check if we can use APs other than AP 0.
         // Older versions of the ST-Link software don't support this.
         if self.hw_version < 3 && self.jtag_version < Self::MIN_JTAG_VERSION_MULTI_AP {
             if ap != 0 {
@@ -1403,6 +1418,10 @@ impl DapAccess for StlinkArmDebug {
 }
 
 impl ArmDebugInterface for StlinkArmDebug {
+    fn driver_mut(&mut self) -> Option<&mut dyn DebugProbe> {
+        Some(self.probe.as_mut())
+    }
+
     fn memory_interface(
         &mut self,
         access_port: &FullyQualifiedApAddress,
@@ -1897,6 +1916,7 @@ mod test {
                 jtag_speed_khz: 0,
                 swo_enabled: false,
                 opened_aps: vec![],
+                reset_line: ResetLine::default(),
             }
         }
     }

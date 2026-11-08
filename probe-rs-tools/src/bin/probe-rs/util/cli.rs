@@ -1,21 +1,25 @@
 //! CLI-specific building blocks.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::pending;
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{future::Future, ops::DerefMut, path::Path, time::Instant};
+use std::{future::Future, path::Path, time::Instant};
 
 use anyhow::Context;
-use libtest_mimic::{Failed, Trial};
+use libtest_mimic::{Completion, Failed, Trial};
 use probe_rs::meta::ElfMetadata;
 use probe_rs::rtt::find_rtt_control_block_and_metadata_in_raw_file;
 use ratatui::crossterm::style::Stylize;
 use rustyline_async::{Readline, ReadlineError, ReadlineEvent, SharedWriter};
 use time::UtcOffset;
 use tokio::io::AsyncWriteExt;
+use tokio::runtime::Handle;
 use tokio::sync::futures::Notified;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, MutexGuard, Notify};
-use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::cmd::run::{EmbeddedTestElfInfo, MonitoringOptions};
@@ -30,10 +34,10 @@ use crate::util::{
     common_options::{BinaryDownloadOptions, ProbeOptions},
     flash::CliProgressBars,
     logging,
-    rtt::{DefmtProcessor, DefmtState, RttDecoder},
+    stream_decoder::{AutoDecoder, DefmtProcessor, DefmtState, StreamDecoder, TextDecoder},
     style::{
         Prompt, StackTraceAddress, StackTraceFunction, StackTraceInlineMarker,
-        StackTraceSourceLocation, probe_rs_color_enabled,
+        StackTraceSourceLocation, probe_rs_color_enabled, strip_ansi,
     },
 };
 use probe_rs_rpc::CancelTopic;
@@ -41,7 +45,7 @@ use probe_rs_rpc::core_ops::{WireBreakpointCause, WireHaltReason};
 use probe_rs_rpc::flash::{BootInfo, DownloadOptions, FlashLayout, ProgressEvent, VerifyResult};
 use probe_rs_rpc::format::FormatOptions;
 use probe_rs_rpc::monitor::{ChannelInfo, MonitorExitReason};
-use probe_rs_rpc::monitor::{MonitorMode, MonitorOptions, RttEvent, SemihostingEvent};
+use probe_rs_rpc::monitor::{MonitorMode, MonitorOptions, RttEvent, SemihostingEvent, SerialEvent};
 use probe_rs_rpc::probe::{
     AttachRequest, AttachResult, DebugProbeEntry, DebugProbeSelector, SelectProbeResult,
 };
@@ -51,7 +55,8 @@ use probe_rs_rpc::semihosting_options::SemihostingOptions;
 use probe_rs_rpc::stack_trace::StackTrace;
 use probe_rs_rpc::stack_trace::StackTraceFrame;
 use probe_rs_rpc::test::{Test, TestResult};
-use probe_rs_rpc_client::{MonitorEvent, RpcClient, SessionInterface};
+use probe_rs_rpc_client::{ClientError, MonitorEvent, RpcClient, SessionInterface};
+use probe_rs_zephyr::log::{Database as ZephyrLogDatabase, Decoder as ZephyrLogDecoder};
 
 type TargetOutputFiles = std::collections::HashMap<ChannelIdentifier, tokio::fs::File>;
 
@@ -69,59 +74,19 @@ pub async fn attach_probe(
     {
         anyhow::bail!("elf_chip does not match probe_chip");
     }
+    probe_options.chip = probe_options.chip.or(elf_meta.chip);
 
-    // Load the chip description if provided.
-    if let Some(chip_description) = probe_options.chip_description_path.take() {
-        let file = tokio::fs::read_to_string(&chip_description)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to read chip description from {}",
-                    chip_description.display()
-                )
-            })?;
+    let request = attach_request(client, probe_options, resume_target).await?;
+    let result = with_slow_attach_feedback(client.attach_probe(request)).await?;
+    let session = attach_outcome(client, result).await?;
 
-        client.load_chip_family(file).await?;
-    }
+    Ok(SessionInterface::new(client.clone(), session))
+}
 
-    let probe = match select_probe(
-        client,
-        probe_options.probe.map(to_wire_debug_probe_selector),
-        probe_options.non_interactive,
-    )
-    .await
-    {
-        Ok(probe) => probe,
-        Err(error) => {
-            print_setup_hints_if_relevant(client).await;
-            return Err(error);
-        }
-    };
-
-    if probe_options.cycle_power {
-        power_reset(
-            from_wire_debug_probe_selector(probe.selector()),
-            Duration::from_secs(1),
-        )
-        .await?;
-    }
-
-    let result = with_slow_attach_feedback(client.attach_probe(AttachRequest {
-        chip: probe_options.chip.or(elf_meta.chip),
-        protocol: probe_options.protocol.map(to_wire_protocol),
-        probe,
-        speed: probe_options.speed,
-        connect_under_reset: probe_options.connect_under_reset,
-        dry_run: probe_options.dry_run,
-        allow_erase_all: probe_options.allow_erase_all,
-        resume_target,
-        wait_for_probe: probe_options.attach_timeout,
-        client: Some(client_label()),
-    }))
-    .await?;
-
+/// Returns the success value of `result`, or the failure as an error.
+pub async fn attach_outcome<T>(client: &RpcClient, result: AttachResult<T>) -> anyhow::Result<T> {
     match result {
-        AttachResult::Success(session) => Ok(SessionInterface::new(client.clone(), session)),
+        AttachResult::Success(value) => Ok(value),
         AttachResult::ProbeNotFound => {
             print_setup_hints_if_relevant(client).await;
             Err(ProbeNotFound.into())
@@ -143,6 +108,65 @@ pub async fn attach_probe(
     }
 }
 
+/// Sends the chip description of `probe_options` to the server, selects the probe and cycles its
+/// power if `probe_options` say so.
+pub async fn attach_request(
+    client: &RpcClient,
+    mut probe_options: ProbeOptions,
+    resume_target: bool,
+) -> anyhow::Result<AttachRequest> {
+    // Load the chip description if provided.
+    if let Some(chip_description) = probe_options.chip_description_path.take() {
+        let file = tokio::fs::read_to_string(&chip_description)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to read chip description from {}",
+                    chip_description.display()
+                )
+            })?;
+
+        client.load_chip_family(file).await?;
+    }
+
+    let mut probe = match select_probe(
+        client,
+        probe_options.probe.map(to_wire_debug_probe_selector),
+        probe_options.non_interactive,
+    )
+    .await
+    {
+        Ok(probe) => probe,
+        Err(error) => {
+            print_setup_hints_if_relevant(client).await;
+            return Err(error);
+        }
+    };
+
+    if probe_options.cycle_power {
+        power_reset(
+            from_wire_debug_probe_selector(probe.selector()),
+            Duration::from_secs(1),
+        )
+        .await?;
+        // The probe gets a new USB device address when it enumerates again.
+        probe.usb_location = None;
+    }
+
+    Ok(AttachRequest {
+        chip: probe_options.chip,
+        protocol: probe_options.protocol.map(to_wire_protocol),
+        probe,
+        speed: probe_options.speed,
+        connect_under_reset: probe_options.connect_under_reset,
+        allow_erase_all: probe_options.allow_erase_all,
+        resume_target,
+        wait_for_probe: probe_options.attach_timeout,
+        client: Some(client_label()),
+        target_serial: probe_options.target_serial,
+    })
+}
+
 /// How long an attach may run before the user gets a progress indicator.
 const ATTACH_FEEDBACK_DELAY: Duration = Duration::from_millis(1500);
 
@@ -150,7 +174,7 @@ const ATTACH_FEEDBACK_DELAY: Duration = Duration::from_millis(1500);
 ///
 /// An attach that waits for a busy probe can take as long as the configured
 /// attach timeout, so without this the CLI looks frozen.
-async fn with_slow_attach_feedback<F: Future>(attach: F) -> F::Output {
+pub async fn with_slow_attach_feedback<F: Future>(attach: F) -> F::Output {
     let mut attach = std::pin::pin!(attach);
 
     tokio::select! {
@@ -451,6 +475,7 @@ pub(crate) fn parse_semihosting_options(arg: &[String]) -> anyhow::Result<Semiho
 #[derive(Default)]
 pub struct FileMetadata {
     pub defmt_data: Option<DefmtState>,
+    pub zephyr_log_dictionary: Option<Arc<ZephyrLogDatabase>>,
     pub scan_regions: Option<ScanRegion>,
 }
 
@@ -480,9 +505,18 @@ pub async fn parse_metadata(path: &Path) -> anyhow::Result<(FileMetadata, Option
         None
     };
 
+    let zephyr_log_dictionary = match ZephyrLogDatabase::from_elf(&elf) {
+        Ok(db) => db.map(Arc::new),
+        Err(error) => {
+            tracing::warn!("Failed to load the embedded Zephyr log dictionary: {error:#}");
+            None
+        }
+    };
+
     Ok((
         FileMetadata {
             defmt_data,
+            zephyr_log_dictionary,
             scan_regions,
         },
         elf_meta,
@@ -493,11 +527,23 @@ pub async fn rtt_client(
     session: &SessionInterface,
     meta: &FileMetadata,
     monitor_options: &MonitoringOptions,
-    timestamp_offset: Option<UtcOffset>,
 ) -> anyhow::Result<CliRttClient> {
     let scan_regions = match &meta.scan_regions {
         Some(scan_regions) => scan_regions.clone(),
         None => monitor_options.scan_region.clone(),
+    };
+
+    let zephyr_log_dictionary = match &monitor_options.zephyr_log_dictionary {
+        Some(path) => {
+            let data = tokio::fs::read(path).await.with_context(|| {
+                format!(
+                    "Failed to read Zephyr log dictionary from {}",
+                    path.display()
+                )
+            })?;
+            Some(Arc::new(ZephyrLogDatabase::from_bytes(&data)?))
+        }
+        None => meta.zephyr_log_dictionary.clone(),
     };
 
     // We don't really know what to configure here, so we set a default configuration if we can, but that's it.
@@ -515,12 +561,8 @@ pub async fn rtt_client(
     // The actual data processor objects will be created once we have the channel names.
     Ok(CliRttClient {
         handle: rtt_client.handle,
-        timestamp_offset,
-        show_timestamps: !monitor_options.no_timestamps,
-        show_location: !monitor_options.no_location,
         channel_processors: vec![],
-        defmt_data: meta.defmt_data.clone(),
-        log_format: monitor_options.log_format.clone(),
+        zephyr_log_dictionary,
     })
 }
 
@@ -645,6 +687,7 @@ impl MonitorUiContext {
             up_channels: Vec::new(),
             down_channels: Vec::new(),
             selected_down_channel,
+            serial_input: false,
             shared_writer: None,
         });
         Self {
@@ -680,9 +723,32 @@ struct MonitorUiState {
     up_channels: Vec<ChannelInfo>,
     down_channels: Vec<ChannelInfo>,
     selected_down_channel: u32,
+    /// The target serial port sent data, so it can receive input too.
+    serial_input: bool,
     shared_writer: Option<SharedWriter>,
 }
+/// A target of the user input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputTarget {
+    Rtt(u32),
+    Serial,
+}
+
 impl MonitorUiState {
+    /// The input targets: the RTT down channels, then the serial port.
+    fn input_targets(&self) -> Vec<(InputTarget, String)> {
+        let mut targets = self
+            .down_channels
+            .iter()
+            .enumerate()
+            .map(|(i, channel)| (InputTarget::Rtt(i as u32), channel.name.clone()))
+            .collect::<Vec<_>>();
+        if self.serial_input {
+            targets.push((InputTarget::Serial, "serial".to_string()));
+        }
+        targets
+    }
+
     fn print(&mut self, message: &str) {
         if let Some(writer) = self.shared_writer.as_mut() {
             _ = writer.write_all(message.as_bytes());
@@ -702,7 +768,7 @@ pub async fn monitor(
     mode: MonitorMode,
     path: Option<&Path>,
     monitor_options: &MonitoringOptions,
-    mut rtt_client: Option<CliRttClient>,
+    mut output: TargetOutput,
     vector_catch: VectorCatchConfig,
 ) -> anyhow::Result<()> {
     let semihosting_options = parse_semihosting_options(&monitor_options.semihosting_file)?;
@@ -714,7 +780,7 @@ pub async fn monitor(
         catch_hardfault: vector_catch.catch_hardfault,
         catch_svc: vector_catch.catch_svc,
         catch_hlt: vector_catch.catch_hlt,
-        rtt_client: rtt_client.as_ref().map(|client| client.handle()),
+        rtt_client: output.rtt_handle(),
         semihosting_options,
     };
 
@@ -722,8 +788,6 @@ pub async fn monitor(
     let ui_context = MonitorUiContext::new(monitor_options.rtt_down_channel);
 
     let monitor = session.monitor(mode, options, async |msg| {
-        let mut client = rtt_client.as_mut();
-
         if let MonitorEvent::Rtt(RttEvent::Discovered {
             down_channels,
             up_channels,
@@ -733,32 +797,30 @@ pub async fn monitor(
                 .update(|state| {
                     state.up_channels = up_channels.clone();
                     state.down_channels = down_channels.clone();
-                    state.rtt_client = client.as_ref().map(|client| client.handle());
+                    state.rtt_client = output.rtt_handle();
                 })
                 .await
         };
+        if matches!(msg, MonitorEvent::Serial(_)) && !ui_context.lock().await.serial_input {
+            ui_context.update(|state| state.serial_input = true).await;
+        }
 
         handle_monitor_event(
-            &mut client,
+            &mut output,
             msg,
             &mut target_output_files,
             &async |message| ui_context.lock().await.print(message),
+            &async |message| eprint!("{message}"),
             &monitor_options.rtt_up_channels,
         )
         .await;
     });
 
-    // SIGTERM handler on *nix systems
+    // SIGTERM (Unix) / Ctrl+Break (Windows) handler
     let terminate = async {
-        #[cfg(unix)]
-        {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install signal handler")
-                .recv()
-                .await;
-            eprintln!("Received SIGTERM, exiting");
-            session.client().publish::<CancelTopic>(&()).await.unwrap();
-        }
+        let signal = terminate_signal().await;
+        eprintln!("Received {signal}, exiting");
+        send_cancel(session).await;
         pending().await
     };
 
@@ -766,23 +828,29 @@ pub async fn monitor(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
 
-    // Gets activated when the RTT client discovers down channels.
-    // Displays a prompt and waits for user input.
+    // Gets activated when the RTT client discovers down channels, or the target serial port
+    // sends data. Displays a prompt and waits for user input. The input targets can change while
+    // the prompt runs, so the prompt reads them again for each event.
     async fn cli_with_prompt(session: &SessionInterface, context: &MonitorUiContext) {
-        let data = context.lock().await.clone();
+        let (targets, selected_down_channel) = {
+            let state = context.lock().await;
+            (state.input_targets(), state.selected_down_channel)
+        };
+        let mut selected = targets
+            .iter()
+            .map(|(target, _)| *target)
+            .find(|target| *target == InputTarget::Rtt(selected_down_channel))
+            .unwrap_or(targets[0].0);
 
-        let channel_count = data.down_channels.len() as u32;
-        let mut selected_channel = data.selected_down_channel % channel_count;
-
-        let prompt = |channel_idx| {
-            Prompt::new(format!(
-                "{}> ",
-                data.down_channels[channel_idx as usize].name
-            ))
-            .to_string()
+        let prompt = |targets: &[(InputTarget, String)], selected: InputTarget| {
+            let name = targets
+                .iter()
+                .find(|(target, _)| *target == selected)
+                .map_or("", |(_, name)| name.as_str());
+            Prompt::new(format!("{name}> ")).to_string()
         };
 
-        let Ok((mut rl, sw)) = Readline::new(prompt(selected_channel)) else {
+        let Ok((mut rl, sw)) = Readline::new(prompt(&targets, selected)) else {
             eprintln!("Failed to create readline");
             _ = tokio::signal::ctrl_c().await;
 
@@ -802,22 +870,44 @@ pub async fn monitor(
                 Ok(ReadlineEvent::Line(mut line)) => {
                     rl.add_history_entry(line.clone());
                     line.push('\n');
-                    if let Some(client) = data.rtt_client
-                        && let Err(error) = session
-                            .send_to_rtt(client, selected_channel, line.into_bytes(), 0)
-                            .await
-                    {
-                        eprintln!("Error sending data to RTT: {:?}", error);
-                        break;
+                    match selected {
+                        InputTarget::Rtt(channel) => {
+                            let rtt_client = context.lock().await.rtt_client;
+                            if let Some(client) = rtt_client
+                                && let Err(error) = session
+                                    .send_to_rtt(client, channel, line.into_bytes(), 0)
+                                    .await
+                            {
+                                eprintln!("Error sending data to RTT: {:?}", error);
+                                break;
+                            }
+                        }
+                        InputTarget::Serial => {
+                            let len = line.len();
+                            // The firmware may not read its input. Report it and continue.
+                            match session.send_to_serial(line.into_bytes()).await {
+                                Ok(written) if written as usize == len => {}
+                                Ok(written) => {
+                                    eprintln!("The serial port took {written} of {len} bytes")
+                                }
+                                Err(error) => {
+                                    eprintln!("Error sending data to the serial port: {error:?}")
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(ReadlineEvent::Eof) => {
-                    if channel_count > 1 {
-                        selected_channel = (selected_channel + 1) % channel_count;
-                        if let Err(error) = rl.update_prompt(&prompt(selected_channel)) {
-                            eprintln!("Error updating prompt: {:?}", error);
-                            break;
-                        }
+                    // Select the next input target.
+                    let targets = context.lock().await.input_targets();
+                    let next = targets
+                        .iter()
+                        .position(|(target, _)| *target == selected)
+                        .map_or(0, |i| (i + 1) % targets.len());
+                    selected = targets[next].0;
+                    if let Err(error) = rl.update_prompt(&prompt(&targets, selected)) {
+                        eprintln!("Error updating prompt: {:?}", error);
+                        break;
                     }
                 }
                 Ok(ReadlineEvent::Interrupted) => {
@@ -858,7 +948,7 @@ pub async fn monitor(
                     DisplayMode::Exited
                 } else if monitor_options.list_rtt {
                     DisplayMode::ListChannelsAndQuit
-                } else if locked.down_channels.is_empty() || !prompt_possible() {
+                } else if locked.input_targets().is_empty() || !prompt_possible() {
                     DisplayMode::OutputOnly
                 } else {
                     DisplayMode::CliWithPrompt
@@ -913,7 +1003,7 @@ pub async fn monitor(
                 DisplayMode::Exited => break,
             }
         }
-        session.client().publish::<CancelTopic>(&()).await.unwrap();
+        send_cancel(session).await;
         pending().await
     };
 
@@ -930,19 +1020,22 @@ pub async fn monitor(
 
     let (print_stack_trace, result) = match result {
         Ok(MonitorExitReason::SemihostingExit(Ok(_))) => {
-            println!("Firmware exited successfully");
             // On success, we only print if the user asked for it.
-            (monitor_options.always_print_stacktrace, Ok(()))
+            (
+                monitor_options.always_print_stacktrace,
+                Ok("Firmware exited successfully"),
+            )
         }
         Ok(MonitorExitReason::UserExit) => {
-            println!("Exited by user request");
             // On ctrl-c, we only print if the user asked for it.
-            (monitor_options.always_print_stacktrace, Ok(()))
+            (
+                monitor_options.always_print_stacktrace,
+                Ok("Exited by user request"),
+            )
         }
         Ok(MonitorExitReason::Halted(halt_reason)) => {
-            let reason = describe_halt_reason(halt_reason);
-            println!("Firmware exited unexpectedly: {reason}");
-            (true, Err(anyhow::anyhow!(reason)))
+            let reason = describe_halt_reason(halt_reason).to_string();
+            (true, Err(FirmwareExited::Unexpected(reason).into()))
         }
         Ok(MonitorExitReason::SemihostingExit(Err(details))) => {
             let reason = match details.reason {
@@ -978,9 +1071,17 @@ pub async fn monitor(
                 _ => String::from(""),
             };
 
-            println!("Firmware exited with: {reason}{subcode}");
-
-            (true, Err(anyhow::anyhow!(reason)))
+            match (details.reason, details.subcode) {
+                // A deliberate exit, so like a successful one, only print a stack trace on request.
+                (0x20026, Some(status)) => (
+                    monitor_options.always_print_stacktrace,
+                    Err(FirmwareExited::WithStatus(status).into()),
+                ),
+                _ => (
+                    true,
+                    Err(FirmwareExited::WithReason(format!("{reason}{subcode}")).into()),
+                ),
+            }
         }
         Err(e) => {
             // Some irrecoverable error happened, probably can't print the stack trace.
@@ -990,13 +1091,49 @@ pub async fn monitor(
 
     if print_stack_trace {
         if let Some(path) = path {
-            display_stack_trace(session, path, monitor_options.stack_frame_limit).await?;
+            if let Err(error) =
+                display_stack_trace(session, path, monitor_options.stack_frame_limit).await
+            {
+                eprintln!("Can not print stack trace: {error}");
+            }
         } else {
             eprintln!("Can not print stack trace because firmware is not available");
         }
     }
 
-    result
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The firmware exited with a non-zero status through semihosting.
+#[derive(Debug, thiserror::Error, docsplay::Display)]
+pub enum FirmwareExited {
+    /// Firmware exited with status {0}
+    WithStatus(u32),
+
+    /// Firmware exited: {0}
+    WithReason(String),
+
+    /// Firmware stopped unexpectedly: {0}
+    Unexpected(String),
+}
+
+impl FirmwareExited {
+    /// Statuses that don't fit in an exit code map to 1, so a failure never reads as success.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::WithStatus(status) => match u8::try_from(*status) {
+                Ok(0) | Err(_) => 1,
+                Ok(code) => code,
+            },
+            _ => 1,
+        }
+    }
 }
 
 /// Describes why the core halted, for a user who runs firmware and does not
@@ -1032,7 +1169,7 @@ pub async fn test(
     libtest_args: libtest_mimic::Arguments,
     monitor_options: &MonitoringOptions,
     path: &Path,
-    mut rtt_client: Option<CliRttClient>,
+    mut output: TargetOutput,
 ) -> anyhow::Result<()> {
     tracing::info!("libtest args {:?}", libtest_args);
     let token = CancellationToken::new();
@@ -1042,21 +1179,37 @@ pub async fn test(
 
     let semihosting_options = parse_semihosting_options(&monitor_options.semihosting_file)?;
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<MonitorEvent>();
+    let capture = !libtest_args.nocapture;
+    let strip_colors = libtest_args.format == Some(libtest_mimic::FormatSetting::Json);
 
-    let rtt_handle = rtt_client.as_ref().map(|rtt| rtt.handle);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<TestLogEvent>();
+
+    let rtt_handle = output.rtt_handle();
     let test = async {
         let tests = if elf_info.version == 0 {
             // In embedded test < 0.7, we have to query the tests from the target via semihosting
-            session
+            sender.send(TestLogEvent::TestStart).unwrap();
+            let result = session
                 .list_tests(
                     boot_info,
                     rtt_handle,
                     semihosting_options.clone(),
-                    async |msg| sender.send(msg).unwrap(),
+                    async |msg| sender.send(TestLogEvent::Monitor(msg)).unwrap(),
                 )
-                .await?
-                .tests
+                .await;
+
+            let (reply, captured) = tokio::sync::oneshot::channel();
+            sender.send(TestLogEvent::TestEnd(reply)).unwrap();
+            let output = captured.await.unwrap_or_default();
+
+            // The output can tell why the list failed.
+            match result {
+                Ok(tests) => tests.tests,
+                Err(e) => {
+                    print!("{output}");
+                    return Err(e.into());
+                }
+            }
         } else {
             // Recent embedded test versions report the tests directly via the elf file
             elf_info.tests
@@ -1066,6 +1219,7 @@ pub async fn test(
             return Ok(());
         }
 
+        let error = Arc::new(std::sync::Mutex::new(None));
         let tests = tests
             .into_iter()
             .map(|test| {
@@ -1076,14 +1230,21 @@ pub async fn test(
                     semihosting_options.clone(),
                     sender.clone(),
                     &token,
+                    &error,
                     test,
                     monitor_options.stack_frame_limit,
+                    capture,
+                    strip_colors,
                 )
             })
             .collect::<Vec<_>>();
 
         tokio::task::spawn_blocking(move || {
-            if libtest_mimic::run(&libtest_args, tests).has_failed() {
+            let conclusion = libtest_mimic::run(&libtest_args, tests);
+            if let Some(error) = error.lock().unwrap().take() {
+                return Err(anyhow::Error::from(error));
+            }
+            if conclusion.has_failed() {
                 anyhow::bail!("Some tests failed");
             }
 
@@ -1093,16 +1254,14 @@ pub async fn test(
     };
 
     let log = async {
-        while let Some(event) = receiver.recv().await {
-            handle_monitor_event(
-                &mut rtt_client.as_mut(),
-                event,
-                &mut target_output_files,
-                &async |message| print!("{message}"),
-                &monitor_options.rtt_up_channels,
-            )
-            .await;
-        }
+        log_test_output(
+            &mut receiver,
+            &mut output,
+            &mut target_output_files,
+            &monitor_options.rtt_up_channels,
+            capture,
+        )
+        .await;
         futures_util::future::pending().await
     };
 
@@ -1115,7 +1274,7 @@ pub async fn test(
 
     let result = with_ctrl_c(test_and_log, async {
         token.cancel();
-        session.client().publish::<CancelTopic>(&()).await.unwrap();
+        send_cancel(session).await;
     })
     .await;
 
@@ -1132,10 +1291,13 @@ fn create_trial(
     path: &Path,
     rtt_client: Option<Key<RttClient>>,
     semihosting_options: SemihostingOptions,
-    sender: UnboundedSender<MonitorEvent>,
+    sender: UnboundedSender<TestLogEvent>,
     token: &CancellationToken,
+    error: &Arc<std::sync::Mutex<Option<ClientError>>>,
     test: Test,
     stack_frame_limit: u32,
+    capture: bool,
+    strip_colors: bool,
 ) -> Trial {
     let name = test.name.clone();
     let ignored = test.ignored;
@@ -1143,36 +1305,65 @@ fn create_trial(
 
     let session = session.clone();
     let token = token.clone();
+    let error = error.clone();
 
-    Trial::test(name, {
+    Trial::ignorable_test(name, {
         move || {
-            if token.is_cancelled() {
-                eprintln!("Cancelled");
-                std::process::exit(0);
+            // A cancel or an error ends the test run. The tests that did not run are ignored.
+            if token.is_cancelled() || error.lock().unwrap().is_some() {
+                return Ok(Completion::ignored_with("not run"));
             }
 
             let handle = tokio::spawn(async move {
-                match session
+                sender.send(TestLogEvent::TestStart).unwrap();
+                let monitor_sender = sender.clone();
+                let result = session
                     .run_test(test, rtt_client, semihosting_options, async move |msg| {
-                        sender.send(msg).unwrap()
+                        monitor_sender.send(TestLogEvent::Monitor(msg)).unwrap()
                     })
-                    .await
-                {
-                    Ok(TestResult::Success) => Ok(()),
-                    Ok(TestResult::Cancelled) => {
-                        eprintln!("Cancelled");
-                        std::process::exit(0);
-                    }
-                    Ok(TestResult::Failed(message)) => {
-                        display_stack_trace(&session, &path, stack_frame_limit).await?;
+                    .await;
 
-                        Err(Failed::from(message))
+                let (reply, captured) = tokio::sync::oneshot::channel();
+                sender.send(TestLogEvent::TestEnd(reply)).unwrap();
+                let mut output = captured.await.unwrap_or_default();
+
+                let reason = match result {
+                    Ok(TestResult::Success) => return Ok(Completion::Completed),
+                    Ok(TestResult::Cancelled) => {
+                        print!("{output}");
+                        return Ok(Completion::ignored_with("cancelled"));
                     }
+                    Ok(TestResult::Failed(message)) => message,
                     Err(e) => {
-                        eprintln!("Error: {e:?}");
-                        std::process::exit(1);
+                        // The test command returns the error after the test run.
+                        let message = e.to_string();
+                        *error.lock().unwrap() = Some(e);
+                        message
                     }
+                };
+
+                let stack_trace = match format_stack_trace(&session, &path, stack_frame_limit).await
+                {
+                    Ok(stack_trace) => stack_trace,
+                    Err(e) => format!("Failed to get the stack trace: {e}\n"),
+                };
+
+                if !capture {
+                    print!("{stack_trace}");
+                    return Err(Failed::from(reason));
                 }
+
+                // Same order as libtest: the output, then the failure.
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&reason);
+                output.push('\n');
+                output.push_str(stack_trace.trim_end());
+                if strip_colors {
+                    output = strip_ansi(output);
+                }
+                Err(Failed::from(output))
             });
 
             Handle::current().block_on(handle).unwrap()
@@ -1186,21 +1377,136 @@ async fn display_stack_trace(
     path: &Path,
     stack_frame_limit: u32,
 ) -> anyhow::Result<()> {
+    print!(
+        "{}",
+        format_stack_trace(session, path, stack_frame_limit).await?
+    );
+
+    Ok(())
+}
+
+async fn format_stack_trace(
+    session: &SessionInterface,
+    path: &Path,
+    stack_frame_limit: u32,
+) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+
     let stack_trace = session
         .stack_trace(path.to_path_buf(), stack_frame_limit)
         .await?;
 
+    let mut s = String::new();
     for StackTrace { core, frames } in stack_trace.cores.iter() {
-        println!("Core {core}");
+        writeln!(s, "Core {core}").unwrap();
         for (i, frame) in frames.iter().enumerate() {
-            println!("    Frame {i}: {}", format_stack_frame(frame));
+            writeln!(s, "    Frame {i}: {}", format_stack_frame(frame)).unwrap();
         }
         if frames.len() >= stack_frame_limit as usize {
-            println!("Use `--stack-frame-limit` to increase the number of frames displayed.");
+            writeln!(
+                s,
+                "Use `--stack-frame-limit` to increase the number of frames displayed."
+            )
+            .unwrap();
         }
     }
 
-    Ok(())
+    Ok(s)
+}
+
+/// Writes the target output of a test run. In capture mode, collects the output of each test, and
+/// drops the output outside of the tests.
+async fn log_test_output(
+    receiver: &mut UnboundedReceiver<TestLogEvent>,
+    output: &mut TargetOutput,
+    target_output_files: &mut TargetOutputFiles,
+    up_channels: &[u32],
+    capture: bool,
+) {
+    let captured = RefCell::new(None::<CapturedOutput>);
+    let write = |message: &str, print: fn(&str)| {
+        if !capture {
+            print(message);
+        } else if let Some(captured) = captured.borrow_mut().as_mut() {
+            captured.push(message);
+        }
+    };
+
+    while let Some(event) = receiver.recv().await {
+        match event {
+            TestLogEvent::Monitor(event) => {
+                handle_monitor_event(
+                    output,
+                    event,
+                    target_output_files,
+                    &async |message| write(message, |m| print!("{m}")),
+                    &async |message| write(message, |m| eprint!("{m}")),
+                    up_channels,
+                )
+                .await;
+            }
+            TestLogEvent::TestStart if capture => {
+                *captured.borrow_mut() = Some(CapturedOutput::default())
+            }
+            TestLogEvent::TestStart => {}
+            TestLogEvent::TestEnd(reply) => {
+                // The next test resets the target, so the decoders cannot complete this data.
+                output
+                    .flush(
+                        target_output_files,
+                        &async |message| write(message, |m| print!("{m}")),
+                        &async |message| write(message, |m| eprint!("{m}")),
+                    )
+                    .await;
+                let text = captured.take().map(CapturedOutput::into_string);
+                _ = reply.send(text.unwrap_or_default());
+            }
+        }
+    }
+}
+
+/// A message to the log task of the test runner.
+enum TestLogEvent {
+    Monitor(MonitorEvent),
+    TestStart,
+    /// Sends the captured output of the test. The output is empty if capture is off.
+    TestEnd(tokio::sync::oneshot::Sender<String>),
+}
+
+/// The output of one test. Keeps the last [`Self::LIMIT`] bytes.
+#[derive(Default)]
+struct CapturedOutput {
+    text: String,
+    truncated: bool,
+}
+
+impl CapturedOutput {
+    const LIMIT: usize = 1024 * 1024;
+
+    fn push(&mut self, message: &str) {
+        self.text.push_str(message);
+        // Trim at twice the limit, so that each push does not move the text.
+        if self.text.len() > 2 * Self::LIMIT {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.text.len() > Self::LIMIT {
+            let start = self.text.ceil_char_boundary(self.text.len() - Self::LIMIT);
+            self.text.drain(..start);
+            self.truncated = true;
+        }
+    }
+
+    fn into_string(mut self) -> String {
+        self.trim();
+        if self.truncated {
+            format!("(The start of the output was removed.)\n{}", self.text)
+        } else {
+            self.text
+        }
+    }
 }
 
 /// Formats a single stack frame for display.
@@ -1236,7 +1542,38 @@ pub(crate) fn format_stack_frame(frame: &StackTraceFrame) -> String {
     s
 }
 
-/// Runs a future until completion, running another future when Ctrl+C is received.
+/// Asks the server to stop the running command. If the connection is gone, the command ends with
+/// that error, so a failed send is not an error here.
+async fn send_cancel(session: &SessionInterface) {
+    if let Err(error) = session.client().publish::<CancelTopic>(&()).await {
+        tracing::debug!("Failed to send the cancel: {error}");
+    }
+}
+
+/// Waits for SIGTERM (Unix) or Ctrl+Break (Windows), as sent by process supervisors.
+async fn terminate_signal() -> &'static str {
+    cfg_select! {
+        unix => {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+            "SIGTERM"
+        }
+        windows => {
+            tokio::signal::windows::ctrl_break()
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+            "Ctrl+Break"
+        }
+        _ => {
+            std::future::pending().await
+        }
+    }
+}
+
+/// Runs a future until completion, running another future when a shutdown signal is received.
 ///
 /// This function enables cooperative asynchronous cancellation without dropping the future.
 async fn with_ctrl_c<F, I>(f: F, on_ctrl_c: I) -> F::Output
@@ -1245,19 +1582,10 @@ where
     I: Future,
 {
     let mut run = std::pin::pin!(f);
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => eprintln!("Received Ctrl+C, exiting"),
-        _ = terminate => eprintln!("Received SIGTERM, exiting"),
+        signal = terminate_signal() => eprintln!("Received {signal}, exiting"),
         result = &mut run => return result,
     };
 
@@ -1274,6 +1602,11 @@ pub struct CliRttClient {
     channel_processors: Vec<Channel>,
 
     // Data necessary to create the channel processors once we know the channel names.
+    zephyr_log_dictionary: Option<Arc<ZephyrLogDatabase>>,
+}
+
+/// The settings to create the decoders of the target output.
+pub struct DecoderSettings {
     log_format: Option<String>,
     show_timestamps: bool,
     show_location: bool,
@@ -1281,39 +1614,134 @@ pub struct CliRttClient {
     defmt_data: Option<DefmtState>,
 }
 
+impl DecoderSettings {
+    pub fn new(
+        meta: &FileMetadata,
+        monitor_options: &MonitoringOptions,
+        timestamp_offset: Option<UtcOffset>,
+    ) -> Self {
+        Self {
+            log_format: monitor_options.log_format.clone(),
+            show_timestamps: !monitor_options.no_timestamps,
+            show_location: !monitor_options.no_location,
+            timestamp_offset,
+            defmt_data: meta.defmt_data.clone(),
+        }
+    }
+
+    fn defmt_processor(&self) -> Option<DefmtProcessor> {
+        self.defmt_data.clone().map(|defmt_data| {
+            DefmtProcessor::new(
+                defmt_data,
+                self.show_timestamps,
+                self.show_location,
+                self.log_format.as_deref(),
+            )
+        })
+    }
+
+    fn auto_decoder(&self) -> StreamDecoder {
+        StreamDecoder::Auto {
+            decoder: AutoDecoder::new(
+                TextDecoder::new(self.timestamp_offset, self.show_timestamps),
+                self.defmt_processor(),
+            ),
+        }
+    }
+}
+
+/// The decoders of the target output: RTT, semihosting and the serial port to the target.
+pub struct TargetOutput {
+    decoders: DecoderSettings,
+    rtt_client: Option<CliRttClient>,
+    semihosting_streams: HashMap<String, Channel>,
+    serial: Channel,
+}
+
+impl TargetOutput {
+    pub fn new(decoders: DecoderSettings, rtt_client: Option<CliRttClient>) -> Self {
+        Self {
+            serial: Channel::new("serial".to_string(), decoders.auto_decoder()),
+            decoders,
+            rtt_client,
+            semihosting_streams: HashMap::new(),
+        }
+    }
+
+    fn semihosting_stream(&mut self, stream: &str) -> &mut Channel {
+        self.semihosting_streams
+            .entry(stream.to_string())
+            .or_insert_with(|| Channel::new(stream.to_string(), self.decoders.auto_decoder()))
+    }
+
+    fn rtt_handle(&self) -> Option<Key<RttClient>> {
+        self.rtt_client.as_ref().map(CliRttClient::handle)
+    }
+
+    /// Writes the data that waits in the decoders for more input.
+    async fn flush(
+        &mut self,
+        target_output_files: &mut TargetOutputFiles,
+        shared_writer: &impl AsyncFn(&str),
+        error_writer: &impl AsyncFn(&str),
+    ) {
+        if let Some(client) = &mut self.rtt_client {
+            for processor in &mut client.channel_processors {
+                let output_file =
+                    ChannelIdentifier::Rtt(processor.channel.clone()).find_in(target_output_files);
+                processor.flush(shared_writer, output_file).await;
+            }
+        }
+        for (stream, channel) in &mut self.semihosting_streams {
+            let output_file =
+                ChannelIdentifier::Semihosting(stream.clone()).find_in(target_output_files);
+            if stream == "stderr" {
+                channel.flush(error_writer, output_file).await;
+            } else {
+                channel.flush(shared_writer, output_file).await;
+            }
+        }
+        let output_file =
+            ChannelIdentifier::Unqualified("serial".to_string()).find_in(target_output_files);
+        self.serial.flush(shared_writer, output_file).await;
+    }
+}
+
 impl CliRttClient {
     pub fn handle(&self) -> Key<RttClient> {
         self.handle
     }
 
-    fn on_channels_discovered(&mut self, up_channels: &[ChannelInfo]) {
+    fn on_channels_discovered(&mut self, up_channels: &[ChannelInfo], decoders: &DecoderSettings) {
         // Already configured.
         if !self.channel_processors.is_empty() {
             return;
         }
 
+        // Zephyr outputs dictionary-based logs on a single channel, which the database records.
+        let zephyr_dict_channel = self
+            .zephyr_log_dictionary
+            .as_ref()
+            .map(|db| db.rtt_channel().unwrap_or(0) as usize);
+
         // Apply our heuristics based on channel names.
-        for channel in up_channels.iter() {
-            let decoder = if channel.name == "defmt" {
-                if let Some(defmt_data) = self.defmt_data.clone() {
-                    RttDecoder::Defmt {
-                        processor: DefmtProcessor::new(
-                            defmt_data,
-                            self.show_timestamps,
-                            self.show_location,
-                            self.log_format.as_deref(),
-                        ),
-                    }
-                } else {
+        for (number, channel) in up_channels.iter().enumerate() {
+            let decoder = if let Some(db) = self
+                .zephyr_log_dictionary
+                .as_ref()
+                .filter(|_| zephyr_dict_channel == Some(number))
+            {
+                StreamDecoder::ZephyrDict {
+                    processor: ZephyrLogDecoder::new(db.clone()),
+                }
+            } else if channel.name == "defmt" {
+                match decoders.defmt_processor() {
+                    Some(processor) => StreamDecoder::Defmt { processor },
                     // Not much we can do. Don't silently eat the data.
-                    RttDecoder::BinaryLE
+                    None => StreamDecoder::BinaryLE,
                 }
             } else {
-                RttDecoder::String {
-                    timestamp_offset: self.timestamp_offset,
-                    last_line_done: false,
-                    show_timestamps: self.show_timestamps,
-                }
+                decoders.auto_decoder()
             };
 
             self.channel_processors
@@ -1331,22 +1759,23 @@ impl CliRttClient {
 }
 
 async fn handle_monitor_event(
-    rtt_client: &mut Option<impl DerefMut<Target = CliRttClient>>,
+    output: &mut TargetOutput,
     event: MonitorEvent,
     target_output_files: &mut TargetOutputFiles,
     shared_writer: &impl AsyncFn(&str),
+    error_writer: &impl AsyncFn(&str),
     up_channels: &[u32],
 ) {
     match event {
         MonitorEvent::Rtt(RttEvent::Discovered { up_channels, .. }) => {
-            let Some(client) = rtt_client else {
+            let Some(client) = &mut output.rtt_client else {
                 return;
             };
 
-            client.on_channels_discovered(&up_channels);
+            client.on_channels_discovered(&up_channels, &output.decoders);
         }
         MonitorEvent::Rtt(RttEvent::Output { channel, bytes }) => {
-            let Some(client) = rtt_client else {
+            let Some(client) = &mut output.rtt_client else {
                 return;
             };
 
@@ -1371,19 +1800,25 @@ async fn handle_monitor_event(
                 )
                 .await;
         }
-        MonitorEvent::Semihosting(SemihostingEvent::Output { stream, data }) => {
-            match stream.as_str() {
-                "stdout" => print!("{data}"),
-                "stderr" => eprint!("{data}"),
-                _ => {}
-            };
+        MonitorEvent::Semihosting(SemihostingEvent::Output { stream, bytes }) => {
+            let output_file =
+                ChannelIdentifier::Semihosting(stream.clone()).find_in(target_output_files);
 
-            if let Some(remote_processor) =
-                ChannelIdentifier::Semihosting(stream).find_in(target_output_files)
-            {
-                // Silently discarding output file errors
-                _ = remote_processor.write_all(data.as_bytes()).await;
-            };
+            let channel = output.semihosting_stream(&stream);
+            if stream == "stderr" {
+                channel.process(&bytes, error_writer, output_file).await;
+            } else {
+                channel.process(&bytes, shared_writer, output_file).await;
+            }
+        }
+        MonitorEvent::Serial(SerialEvent::Output { bytes }) => {
+            let output_file =
+                ChannelIdentifier::Unqualified("serial".to_string()).find_in(target_output_files);
+
+            output
+                .serial
+                .process(&bytes, shared_writer, output_file)
+                .await;
         }
     }
 }
@@ -1398,12 +1833,12 @@ impl<'a> std::fmt::Display for ChannelInfoPrinter<'a> {
 
 struct Channel {
     channel: String,
-    decoder: RttDecoder,
+    decoder: StreamDecoder,
     printer_prefix: String,
 }
 
 impl Channel {
-    fn new(channel: String, decoder: RttDecoder) -> Self {
+    fn new(channel: String, decoder: StreamDecoder) -> Self {
         Self {
             channel,
             decoder,
@@ -1422,13 +1857,108 @@ impl Channel {
         copy_to: Option<&mut tokio::fs::File>,
     ) {
         if let Some(data) = self.decoder.process(bytes).ok().flatten() {
-            let data = data.to_string();
-            let message = format!("{}{}", self.printer_prefix, data);
-            shared_writer(&message).await;
-            if let Some(copy_to) = copy_to {
-                // Silently discarding output file errors
-                _ = copy_to.write_all(data.as_bytes()).await;
-            }
+            self.write(&data.to_string(), shared_writer, copy_to).await;
         }
+    }
+
+    async fn flush(
+        &mut self,
+        shared_writer: &impl AsyncFn(&str),
+        copy_to: Option<&mut tokio::fs::File>,
+    ) {
+        let data = self.decoder.flush();
+        if !data.is_empty() {
+            self.write(&data, shared_writer, copy_to).await;
+        }
+    }
+
+    async fn write(
+        &self,
+        data: &str,
+        shared_writer: &impl AsyncFn(&str),
+        copy_to: Option<&mut tokio::fs::File>,
+    ) {
+        let message = format!("{}{}", self.printer_prefix, data);
+        shared_writer(&message).await;
+        if let Some(copy_to) = copy_to {
+            // Silently discarding output file errors
+            _ = copy_to.write_all(data.as_bytes()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sends the semihosting output of each test through the log task. Returns the captured
+    /// output of each test.
+    async fn capture_tests(tests: &[&[u8]]) -> Vec<String> {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut replies = Vec::new();
+        for bytes in tests {
+            sender.send(TestLogEvent::TestStart).unwrap();
+            sender
+                .send(TestLogEvent::Monitor(MonitorEvent::Semihosting(
+                    SemihostingEvent::Output {
+                        stream: "stdout".to_string(),
+                        bytes: bytes.to_vec(),
+                    },
+                )))
+                .unwrap();
+            let (reply, captured) = tokio::sync::oneshot::channel();
+            sender.send(TestLogEvent::TestEnd(reply)).unwrap();
+            replies.push(captured);
+        }
+        drop(sender);
+
+        let decoders = DecoderSettings {
+            log_format: None,
+            show_timestamps: false,
+            show_location: false,
+            timestamp_offset: None,
+            defmt_data: None,
+        };
+        let mut output = TargetOutput::new(decoders, None);
+        log_test_output(
+            &mut receiver,
+            &mut output,
+            &mut TargetOutputFiles::new(),
+            &[],
+            true,
+        )
+        .await;
+
+        let mut captured = Vec::new();
+        for reply in replies {
+            captured.push(reply.await.unwrap());
+        }
+        captured
+    }
+
+    #[tokio::test]
+    async fn incomplete_output_stays_with_its_test() {
+        // A trailing 0xFF can be the start of an esp-println defmt frame.
+        let captured = capture_tests(&[b"output of the first test\n\xFF", b"second\n"]).await;
+        assert_eq!(captured[1], "second\n");
+    }
+
+    #[test]
+    fn firmware_exit_code() {
+        assert_eq!(FirmwareExited::WithStatus(1).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithStatus(42).exit_code(), 42);
+        assert_eq!(FirmwareExited::WithStatus(255).exit_code(), 255);
+        // Must not be reported as success
+        assert_eq!(FirmwareExited::WithStatus(256).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithStatus(0).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithReason(String::from("")).exit_code(), 1);
+        assert_eq!(FirmwareExited::Unexpected(String::from("")).exit_code(), 1);
+    }
+
+    #[test]
+    fn firmware_exit_status_through_anyhow() {
+        let error = anyhow::Error::from(FirmwareExited::WithStatus(3)).context("while running");
+        let status = error.downcast_ref::<FirmwareExited>().unwrap();
+        assert_eq!(status.exit_code(), 3);
     }
 }

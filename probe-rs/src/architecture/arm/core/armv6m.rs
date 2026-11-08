@@ -1,6 +1,10 @@
 //! Register types and the core interface for armv6-M
 
-use super::{CortexMState, Dfsr, registers::cortex_m::*};
+use super::{
+    CortexMState, Dfsr,
+    cortex_m::{clear_step_before_reset, enable_halting_debug, exit_halt, set_vector_catch},
+    registers::cortex_m::*,
+};
 use crate::{
     Architecture, BreakpointCause, CoreInformation, CoreInterface, CoreRegister, CoreStatus,
     CoreType, HaltReason, InstructionSet, MemoryInterface, MemoryMappedRegister,
@@ -21,7 +25,7 @@ bitfield! {
     ///
     /// To write this register successfully, you need to set the debug key via [`Dhcsr::enable_write`] first!
     #[derive(Copy, Clone)]
-    pub struct Dhcsr(u32);
+    pub struct Dhcsr(pub u32);
     impl Debug;
     /// Indicates whether the processor has been reset since the last read of DHCSR:
     ///
@@ -174,7 +178,7 @@ impl MemoryMappedRegister<u32> for Dhcsr {
 
 /// Debug Core Register Data Register, DCRDR (see armv6-M Architecture Reference Manual C1.6.5)
 #[derive(Debug, Copy, Clone)]
-pub struct Dcrdr(u32);
+pub struct Dcrdr(pub u32);
 
 impl From<u32> for Dcrdr {
     fn from(value: u32) -> Self {
@@ -198,7 +202,7 @@ bitfield! {
     ///
     /// Provides BPU implementation information, and the global enable for the BPU.
     #[derive(Copy, Clone)]
-    pub struct BpCtrl(u32);
+    pub struct BpCtrl(pub u32);
     impl Debug;
     /// The number of breakpoint comparators. If NUM_CODE is zero, the implementation does not support any comparators
     pub num_code, _: 7, 4;
@@ -236,7 +240,7 @@ bitfield! {
     /// Holds a breakpoint address for comparison with instruction addresses in the Code memory
     /// region, see The system address map on page B3-224 for more information.
     #[derive(Copy, Clone)]
-    pub struct BpCompx(u32);
+    pub struct BpCompx(pub u32);
     impl Debug;
     /// BP_MATCH defines the behavior when the COMP address is matched:
     ///
@@ -304,7 +308,7 @@ bitfield! {
     ///
     /// [`Aircr::vectkey`] must be called before this register can effectively be written!
     #[derive(Copy, Clone)]
-    pub struct Aircr(u32);
+    pub struct Aircr(pub u32);
     impl Debug;
     /// Vector Key. The value 0x05FA must be written to this register, otherwise
     /// the register write is UNPREDICTABLE.
@@ -372,7 +376,7 @@ impl MemoryMappedRegister<u32> for Aircr {
 bitfield! {
     /// Debug Exception and Monitor Control Register, DEMCR (see armv6-M Architecture Reference Manual C1.6.6)
     #[derive(Copy, Clone)]
-    pub struct Demcr(u32);
+    pub struct Demcr(pub u32);
     impl Debug;
     /// Global enable for DWT.
     ///
@@ -439,7 +443,7 @@ impl<'probe> Armv6m<'probe> {
             };
 
             // Clear DFSR register. The bits in the register are sticky,
-            // so we clear them here to ensure that that none are set.
+            // so we clear them here to ensure that none are set.
             let dfsr_clear = Dfsr::clear_all();
 
             memory.write_word_32(Dfsr::get_mmio_address(), dfsr_clear.into())?;
@@ -579,6 +583,7 @@ impl CoreInterface for Armv6m<'_> {
     fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error> {
         // TODO: Generic halt support
         self.state.clear_pending_step();
+        self.state.pc_written = false;
 
         let mut value = Dhcsr(0);
         value.set_c_halt(true);
@@ -600,18 +605,17 @@ impl CoreInterface for Armv6m<'_> {
     }
 
     fn run(&mut self) -> Result<(), Error> {
-        // Before we run, we always perform a single instruction step, to account for possible breakpoints that might get us stuck on the current instruction.
-        self.step()?;
-        self.state.clear_pending_step();
+        // Before we run, we always perform a single instruction step, to account for possible
+        // breakpoints that might get us stuck on the current instruction. If the PC was written
+        // since we halted, the core is no longer on that instruction and there is nothing to
+        // step over.
+        if !self.state.pc_written {
+            self.step()?;
+            self.state.clear_pending_step();
+        }
+        self.state.pc_written = false;
 
-        let mut value = Dhcsr(0);
-        value.set_c_halt(false);
-        value.set_c_debugen(true);
-        value.enable_write();
-
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), value.into())?;
-        self.memory.flush()?;
+        exit_halt(&mut *self.memory, false)?;
 
         // We assume that the core is running now.
         self.set_core_status(CoreStatus::Running);
@@ -621,6 +625,9 @@ impl CoreInterface for Armv6m<'_> {
     fn reset(&mut self) -> Result<(), Error> {
         self.state.semihosting_command = None;
         self.state.clear_pending_step();
+        self.state.pc_written = false;
+
+        clear_step_before_reset(&mut *self.memory, false)?;
 
         self.sequence
             .reset_system(&mut *self.memory, crate::CoreType::Armv6m, None)?;
@@ -633,6 +640,9 @@ impl CoreInterface for Armv6m<'_> {
     fn reset_and_halt(&mut self, _timeout: Duration) -> Result<CoreInformation, Error> {
         self.reset_catch_set()?;
         self.state.clear_pending_step();
+        self.state.pc_written = false;
+
+        clear_step_before_reset(&mut *self.memory, true)?;
 
         self.sequence
             .reset_system(&mut *self.memory, crate::CoreType::Armv6m, None)?;
@@ -688,19 +698,9 @@ impl CoreInterface for Armv6m<'_> {
             None
         };
 
-        let mut value = Dhcsr(0);
-        // Leave halted state.
-        // Step one instruction.
+        // Only arm the pending step once the write has landed.
+        exit_halt(&mut *self.memory, true)?;
         self.state.begin_step();
-        value.set_c_step(true);
-        value.set_c_halt(false);
-        value.set_c_debugen(true);
-        value.set_c_maskints(true);
-        value.enable_write();
-
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), value.into())?;
-        self.memory.flush()?;
 
         // The single-step might put the core in lockup state. Lockup isn't considered "halted"
         // so we can't use `wait_for_core_halted` here.
@@ -721,10 +721,14 @@ impl CoreInterface for Armv6m<'_> {
         // Re-enable breakpoints before we continue.
         if let Some(pc_before_step) = breakpoint_at_pc {
             // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
+            // A `b .` (branch to itself) also leaves the PC unchanged, so only skip a real `BKPT`.
             if pc_before_step == pc_after_step
                 && !self
                     .hw_breakpoints()?
                     .contains(&pc_before_step.try_into().ok())
+                && pc_before_step
+                    .try_into()
+                    .is_ok_and(|pc: u64| super::cortex_m::is_bkpt_at(self, pc))
             {
                 tracing::debug!(
                     "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
@@ -738,6 +742,9 @@ impl CoreInterface for Armv6m<'_> {
         }
 
         self.state.semihosting_command = None;
+
+        // The core halted again, and any PC write above was this function's own doing.
+        self.state.pc_written = false;
 
         Ok(CoreInformation {
             pc: pc_after_step.try_into()?,
@@ -756,6 +763,9 @@ impl CoreInterface for Armv6m<'_> {
     fn write_core_reg(&mut self, address: RegisterId, value: RegisterValue) -> Result<(), Error> {
         if self.state.current_state.is_halted() {
             super::cortex_m::write_core_reg(&mut *self.memory, address, value.try_into()?)?;
+            if address == self.program_counter().id() {
+                self.state.pc_written = true;
+            }
             Ok(())
         } else {
             Err(Error::Arm(ArmError::CoreNotHalted))
@@ -917,52 +927,12 @@ impl CoreInterface for Armv6m<'_> {
 
     #[tracing::instrument(skip(self))]
     fn enable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
-        dhcsr.set_c_debugen(true);
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-
-        let mut demcr = Demcr(self.memory.read_word_32(Demcr::get_mmio_address())?);
-        match condition {
-            VectorCatchCondition::HardFault => demcr.set_vc_harderr(true),
-            VectorCatchCondition::CoreReset => demcr.set_vc_corereset(true),
-            VectorCatchCondition::SecureFault => {
-                return Err(Error::Arm(ArmError::ArchitectureRequired(&["ARMv8"])));
-            }
-            VectorCatchCondition::All => {
-                demcr.set_vc_harderr(true);
-                demcr.set_vc_corereset(true);
-            }
-            VectorCatchCondition::Svc | VectorCatchCondition::Hlt => {
-                return Err(Error::NotImplemented("vector catch condition Svc/Hlt"));
-            }
-        };
-
-        self.memory
-            .write_word_32(Demcr::get_mmio_address(), demcr.into())?;
-        Ok(())
+        enable_halting_debug(&mut *self.memory)?;
+        set_vector_catch(&mut *self.memory, condition, true)
     }
 
     fn disable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        let mut demcr = Demcr(self.memory.read_word_32(Demcr::get_mmio_address())?);
-        match condition {
-            VectorCatchCondition::HardFault => demcr.set_vc_harderr(false),
-            VectorCatchCondition::CoreReset => demcr.set_vc_corereset(false),
-            VectorCatchCondition::SecureFault => {
-                return Err(Error::Arm(ArmError::ArchitectureRequired(&["ARMv8"])));
-            }
-            VectorCatchCondition::All => {
-                demcr.set_vc_harderr(false);
-                demcr.set_vc_corereset(false);
-            }
-            VectorCatchCondition::Svc | VectorCatchCondition::Hlt => {
-                return Err(Error::NotImplemented("vector catch condition Svc/Hlt"));
-            }
-        };
-
-        self.memory
-            .write_word_32(Demcr::get_mmio_address(), demcr.into())?;
-        Ok(())
+        set_vector_catch(&mut *self.memory, condition, false)
     }
 }
 

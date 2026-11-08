@@ -2,7 +2,7 @@
 
 use crate::{
     CoreInterface, CoreRegister, CoreStatus, CoreType, Error, HaltReason, InstructionSet,
-    MemoryInterface, MemoryMappedRegister,
+    MemoryInterface, MemoryMappedRegister, Xlen,
     architecture::riscv::sequences::RiscvDebugSequence,
     core::{
         Architecture, BreakpointCause, CoreInformation, CoreRegisters, RegisterId, RegisterValue,
@@ -15,7 +15,9 @@ use crate::{
 };
 use bitfield::bitfield;
 use communication_interface::{AbstractCommandErrorKind, RiscvCommunicationInterface, RiscvError};
-use registers::{FP, RA, RISCV_CORE_REGISTERS, RISCV_WITH_FP_CORE_REGISTERS, SP};
+use registers::{
+    FP, RA, RISCV_CORE_REGISTERS, RISCV_RV32E_CORE_REGISTERS, RISCV_WITH_FP_CORE_REGISTERS, SP,
+};
 use registers64::{FP64, PC64, RA64, RISCV64_CORE_REGISTERS, RISCV64_WITH_FP_CORE_REGISTERS, SP64};
 use std::{
     marker::PhantomData,
@@ -66,12 +68,14 @@ mod sealed {
 /// all XLEN-dependent differences so that [`RiscvCore`] can be a single generic
 /// struct rather than two near-duplicate types.
 pub trait XlenMode: sealed::Sealed + 'static {
+    /// The register width of this core.
+    const XLEN: Xlen;
     /// Configure the communication interface for this XLEN (e.g. set 64-bit mode).
     fn configure_interface(interface: &mut RiscvCommunicationInterface);
     /// The `CoreType` reported by this core.
     fn core_type() -> CoreType;
-    /// The register file for this core, with or without FPU registers.
-    fn registers(fp_present: bool) -> &'static CoreRegisters;
+    /// The register file for this core, with or without FPU registers, and for RV32E cores.
+    fn registers(fp_present: bool, rv32e: bool) -> &'static CoreRegisters;
     /// The program counter register for this core.
     fn program_counter() -> &'static CoreRegister;
     /// The frame pointer register for this core.
@@ -84,10 +88,6 @@ pub trait XlenMode: sealed::Sealed + 'static {
     fn csr_to_register_value(v: u64) -> RegisterValue;
     /// Unwrap a `RegisterValue` into a `u64` for writing to a CSR.
     fn register_value_to_csr(v: RegisterValue) -> Result<u64, Error>;
-    /// The `InstructionSet` variant for this XLEN when compressed instructions are present.
-    fn compressed_instruction_set() -> InstructionSet;
-    /// The `InstructionSet` variant for this XLEN without compressed instructions.
-    fn uncompressed_instruction_set() -> InstructionSet;
     /// Extract `(trigger_type, mcontrol_low32)` from a raw `tdata1` value.
     ///
     /// `mcontrol_low32` is the low 32 bits of `tdata1`, which is compatible with
@@ -125,14 +125,19 @@ impl sealed::Sealed for Xlen32 {}
 impl sealed::Sealed for Xlen64 {}
 
 impl XlenMode for Xlen32 {
+    const XLEN: Xlen = Xlen::X32;
+
     fn configure_interface(_interface: &mut RiscvCommunicationInterface) {}
 
     fn core_type() -> CoreType {
         CoreType::Riscv
     }
 
-    fn registers(fp_present: bool) -> &'static CoreRegisters {
-        if fp_present {
+    fn registers(fp_present: bool, rv32e: bool) -> &'static CoreRegisters {
+        // RV32E has no standard F extension, so it takes precedence over fp_present
+        if rv32e {
+            &RISCV_RV32E_CORE_REGISTERS
+        } else if fp_present {
             &RISCV_WITH_FP_CORE_REGISTERS
         } else {
             &RISCV_CORE_REGISTERS
@@ -159,13 +164,6 @@ impl XlenMode for Xlen32 {
     fn register_value_to_csr(v: RegisterValue) -> Result<u64, Error> {
         let u: u32 = v.try_into()?;
         Ok(u64::from(u))
-    }
-
-    fn compressed_instruction_set() -> InstructionSet {
-        InstructionSet::RV32C
-    }
-    fn uncompressed_instruction_set() -> InstructionSet {
-        InstructionSet::RV32
     }
 
     fn unpack_tdata1(raw: u64) -> (u32, u32) {
@@ -203,6 +201,8 @@ impl XlenMode for Xlen32 {
 }
 
 impl XlenMode for Xlen64 {
+    const XLEN: Xlen = Xlen::X64;
+
     fn configure_interface(interface: &mut RiscvCommunicationInterface) {
         interface.set_xlen_64(true);
     }
@@ -211,7 +211,7 @@ impl XlenMode for Xlen64 {
         CoreType::Riscv64
     }
 
-    fn registers(fp_present: bool) -> &'static CoreRegisters {
+    fn registers(fp_present: bool, _rv32e: bool) -> &'static CoreRegisters {
         if fp_present {
             &RISCV64_WITH_FP_CORE_REGISTERS
         } else {
@@ -238,13 +238,6 @@ impl XlenMode for Xlen64 {
 
     fn register_value_to_csr(v: RegisterValue) -> Result<u64, Error> {
         v.try_into()
-    }
-
-    fn compressed_instruction_set() -> InstructionSet {
-        InstructionSet::RV64C
-    }
-    fn uncompressed_instruction_set() -> InstructionSet {
-        InstructionSet::RV64
     }
 
     fn unpack_tdata1(raw: u64) -> (u32, u32) {
@@ -324,15 +317,10 @@ impl<'state, X: XlenMode> RiscvCore<'state, X> {
 
         interface.ensure_debug_on_sw_breakpoint()?;
 
-        if !state.misa_read {
-            // Determine FPU presence from MISA extensions (F, D, or Q)
-            let misa_val = interface
-                .read_csr(Misa::get_mmio_address() as u16)
-                .unwrap_or(0);
-            let isa_extensions = (misa_val & 0x3ff_ffff) as u32;
-            let fp_mask = (1 << 3) | (1 << 5) | (1 << 16);
-            state.fp_present = isa_extensions & fp_mask != 0;
-            state.misa_read = true;
+        // `registers` cannot read `misa`, so read it here. A failed read is retried when the
+        // instruction set is needed again.
+        if let Err(error) = state.instruction_set::<X>(&mut interface) {
+            tracing::debug!("Could not read misa: {error}");
         }
 
         Ok(Self {
@@ -586,7 +574,7 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
             // single step and manually advance the dpc.
             let mut debug_pc = self.read_core_reg(RegisterId(0x7b1))?;
             // Advance the dpc by the size of the EBREAK (ebreak or c.ebreak) instruction.
-            if self.instruction_set()? == X::compressed_instruction_set() {
+            if let InstructionSet::Riscv { c: true, .. } = self.instruction_set()? {
                 // We may have been halted by either an EBREAK or a C.EBREAK instruction.
                 // We need to read back the instruction to determine how many bytes to skip.
                 let instruction = self.read_word_32(debug_pc.try_into().unwrap())?;
@@ -851,7 +839,11 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
     }
 
     fn registers(&self) -> &'static CoreRegisters {
-        X::registers(self.state.fp_present)
+        let fp_present = matches!(
+            self.state.instruction_set,
+            Some(InstructionSet::Riscv { f: true, .. })
+        );
+        X::registers(fp_present, self.state.rv32e)
     }
 
     fn program_counter(&self) -> &'static CoreRegister {
@@ -887,13 +879,7 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
     }
 
     fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
-        // Check if the Bit at position 2 (signifies letter C, for compressed) is set.
-        let misa_val = self.interface.read_csr(0x301)?;
-        if misa_val & (1 << 2) != 0 {
-            Ok(X::compressed_instruction_set())
-        } else {
-            Ok(X::uncompressed_instruction_set())
-        }
+        Ok(self.state.instruction_set::<X>(&mut self.interface)?)
     }
 
     fn floating_point_register_count(&mut self) -> Result<usize, Error> {
@@ -905,7 +891,10 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
     }
 
     fn fpu_support(&mut self) -> Result<bool, Error> {
-        Ok(self.state.fp_present)
+        Ok(matches!(
+            self.instruction_set()?,
+            InstructionSet::Riscv { f: true, .. }
+        ))
     }
 
     fn reset_catch_set(&mut self) -> Result<(), Error> {
@@ -951,11 +940,12 @@ pub struct RiscvCoreState {
     /// The semihosting command that was decoded at the current program counter
     semihosting_command: Option<SemihostingCommand>,
 
-    /// Whether the core has FPU support (F, D, or Q extensions present)
-    fp_present: bool,
+    /// The instruction set from `misa`, or `None` if `misa` was not read yet.
+    instruction_set: Option<InstructionSet>,
 
-    /// Whether the MISA CSR has been read.
-    misa_read: bool,
+    /// Whether the core is RV32E (misa E extension), with only 16 integer registers. Set together
+    /// with `instruction_set`.
+    rv32e: bool,
 }
 
 impl RiscvCoreState {
@@ -965,15 +955,40 @@ impl RiscvCoreState {
             hw_breakpoints: None,
             pc_written: false,
             semihosting_command: None,
-            fp_present: false,
-            misa_read: false,
+            instruction_set: None,
+            rv32e: false,
         }
+    }
+
+    /// Returns the instruction set of the core. Reads `misa` only until a read succeeds.
+    fn instruction_set<X: XlenMode>(
+        &mut self,
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<InstructionSet, RiscvError> {
+        if let Some(instruction_set) = self.instruction_set {
+            return Ok(instruction_set);
+        }
+
+        let misa_val = interface.read_csr(Misa::get_mmio_address() as u16)?;
+        let isa_extensions = (misa_val & 0x3ff_ffff) as u32;
+        // FPU presence from the F, D, or Q extensions
+        let fp_mask = (1 << 3) | (1 << 5) | (1 << 16);
+        let instruction_set = InstructionSet::Riscv {
+            xlen: X::XLEN,
+            c: isa_extensions & (1 << 2) != 0,
+            f: isa_extensions & fp_mask != 0,
+        };
+        // The E bit is set on RV32E cores, which only have x0-x15.
+        self.rv32e = isa_extensions & (1 << 4) != 0;
+        self.instruction_set = Some(instruction_set);
+
+        Ok(instruction_set)
     }
 }
 
 memory_mapped_bitfield_register! {
     /// `dmcontrol` register, located at address 0x10
-    pub struct Dmcontrol(u32);
+    pub struct Dmcontrol(pub u32);
     0x10, "dmcontrol",
     impl From;
 
@@ -1048,7 +1063,7 @@ memory_mapped_bitfield_register! {
     /// Readonly `dmstatus` register.
     ///
     /// Located at address 0x11
-    pub struct Dmstatus(u32);
+    pub struct Dmstatus(pub u32);
     0x11, "dmstatus",
     impl From;
 
@@ -1131,7 +1146,7 @@ memory_mapped_bitfield_register! {
 }
 
 bitfield! {
-    struct Dcsr(u32);
+    struct Dcsr(pub u32);
     impl Debug;
 
     /// Debug module version. Value 4 indicates spec 1.0; value 3 indicates 0.13.
@@ -1158,7 +1173,7 @@ bitfield! {
 
 memory_mapped_bitfield_register! {
     /// Abstract Control and Status (see 3.12.6)
-    pub struct Abstractcs(u32);
+    pub struct Abstractcs(pub u32);
     0x16, "abstractcs",
     impl From;
 
@@ -1174,7 +1189,7 @@ memory_mapped_bitfield_register! {
 
 memory_mapped_bitfield_register! {
     /// Hart Info (see 3.12.3)
-    pub struct Hartinfo(u32);
+    pub struct Hartinfo(pub u32);
     0x12, "hartinfo",
     impl From;
 
@@ -1184,41 +1199,41 @@ memory_mapped_bitfield_register! {
     dataaddr, _: 11, 0;
 }
 
-memory_mapped_bitfield_register! { pub struct Data0(u32); 0x04, "data0", impl From; }
-memory_mapped_bitfield_register! { pub struct Data1(u32); 0x05, "data1", impl From; }
-memory_mapped_bitfield_register! { pub struct Data2(u32); 0x06, "data2", impl From; }
-memory_mapped_bitfield_register! { pub struct Data3(u32); 0x07, "data3", impl From; }
-memory_mapped_bitfield_register! { pub struct Data4(u32); 0x08, "data4", impl From; }
-memory_mapped_bitfield_register! { pub struct Data5(u32); 0x09, "data5", impl From; }
-memory_mapped_bitfield_register! { pub struct Data6(u32); 0x0A, "data6", impl From; }
-memory_mapped_bitfield_register! { pub struct Data7(u32); 0x0B, "data7", impl From; }
-memory_mapped_bitfield_register! { pub struct Data8(u32); 0x0C, "data8", impl From; }
-memory_mapped_bitfield_register! { pub struct Data9(u32); 0x0D, "data9", impl From; }
-memory_mapped_bitfield_register! { pub struct Data10(u32); 0x0E, "data10", impl From; }
-memory_mapped_bitfield_register! { pub struct Data11(u32); 0x0f, "data11", impl From; }
+memory_mapped_bitfield_register! { pub struct Data0(pub u32); 0x04, "data0", impl From; }
+memory_mapped_bitfield_register! { pub struct Data1(pub u32); 0x05, "data1", impl From; }
+memory_mapped_bitfield_register! { pub struct Data2(pub u32); 0x06, "data2", impl From; }
+memory_mapped_bitfield_register! { pub struct Data3(pub u32); 0x07, "data3", impl From; }
+memory_mapped_bitfield_register! { pub struct Data4(pub u32); 0x08, "data4", impl From; }
+memory_mapped_bitfield_register! { pub struct Data5(pub u32); 0x09, "data5", impl From; }
+memory_mapped_bitfield_register! { pub struct Data6(pub u32); 0x0A, "data6", impl From; }
+memory_mapped_bitfield_register! { pub struct Data7(pub u32); 0x0B, "data7", impl From; }
+memory_mapped_bitfield_register! { pub struct Data8(pub u32); 0x0C, "data8", impl From; }
+memory_mapped_bitfield_register! { pub struct Data9(pub u32); 0x0D, "data9", impl From; }
+memory_mapped_bitfield_register! { pub struct Data10(pub u32); 0x0E, "data10", impl From; }
+memory_mapped_bitfield_register! { pub struct Data11(pub u32); 0x0f, "data11", impl From; }
 
-memory_mapped_bitfield_register! { struct Command(u32); 0x17, "command", impl From; }
+memory_mapped_bitfield_register! { struct Command(pub u32); 0x17, "command", impl From; }
 
-memory_mapped_bitfield_register! { pub struct Progbuf0(u32); 0x20, "progbuf0", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf1(u32); 0x21, "progbuf1", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf2(u32); 0x22, "progbuf2", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf3(u32); 0x23, "progbuf3", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf4(u32); 0x24, "progbuf4", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf5(u32); 0x25, "progbuf5", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf6(u32); 0x26, "progbuf6", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf7(u32); 0x27, "progbuf7", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf8(u32); 0x28, "progbuf8", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf9(u32); 0x29, "progbuf9", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf10(u32); 0x2A, "progbuf10", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf11(u32); 0x2B, "progbuf11", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf12(u32); 0x2C, "progbuf12", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf13(u32); 0x2D, "progbuf13", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf14(u32); 0x2E, "progbuf14", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf15(u32); 0x2F, "progbuf15", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf0(pub u32); 0x20, "progbuf0", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf1(pub u32); 0x21, "progbuf1", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf2(pub u32); 0x22, "progbuf2", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf3(pub u32); 0x23, "progbuf3", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf4(pub u32); 0x24, "progbuf4", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf5(pub u32); 0x25, "progbuf5", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf6(pub u32); 0x26, "progbuf6", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf7(pub u32); 0x27, "progbuf7", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf8(pub u32); 0x28, "progbuf8", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf9(pub u32); 0x29, "progbuf9", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf10(pub u32); 0x2A, "progbuf10", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf11(pub u32); 0x2B, "progbuf11", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf12(pub u32); 0x2C, "progbuf12", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf13(pub u32); 0x2D, "progbuf13", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf14(pub u32); 0x2E, "progbuf14", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf15(pub u32); 0x2F, "progbuf15", impl From; }
 
 bitfield! {
     /// Trigger type 2 — legacy address/data match control (mcontrol).
-    struct Mcontrol(u32);
+    struct Mcontrol(pub u32);
     impl Debug;
 
     type_, set_type: 31, 28;
@@ -1245,7 +1260,7 @@ bitfield! {
     /// Low bits 0–15 are position-compatible with `Mcontrol`. Differences start
     /// at bit 16: a unified 4-bit `size` field replaces the split `sizelo`/`sizehi`
     /// of the legacy type, and new `hit0`, `vu`, `vs`, and `hit1` bits are added.
-    struct Mcontrol6(u32);
+    struct Mcontrol6(pub u32);
     impl Debug;
 
     type_, set_type: 31, 28;
@@ -1276,7 +1291,7 @@ bitfield! {
 
 memory_mapped_bitfield_register! {
     /// Isa and Extensions (see RISC-V Privileged Spec, 3.1.1)
-    pub struct Misa(u32);
+    pub struct Misa(pub u32);
     0x301, "misa",
     impl From;
 

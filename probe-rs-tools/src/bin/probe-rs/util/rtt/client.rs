@@ -1,10 +1,44 @@
-use crate::util::rtt::{RttActiveDownChannel, RttActiveUpChannel, RttConfig, RttConnection};
+use crate::util::rtt::{
+    RttActiveDownChannel, RttActiveUpChannel, RttConfig, RttConnection, port_reaching,
+};
 use probe_rs::{
     Core, MemoryInterface, Target,
     flashing::FlashLoader,
-    rtt::{Error, Rtt, ScanRegion},
+    rtt::{Error, Rtt, RttTarget, ScanRegion},
 };
 use probe_rs_rpc::rtt_config::ChannelMode;
+use std::time::{Duration, Instant};
+
+/// How long the control block may be missing before the user is told about it.
+const MISSING_CONTROL_BLOCK_WARNING_DELAY: Duration = Duration::from_secs(5);
+
+/// Tracks a control block that has not been found, so that the user is only told once per
+/// attach. Reset by replacing it with the default value.
+#[derive(Default)]
+struct MissingControlBlock {
+    /// When we first failed to find the control block since we were last attached.
+    since: Option<Instant>,
+
+    /// Whether the user has been told that the control block is missing.
+    warned: bool,
+}
+
+impl MissingControlBlock {
+    fn not_found(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+    }
+
+    /// Returns true once the control block has been missing for `delay`, and only the first
+    /// time that is the case since we were last attached.
+    fn should_warn(&mut self, delay: Duration) -> bool {
+        if self.warned {
+            return false;
+        }
+
+        self.warned = self.since.is_some_and(|since| since.elapsed() >= delay);
+        self.warned
+    }
+}
 
 pub struct RttClient {
     pub scan_region: ScanRegion,
@@ -26,8 +60,24 @@ pub struct RttClient {
     /// prevent spamming the log with messages about corrupted control blocks.
     polled_data: bool,
 
+    /// How long the control block has been missing, and whether the user was told. Used to
+    /// only warn once per attach.
+    missing_control_block: MissingControlBlock,
+
     /// The core used to poll the target.
     core_id: usize,
+
+    /// Whether the user was told that RTT is polled through the core.
+    warned_core_polling: bool,
+
+    /// The memory port the next attach goes through, or `None` for the core.
+    attach_port: Option<usize>,
+
+    /// Whether attaching through a memory port failed, so attaching uses the core.
+    port_attach_failed: bool,
+
+    /// What RTT needs to know about the target, for the path the next attach takes.
+    attach_target: Option<RttTarget>,
 }
 
 impl RttClient {
@@ -37,7 +87,6 @@ impl RttClient {
         } else {
             0
         };
-
         Self {
             scan_region,
             channel_modes: config.channels.iter().map(|c| c.mode).collect(),
@@ -48,7 +97,12 @@ impl RttClient {
             disallow_clearing_rtt_header: false,
             try_attaching: true,
             polled_data: false,
+            missing_control_block: MissingControlBlock::default(),
             core_id,
+            warned_core_polling: false,
+            attach_port: None,
+            port_attach_failed: false,
+            attach_target: None,
         }
     }
 
@@ -74,11 +128,62 @@ impl RttClient {
         }
     }
 
+    /// Returns the memory port to access RTT through, or `None` to use `core`.
+    ///
+    /// A memory port is used when it reaches the control block and, once attached, all channel
+    /// buffers.
+    pub fn memory_port(&mut self, core: &Core) -> Option<usize> {
+        let port = self.select_memory_port(core);
+        if !self.is_attached() {
+            let port_target = port
+                .and_then(|port| RttTarget::for_memory_port(core.target(), port, core.is_64_bit()));
+            self.attach_target = Some(port_target.unwrap_or_else(|| RttTarget::from(core)));
+        }
+        port
+    }
+
+    fn select_memory_port(&mut self, core: &Core) -> Option<usize> {
+        let target = core.target();
+        if target.memory_ports.is_empty() {
+            return None;
+        }
+
+        let Some(connection) = self.target.as_ref() else {
+            let address = match self.scan_region {
+                ScanRegion::Exact(address) => Some(address),
+                _ => self.last_control_block_address,
+            };
+            let port = address
+                .filter(|_| !self.port_attach_failed)
+                .and_then(|address| {
+                    let control_block = address..address + Rtt::control_block_size() as u64;
+                    port_reaching(target, std::slice::from_ref(&control_block))
+                });
+            self.attach_port = port;
+            return port;
+        };
+
+        let port = connection.memory_port(target);
+        // A re-attach goes through the same path as the polling.
+        self.attach_port = port;
+        if port.is_some() {
+            self.port_attach_failed = false;
+        } else if !self.warned_core_polling {
+            self.warned_core_polling = true;
+            tracing::warn!(
+                "No memory port reaches the RTT control block and buffers, so RTT is polled \
+                 through the core, which may halt it. Place them in memory a memory port can \
+                 reach to poll RTT while the core runs."
+            );
+        }
+        port
+    }
+
     pub fn is_attached(&self) -> bool {
         self.target.is_some()
     }
 
-    fn try_attach_impl(&mut self, core: &mut Core) -> Result<bool, Error> {
+    fn try_attach_impl(&mut self, core: &mut impl MemoryInterface) -> Result<bool, Error> {
         if self.is_attached() {
             return Ok(true);
         }
@@ -87,13 +192,18 @@ impl RttClient {
             return Ok(false);
         }
 
+        let Some(rtt_target) = self.attach_target.clone() else {
+            tracing::debug!("Failed to attach - no memory access selected yet");
+            return Ok(false);
+        };
         let location = if let Some(location) = self.last_control_block_address {
             location
         } else {
-            let location = match Rtt::find_control_block(core, &self.scan_region) {
+            let location = match Rtt::find_control_block(core, &rtt_target, &self.scan_region) {
                 Ok(location) => location,
                 Err(Error::ControlBlockNotFound) => {
                     tracing::debug!("Failed to attach - control block not found");
+                    self.missing_control_block.not_found();
                     return Ok(false);
                 }
                 Err(Error::NoControlBlockLocation) => {
@@ -108,22 +218,31 @@ impl RttClient {
             location
         };
 
-        let rtt = match Rtt::attach_at(core, location) {
+        let rtt = match Rtt::attach_at(core, &rtt_target, location) {
             Ok(rtt) => rtt,
             Err(Error::ControlBlockNotFound) => {
                 self.last_control_block_address = None;
                 tracing::debug!("Failed to attach - control block not found");
+                self.missing_control_block.not_found();
                 return Ok(false);
             }
             Err(Error::ControlBlockCorrupted(error)) => {
                 tracing::debug!("Failed to attach - control block corrupted: {}", error);
                 return Ok(false);
             }
+            Err(error @ Error::BufferNotReachable { .. }) => {
+                tracing::debug!("Failed to attach - {error}");
+                self.port_attach_failed |= self.attach_port.is_some();
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
 
         match RttConnection::new(rtt) {
-            Ok(rtt) => self.target = Some(rtt),
+            Ok(rtt) => {
+                self.target = Some(rtt);
+                self.missing_control_block = MissingControlBlock::default();
+            }
             Err(Error::ControlBlockCorrupted(error)) => {
                 tracing::debug!("Failed to attach - control block corrupted: {}", error);
             }
@@ -134,7 +253,7 @@ impl RttClient {
         Ok(self.target.is_some())
     }
 
-    pub fn try_attach(&mut self, core: &mut Core) -> Result<bool, Error> {
+    pub fn try_attach(&mut self, core: &mut impl MemoryInterface) -> Result<bool, Error> {
         let attached = self.try_attach_impl(core)?;
 
         if attached && self.need_configure {
@@ -145,7 +264,36 @@ impl RttClient {
         Ok(self.is_attached())
     }
 
-    pub fn poll_channel(&mut self, core: &mut Core, channel: u32) -> Result<&[u8], Error> {
+    /// Tells the user, once, that the control block has not shown up. Attaching fails silently
+    /// while the firmware has yet to initialize RTT, which looks the same as firmware that
+    /// never does, or an ELF file that does not match the firmware on the target.
+    pub(crate) fn warn_if_control_block_is_missing(&mut self) {
+        if !self
+            .missing_control_block
+            .should_warn(MISSING_CONTROL_BLOCK_WARNING_DELAY)
+        {
+            return;
+        }
+
+        let delay = MISSING_CONTROL_BLOCK_WARNING_DELAY.as_secs();
+        match self.scan_region {
+            ScanRegion::Exact(address) => tracing::warn!(
+                "No RTT control block found at {address:#010x} after {delay} seconds. \
+                 The ELF file may not match the firmware on the target, or the firmware \
+                 has not initialized RTT. Still trying to attach."
+            ),
+            _ => tracing::warn!(
+                "No RTT control block found after {delay} seconds. The firmware may not \
+                 have initialized RTT. Still trying to attach."
+            ),
+        }
+    }
+
+    pub fn poll_channel(
+        &mut self,
+        core: &mut impl MemoryInterface,
+        channel: u32,
+    ) -> Result<&[u8], Error> {
         self.try_attach(core)?;
 
         if let Some(ref mut target) = self.target {
@@ -182,7 +330,7 @@ impl RttClient {
     /// Returns 0 if RTT is not attached yet, in which case nothing was sent.
     pub(crate) fn write_down_channel(
         &mut self,
-        core: &mut Core,
+        core: &mut impl MemoryInterface,
         channel: u32,
         input: impl AsRef<[u8]>,
     ) -> Result<usize, Error> {
@@ -195,7 +343,7 @@ impl RttClient {
         target.write_down_channel(core, channel, input)
     }
 
-    pub fn clean_up(&mut self, core: &mut Core) -> Result<(), Error> {
+    pub fn clean_up(&mut self, core: &mut impl MemoryInterface) -> Result<(), Error> {
         self.need_configure = true;
 
         if let Some(target) = self.target.as_mut() {
@@ -208,7 +356,10 @@ impl RttClient {
     /// This function prevents probe-rs from attaching to an RTT control block that is not
     /// supposed to be valid. This is useful when probe-rs has reset the MCU before attaching,
     /// or during/after flashing, when the MCU has not yet been started.
-    pub(crate) fn clear_control_block(&mut self, core: &mut Core) -> Result<(), Error> {
+    pub(crate) fn clear_control_block(
+        &mut self,
+        core: &mut impl MemoryInterface,
+    ) -> Result<(), Error> {
         if self.disallow_clearing_rtt_header {
             tracing::debug!("Not clearing RTT control block");
             return Ok(());
@@ -228,7 +379,7 @@ impl RttClient {
                     // If we know the exact location where a control block should be, we can clear
                     // the whole block.
                     if location == scan_location {
-                        if core.is_64_bit() {
+                        if self.attach_target.as_ref().is_some_and(|t| t.is_64_bit) {
                             const SIZE_64B: usize = 16 + 2 * 8;
                             core.write_8(location, &[0; SIZE_64B])?;
                         } else {
@@ -271,7 +422,7 @@ impl RttClient {
         self.core_id
     }
 
-    pub(crate) fn configure(&mut self, core: &mut Core<'_>) -> Result<(), Error> {
+    pub(crate) fn configure(&mut self, core: &mut impl MemoryInterface) -> Result<(), Error> {
         let Some(target) = self.target.as_mut() else {
             return Ok(());
         };
@@ -366,5 +517,29 @@ mod test {
         client.configure_from_loader(&loader_writing(&target, CONTROL_BLOCK));
 
         assert!(!client.disallow_clearing_rtt_header);
+    }
+
+    #[test]
+    fn a_control_block_that_was_not_looked_for_is_not_missing() {
+        let mut missing = MissingControlBlock::default();
+
+        assert!(!missing.should_warn(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_control_block_is_not_missing_before_the_delay_has_passed() {
+        let mut missing = MissingControlBlock::default();
+        missing.not_found();
+
+        assert!(!missing.should_warn(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_missing_control_block_is_reported_once() {
+        let mut missing = MissingControlBlock::default();
+        missing.not_found();
+
+        assert!(missing.should_warn(Duration::ZERO));
+        assert!(!missing.should_warn(Duration::ZERO));
     }
 }

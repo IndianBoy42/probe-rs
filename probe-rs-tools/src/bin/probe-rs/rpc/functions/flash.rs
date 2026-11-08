@@ -179,15 +179,13 @@ fn flash_impl(
     request: FlashRequest,
     sender: Sender<ProgressEvent>,
 ) -> NoResponse {
-    let dry_run = ctx.dry_run(request.sessid);
     let mut session = ctx.session_blocking(request.sessid);
 
     let loader = ctx.object_mut_blocking(request.loader);
 
     let mut options = flash_request_download_options(&request);
-    options.dry_run = dry_run;
     options.progress = FlashProgress::new(move |event| {
-        from_library_progress_event(event, |event| sender.blocking_send(event).unwrap());
+        from_library_progress_event(event, |event| _ = sender.blocking_send(event));
     });
 
     lift(
@@ -218,7 +216,7 @@ fn erase_all_impl(
     let mut progress = FlashProgress::new(move |event| {
         from_library_progress_event(event, |event| {
             if event.is_operation(Operation::Erase) {
-                sender.blocking_send(event).unwrap()
+                _ = sender.blocking_send(event)
             }
         });
     });
@@ -251,7 +249,7 @@ fn erase_range_impl(
     let mut progress = FlashProgress::new(move |event| {
         from_library_progress_event(event, |event| {
             if event.is_operation(Operation::Erase) {
-                sender.blocking_send(event).unwrap()
+                _ = sender.blocking_send(event)
             }
         });
     });
@@ -290,7 +288,7 @@ fn verify_impl(
             if event.is_operation(Operation::Verify)
                 || matches!(event, ProgressEvent::DiagnosticMessage { .. })
             {
-                sender.blocking_send(event).unwrap()
+                _ = sender.blocking_send(event)
             }
         });
     });

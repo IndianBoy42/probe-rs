@@ -41,7 +41,6 @@ pub struct TargetInfoRequest {
     pub probe: DebugProbeEntry,
     pub speed: Option<u32>,
     pub connect_under_reset: bool,
-    pub dry_run: bool,
     pub target_sel: Option<u32>,
     pub protocol: WireProtocol,
     /// IR lengths for each TAP in the scan chain, in scan-chain order.
@@ -76,6 +75,56 @@ pub enum InfoEvent {
         idcode: Option<u32>,
     },
     ArmDp(DebugPortInfo),
+    /// The TAPs on the JTAG scan chain, in scan chain order.
+    JtagScanChain(Vec<JtagTapInfo>),
+    /// The events that follow are about the TAP at this index.
+    JtagTap {
+        index: u32,
+    },
+    RiscvDebugModule(RiscvDebugModuleInfo),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Schema)]
+pub struct JtagTapInfo {
+    /// `None` for a TAP without an IDCODE register.
+    pub idcode: Option<u32>,
+    pub ir_len: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Schema)]
+pub struct RiscvDebugModuleInfo {
+    pub version: RiscvDebugModuleVersion,
+    pub harts: Vec<RiscvHartInfo>,
+}
+
+/// The version of a RISC-V debug module.
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize, Schema)]
+pub enum RiscvDebugModuleVersion {
+    NoModule,
+    Version { major: u8, minor: u8 },
+    NonConforming,
+    Unknown(u8),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Schema)]
+pub struct RiscvHartInfo {
+    pub index: u32,
+    pub isa: RiscvHartIsa,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Schema)]
+pub enum RiscvHartIsa {
+    /// The hart exists, but the debug module reports it as unavailable.
+    Unavailable,
+    /// The hart does not implement `misa`.
+    NotImplemented,
+    Isa {
+        /// `None` when the width is not known.
+        xlen: Option<u32>,
+        /// The `Extensions` field of `misa`. Bit 0 is extension `A`.
+        extensions: u32,
+    },
+    Error(String),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash, Serialize, Deserialize, Schema)]
@@ -83,7 +132,7 @@ pub enum DpAddress {
     /// Access the single DP on the bus, assuming there is only one.
     /// Will cause corruption if multiple are present.
     Default,
-    /// Select a particular DP on a SWDv2 multidrop bus. The contained `u32` is
+    /// Select a particular DP on an SWDv2 multidrop bus. The contained `u32` is
     /// the `TARGETSEL` value to select it.
     Multidrop(u32),
 }

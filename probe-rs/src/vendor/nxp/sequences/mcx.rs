@@ -19,8 +19,11 @@ use crate::{
         memory::ArmMemoryInterface,
         sequences::ArmDebugSequence,
     },
+    flashing::FlashCompare,
     probe::WireProtocol,
 };
+
+use super::mcx_verify::McxMisrCompare;
 
 mod debugmailbox {
     #![allow(non_snake_case)]
@@ -74,9 +77,35 @@ impl MCX {
         "MCXA156", "MCXA155", "MCXA154", "MCXA146", "MCXA145", "MCXA144",
     ];
     const VARIANT_A2: [&str; 6] = ["MCXA16", "MCXA17", "MCXA18", "MCXA25", "MCXA26", "MCXA27"];
+    const VARIANT_A3: [&str; 8] = [
+        "MCXA343", "MCXA344", "MCXA345", "MCXA346", "MCXA355", "MCXA356", "MCXA365", "MCXA366",
+    ];
     const VARIANT_A5: [&str; 6] = ["MCXA28", "MCXA45", "MCXA53", "MCXA55", "MCXA56", "MCXA57"];
     const VARIANT_N: [&str; 1] = ["MCXN"];
     const VARIANT_N0: [&str; 2] = ["MCXN947", "MCXN526"];
+
+    /// Parts whose reference manual documents the FMU at 0x4009_5000 with the Read into
+    /// MISR command, so flash can be verified by signature rather than by reading it back.
+    ///
+    /// Taken from three manuals, which describe the same register block and the same command:
+    ///
+    /// - MCX A175, A176, A185, A186, A255, A256, A265 and A266, confirmed against an
+    ///   MCXA266.
+    /// - MCX A577, A567, A566, A557, A556, A537, A536, A457, A456, A287 and A286.
+    /// - MCX A345, A346, A355, A356, A365 and A366 (MCXAP144M240F60RM, section 6.3.2.6).
+    ///
+    /// A27x is also here without a manual of its own: it is the same die as A265/A266, and
+    /// early boards identify as A275/A276 rather than A265/A266.
+    ///
+    /// Extend this only alongside the manual for the part being added.
+    const VARIANT_FMU_MISR: [&str; 17] = [
+        "MCXA17", "MCXA18", "MCXA25", "MCXA26", "MCXA27", "MCXA28", "MCXA45", "MCXA53", "MCXA55",
+        "MCXA56", "MCXA57", "MCXA345", "MCXA346", "MCXA355", "MCXA356", "MCXA365", "MCXA366",
+    ];
+
+    /// How long to wait for the boot ROM to grant debug access after a successful
+    /// `START_DBG_SESSION` debug mailbox command.
+    const AP_ENABLE_TIMEOUT: Duration = Duration::from_millis(1000);
 
     fn is_variant<'a, V>(&self, v: V) -> bool
     where
@@ -179,7 +208,47 @@ impl MCX {
 
         interface.flush()?;
 
+        // The ROM acknowledges "Start Debug Session" *before* it actually enables debug
+        // access. Per the reference manual, section 49.6.1 (Debug session with uninitialized
+        // or invalid image or ISP mode): "Upon receiving the command, the boot code disables
+        // any unwanted peripheral and manages NXP secrets before enabling debug access.
+        // After enabling debug access, the ROM enters a while(1) loop."
+        //
+        // Measured on an MCXA266 held in ISP mode, AP0 only reports CSW.DeviceEn ~25 ms
+        // after the mailbox returns success. Returning here immediately makes the very next
+        // AP transaction fault, which is why flashing a part in ISP mode used to fail on the
+        // first attempt and only succeed on the second.
+        self.wait_for_ap_enabled(interface, &FullyQualifiedApAddress::v1_with_dp(dp, 0))?;
+
         Ok(true)
+    }
+
+    /// Wait until the given memory AP reports `CSW.DeviceEn`, meaning debug access has
+    /// actually been granted and the AP can be used for memory transactions.
+    fn wait_for_ap_enabled(
+        &self,
+        interface: &mut dyn DapAccess,
+        mem_ap: &FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        let start = Instant::now();
+        loop {
+            // While the ROM is still bringing debug up, reading the AP can transiently
+            // fault. Treat that the same as "not enabled yet" and keep polling.
+            if matches!(self.is_ap_enabled(interface, mem_ap), Ok(true)) {
+                tracing::debug!("AP {mem_ap:?} enabled after {:?}", start.elapsed());
+                return Ok(());
+            }
+
+            if start.elapsed() > Self::AP_ENABLE_TIMEOUT {
+                tracing::error!(
+                    "AP {mem_ap:?} was not enabled within {:?}",
+                    Self::AP_ENABLE_TIMEOUT
+                );
+                return Err(ArmError::Timeout);
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn configure_trace_clock(
@@ -217,6 +286,28 @@ impl MCX {
             interface.write_word_32(AHBRESETSET0_ADDR, 1 << 29)?;
             // Enable Port0 clock
             interface.write_word_32(AHBCLKCTRLSET0_ADDR, 1 << 29)?;
+        } else if self.is_variant(Self::VARIANT_A3) {
+            // MCXAP144M240F60RM, section 14.5.2. The MCXA343/344 use periph3's
+            // MRCC layout instead, as defined in their CMSIS PERI_MRCC.h and SVD.
+            // Do not copy the stale trace addresses in the packs' debug scripts.
+            const MRCC_BASE: u64 = 0x4009_1000;
+            let trace_clksel = MRCC_BASE
+                + if self.is_variant(["MCXA343", "MCXA344"]) {
+                    0x150
+                } else {
+                    0x1A8
+                };
+            let trace_clkdiv = trace_clksel + 4;
+
+            // Preserve a selected source; MUX=3 means no clock.
+            if interface.read_word_32(trace_clksel)? & 0x3 == 0x3 {
+                interface.write_word_32(trace_clksel, 0)?;
+            }
+            // DIV is four bits wide. Clear HALT/RESET without writing reserved bits.
+            let divider = interface.read_word_32(trace_clkdiv)? & 0xF;
+            interface.write_word_32(trace_clkdiv, divider)?;
+            interface.write_word_32(MRCC_BASE + 0x14, 1 << 12)?;
+            interface.write_word_32(MRCC_BASE + 0x54, 1 << 12)?;
         }
 
         interface.flush()?;
@@ -289,6 +380,21 @@ impl MCX {
 }
 
 impl ArmDebugSequence for MCX {
+    /// Compare flash with the FMU's MISR instead of reading the image back.
+    ///
+    /// Restricted to `VARIANT_FMU_MISR`, the parts whose reference manual places the FMU
+    /// register block at 0x4009_5000 and documents the Read into MISR command. Launching a
+    /// flash command at an address that has not been confirmed would write to whatever else
+    /// lives there, so every other MCX part keeps reading the image back until its own
+    /// manual has been checked.
+    fn flash_compare(&self) -> Option<Arc<dyn FlashCompare>> {
+        if self.is_variant(Self::VARIANT_FMU_MISR) {
+            Some(Arc::new(McxMisrCompare))
+        } else {
+            None
+        }
+    }
+
     fn debug_port_start(
         &self,
         interface: &mut dyn DapAccess,
@@ -429,7 +535,11 @@ impl ArmDebugSequence for MCX {
             interface.write_word_32(0x4000_0220, 0xE000)?;
             interface.write_word_32(0x4000_0140, 0xE000)?;
         } else {
-            tracing::warn!("unknown variant, using default watchpoint configuration");
+            // MCXA3's ResetSystem sequence watches the whole flash address range,
+            // rather than the SYSCON accesses used by the other MCXA variants.
+            if !self.is_variant(Self::VARIANT_A3) {
+                tracing::warn!("unknown variant, using default watchpoint configuration");
+            }
             interface.write_word_32(0xE000_1020, 0x0000_0000)?;
             interface.write_word_32(0xE000_1028, 0x0000_0412)?;
             interface.write_word_32(0xE000_1030, 0x000F_FFFF)?;

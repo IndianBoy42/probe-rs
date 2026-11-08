@@ -10,7 +10,6 @@ use probe_rs::{
     Permissions, Session, Target,
     config::{Registry, RegistryError, TargetSelector},
     flashing::{FileDownloadError, FlashError},
-    integration::FakeProbe,
     probe::{
         DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
         WireProtocol,
@@ -176,8 +175,6 @@ pub struct ProbeOptions {
     )]
     pub connect_under_reset: bool,
 
-    #[arg(long, env = "PROBE_RS_DRY_RUN", help_heading = "PROBE CONFIGURATION")]
-    pub dry_run: bool,
     /// Use this flag to allow all memory, including security keys and 3rd party
     /// firmware, to be erased even when it has read-only protection.
     #[arg(
@@ -201,6 +198,11 @@ pub struct ProbeOptions {
     )]
     #[serde(default)]
     pub attach_timeout: Option<Duration>,
+
+    /// Open the serial port to the target. The commands that show target output set it.
+    #[arg(skip)]
+    #[serde(skip)]
+    pub target_serial: bool,
 }
 
 impl ProbeOptions {
@@ -275,7 +277,7 @@ impl<'r> LoadedProbeOptions<'r> {
                 }
             })?;
 
-            TargetSelector::Specified(target)
+            TargetSelector::Specified(Box::new(target))
         } else {
             TargetSelector::Auto
         };
@@ -359,11 +361,7 @@ impl<'r> LoadedProbeOptions<'r> {
 
     /// Attaches to specified probe and configures it.
     pub fn attach_probe(&self, lister: &Lister) -> Result<Probe, OperationError> {
-        let mut probe = if self.0.dry_run {
-            Probe::from_specific_probe(Box::new(FakeProbe::with_mocked_core()))
-        } else {
-            self.open_probe(lister)?
-        };
+        let mut probe = self.open_probe(lister)?;
 
         if let Some(protocol) = self.0.protocol {
             // Select protocol and speed
@@ -409,19 +407,29 @@ impl<'r> LoadedProbeOptions<'r> {
         probe: Probe,
         target: TargetSelector,
     ) -> Result<Session, OperationError> {
+        self.attach_session_with(probe, target, self.0.connect_under_reset)
+    }
+
+    /// Attaches to target device session. Attaches under reset if `under_reset` is set.
+    pub fn attach_session_with(
+        &self,
+        probe: Probe,
+        target: TargetSelector,
+        under_reset: bool,
+    ) -> Result<Session, OperationError> {
         let mut permissions = Permissions::new();
         if self.0.allow_erase_all {
             permissions = permissions.allow_erase_all();
         }
 
-        let session = if self.0.connect_under_reset {
+        let session = if under_reset {
             probe.attach_under_reset_with_registry(target, permissions, self.1)
         } else {
             probe.attach_with_registry(target, permissions, self.1)
         }
         .map_err(|error| OperationError::AttachingFailed {
             source: error,
-            connect_under_reset: self.0.connect_under_reset,
+            connect_under_reset: under_reset,
         })?;
 
         Ok(session)
@@ -429,10 +437,6 @@ impl<'r> LoadedProbeOptions<'r> {
 
     pub(crate) fn connect_under_reset(&self) -> bool {
         self.0.connect_under_reset
-    }
-
-    pub(crate) fn dry_run(&self) -> bool {
-        self.0.dry_run
     }
 
     pub(crate) fn chip(&self) -> Option<String> {
@@ -469,7 +473,11 @@ pub struct CargoOptions {
     /// Escape hatch: all args passed after a sentinel `--` end up here,
     /// unprocessed. Used to pass arguments to cargo not declared in
     /// [CargoOptions].
-    #[arg(hide = true)]
+    ///
+    /// `last = true` keeps these values from being claimed by an earlier
+    /// positional (notably cargo-embed's optional config profile), matching
+    /// cargo-flash and the help text above.
+    #[arg(hide = true, last = true)]
     pub trailing_opts: Vec<String>,
 }
 
@@ -683,77 +691,9 @@ impl From<std::io::Error> for OperationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use probe_rs::probe::{DebugProbe, DebugProbeInfo, ProbeCreationError, ProbeFactory};
+    use crate::util::busy_lister::BusyLister;
+    use probe_rs::integration::FakeProbe;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A probe that another process holds: `open` fails until `free_after`
-    /// attempts have been made.
-    struct BusyLister {
-        info: DebugProbeInfo,
-        attempts: AtomicUsize,
-        free_after: usize,
-        /// The probe answers the open, then faults.
-        faulty: bool,
-    }
-
-    #[derive(Debug)]
-    struct MockProbeFactory;
-
-    impl std::fmt::Display for MockProbeFactory {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("Mocked Probe")
-        }
-    }
-
-    impl ProbeFactory for MockProbeFactory {
-        fn open(
-            &self,
-            _selector: &DebugProbeSelector,
-        ) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-            unreachable!("BusyLister opens FakeProbe directly")
-        }
-
-        fn list_probes(&self) -> Vec<probe_rs::probe::list::ProbeListItem> {
-            Vec::new()
-        }
-    }
-
-    impl std::fmt::Debug for BusyLister {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("BusyLister")
-        }
-    }
-
-    impl probe_rs::integration::ProbeLister for BusyLister {
-        fn open(&self, _selector: &DebugProbeSelector) -> Result<Probe, DebugProbeError> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if self.faulty {
-                return Err(DebugProbeError::ProbeCouldNotBeCreated(
-                    ProbeCreationError::Usb(std::io::Error::other(
-                        "hardware fault or protocol violation",
-                    )),
-                ));
-            }
-            if attempt < self.free_after {
-                return Err(DebugProbeError::ProbeCouldNotBeCreated(
-                    ProbeCreationError::CouldNotOpen,
-                ));
-            }
-            Ok(Probe::from_specific_probe(Box::new(
-                FakeProbe::with_mocked_core(),
-            )))
-        }
-
-        fn list_with_access(
-            &self,
-            _selector: Option<&DebugProbeSelector>,
-        ) -> Vec<probe_rs::probe::list::ProbeListItem> {
-            vec![probe_rs::probe::list::ProbeListItem::accessible(
-                self.info.clone(),
-            )]
-        }
-    }
 
     fn busy_lister(free_after: usize) -> (Arc<BusyLister>, Lister) {
         make_lister(free_after, false)
@@ -764,20 +704,8 @@ mod tests {
     }
 
     fn make_lister(free_after: usize, faulty: bool) -> (Arc<BusyLister>, Lister) {
-        let lister = Arc::new(BusyLister {
-            info: DebugProbeInfo::new(
-                "Mock probe",
-                0x12,
-                0x23,
-                Some("busy_serial".to_owned()),
-                &MockProbeFactory,
-                None,
-                false,
-            ),
-            attempts: AtomicUsize::new(0),
-            free_after,
-            faulty,
-        });
+        let lister = BusyLister::new(free_after, FakeProbe::with_mocked_core());
+        let lister = Arc::new(if faulty { lister.faulty() } else { lister });
 
         struct ArcLister(Arc<BusyLister>);
 
@@ -813,9 +741,9 @@ mod tests {
             probe: None,
             speed: None,
             connect_under_reset: false,
-            dry_run: false,
             allow_erase_all: false,
             attach_timeout,
+            target_serial: false,
         }
     }
 
@@ -830,7 +758,7 @@ mod tests {
             .unwrap();
 
         assert!(options.attach_probe(&handle).is_ok());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(lister.attempts(), 3);
     }
 
     /// The wait cannot repair a probe that faults, so the attach timeout must
@@ -844,7 +772,7 @@ mod tests {
             .unwrap();
 
         assert!(options.attach_probe(&handle).is_err());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(lister.attempts(), 1);
     }
 
     #[test]
@@ -854,7 +782,7 @@ mod tests {
         let options = probe_options(None).load(&mut registry).unwrap();
 
         assert!(options.attach_probe(&handle).is_err());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(lister.attempts(), 1);
     }
 
     #[test]

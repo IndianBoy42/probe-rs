@@ -6,6 +6,7 @@ pub mod usb_util;
 pub mod blackmagic;
 pub mod ch347;
 pub mod cmsisdap;
+#[cfg(any(test, feature = "test"))]
 pub mod fake_probe;
 pub mod ftdi;
 pub mod glasgow;
@@ -17,6 +18,8 @@ mod selector;
 pub mod sifliuart;
 pub mod stlink;
 pub mod swd;
+pub mod target_serial;
+pub mod ti_icdi;
 pub mod wlink;
 pub mod xvc;
 
@@ -41,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, LazyLock};
+use target_serial::TargetSerial;
 
 pub use bits::BitSequence;
 pub use jtag::chain::ChainParams;
@@ -74,6 +78,7 @@ static DRIVERS: LazyLock<RwLock<Vec<&'static dyn ProbeFactory>>> = LazyLock::new
         &glasgow::GlasgowFactory,
         &ch347::Ch347Factory,
         &xvc::XvcFactory,
+        &ti_icdi::IcdiFactory,
     ];
 
     RwLock::new(probes)
@@ -117,6 +122,13 @@ impl std::str::FromStr for WireProtocol {
             )),
         }
     }
+}
+
+/// Sends a line reset, the SWJ-DP SWD to JTAG switch sequence and a TAP reset.
+fn switch_swd_to_jtag(wire: &mut dyn DebugPortWire) -> Result<(), ArmError> {
+    wire.swj_sequence(&BitSequence::from_u64(51, (1 << 51) - 1))?;
+    wire.swj_sequence(&BitSequence::from_u64(16, 0xE73C))?;
+    wire.swj_sequence(&BitSequence::from_u64(6, 0x3F))
 }
 
 /// Marker trait for all probe errors.
@@ -211,6 +223,9 @@ pub enum DebugProbeError {
     /// Failed to find or attach to the target. Please check the wiring before retrying.
     TargetNotFound,
 
+    /// The reset line of the probe cannot be used: `reset_line_connected` is false for this probe.
+    ResetLineNotConnected,
+
     /// The '{function_name}' functionality is not implemented yet.
     ///
     /// The variant of the function you called is not yet implemented.
@@ -282,6 +297,46 @@ impl<T: ProbeError> From<T> for ProbeCreationError {
     }
 }
 
+/// The `reset_line_connected` setting of a probe.
+///
+/// A probe driver keeps one, and checks it before it asserts the reset line. Release and read
+/// of the reset line stay possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetLine {
+    connected: bool,
+}
+
+impl Default for ResetLine {
+    fn default() -> Self {
+        Self { connected: true }
+    }
+}
+
+impl ResetLine {
+    /// Sets whether the reset line is connected to the target.
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
+    }
+
+    /// Fails if the reset line is not connected.
+    pub fn check_assert(&self) -> Result<(), DebugProbeError> {
+        if self.connected {
+            Ok(())
+        } else {
+            Err(DebugProbeError::ResetLineNotConnected)
+        }
+    }
+
+    /// Fails if the reset line is not connected and the pins drive nRESET low.
+    pub fn check_pins(&self, out: swd::Pins, select: swd::Pins) -> Result<(), DebugProbeError> {
+        if select.nreset() && !out.nreset() {
+            self.check_assert()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// The Probe struct is a generic wrapper over the different
 /// probes supported.
 ///
@@ -309,10 +364,7 @@ pub struct Probe {
 impl Probe {
     /// Create a new probe from a more specific probe driver.
     pub fn new(probe: impl DebugProbe + 'static) -> Self {
-        Self {
-            inner: Box::new(probe),
-            attached: false,
-        }
+        Self::from_specific_probe(Box::new(probe))
     }
 
     pub(crate) fn from_attached_probe(probe: Box<dyn DebugProbe>) -> Self {
@@ -328,6 +380,13 @@ impl Probe {
             inner: probe,
             attached: false,
         }
+    }
+
+    /// Sets whether the reset line of the probe is connected to the target. If it is not,
+    /// all operations that assert the reset line fail. See
+    /// [`DebugProbe::set_reset_line_connected`].
+    pub fn set_reset_line_connected(&mut self, connected: bool) {
+        self.inner.set_reset_line_connected(connected);
     }
 
     /// Get the human readable name for the probe.
@@ -376,6 +435,16 @@ impl Probe {
     pub fn attach_to_unspecified(&mut self) -> Result<(), Error> {
         self.inner.attach()?;
         self.attached = true;
+
+        // A debug port with SWJ pin switching that an earlier session left in SWD mode keeps
+        // its JTAG TAPs off TDO, so the scan below would find an empty chain. The switch
+        // sequence never enters a Capture or Update state, so JTAG-only TAPs ignore it.
+        if self.protocol() == Some(WireProtocol::Jtag)
+            && self.inner.try_as_jtag_chain_access_mut().is_some()
+            && let Err(error) = self.with_debug_port_wire(switch_swd_to_jtag)
+        {
+            tracing::debug!("Unable to send the SWD to JTAG switch sequence: {error}");
+        }
 
         // A JTAG consumer needs the padding parameters of a TAP. Select the first one, so that a
         // caller that does not know the chain can access the target. A chain that is not visible
@@ -575,24 +644,25 @@ impl Probe {
             return Err((self, DebugProbeError::NotAttached.into()));
         }
 
-        match self.inner.try_get_arm_debug_interface(sequence.clone()) {
-            Ok(interface) => Ok(interface),
+        let interface = match self.inner.try_get_arm_debug_interface(sequence.clone()) {
+            Ok(interface) => interface,
             Err((probe, err)) => match probe.try_as_swd_probe() {
                 Ok(swd_probe) => {
                     let settings = swd_probe.swd_settings();
                     // A probe that answers WAIT itself paces the transfers, the
                     // others need overrun detection for stable communication.
                     let use_overrun_detect = !swd_probe.handles_wait();
-                    Ok(ArmCommunicationInterface::create_swd(
+                    ArmCommunicationInterface::create_swd(
                         swd_probe,
                         settings,
                         sequence,
                         use_overrun_detect,
-                    ))
+                    )
                 }
-                Err(probe) => Err((Probe::from_attached_probe(probe), err)),
+                Err(probe) => return Err((Probe::from_attached_probe(probe), err)),
             },
-        }
+        };
+        Ok(interface)
     }
 
     /// Check if the probe has an interface to debug RISC-V chips.
@@ -644,6 +714,13 @@ impl Probe {
         self.inner.get_swo_interface_mut()
     }
 
+    /// Takes the serial port to the target, if the probe has one.
+    ///
+    /// Call this before attach. The port is not open yet.
+    pub fn target_serial(&mut self) -> Option<Box<dyn TargetSerial>> {
+        self.inner.target_serial()
+    }
+
     /// Try reading the target voltage of via the connected voltage pin.
     ///
     /// This does not work on all probes.
@@ -651,9 +728,9 @@ impl Probe {
         self.inner.get_target_voltage()
     }
 
-    /// Try to convert the probe into a concrete probe type.
-    pub fn try_into<P: DebugProbe>(&mut self) -> Option<&mut P> {
-        (self.inner.as_mut() as &mut dyn Any).downcast_mut::<P>()
+    /// Returns the probe driver. Downcast it through [`Any`] to use a specific driver's own API.
+    pub fn driver_mut(&mut self) -> &mut dyn DebugProbe {
+        self.inner.as_mut()
     }
 }
 
@@ -743,6 +820,15 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     /// This should deassert the reset pin of the target via debug probe.
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError>;
 
+    /// Tells the probe that its reset line is connected to the target, or not.
+    ///
+    /// If `connected` is false, the probe must not assert its reset line:
+    /// [`DebugProbe::target_reset`], [`DebugProbe::target_reset_assert`] and pin operations that
+    /// drive nRESET low fail with [`DebugProbeError::ResetLineNotConnected`]. Use [`ResetLine`]
+    /// for these checks. A probe that does not use its reset line by default can use it after
+    /// this is called with `true`.
+    fn set_reset_line_connected(&mut self, connected: bool);
+
     /// Selects the transport protocol to be used by the debug probe.
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError>;
 
@@ -824,6 +910,13 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
         None
     }
 
+    /// Creates a handle to the serial port to the target, if the probe has one.
+    ///
+    /// The handle is not open, and it does not depend on the probe.
+    fn target_serial(&mut self) -> Option<Box<dyn TargetSerial>> {
+        None
+    }
+
     /// Boxes itself.
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe>;
 
@@ -833,11 +926,16 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     }
 
     /// Convert this probe into a layer-0 SWD probe, if it implements [`SwdProbe`].
+    ///
+    /// A probe in JTAG mode refuses, so that the caller uses the JTAG transport.
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
         Err(self.into_probe())
     }
 
     /// Borrow this probe as a layer-0 SWD probe, if it implements [`SwdProbe`].
+    ///
+    /// A probe in JTAG mode may return itself, to run SWJ sequences and pin operations on the
+    /// JTAG pins.
     fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
         None
     }
@@ -884,6 +982,12 @@ pub struct DebugProbeInfo {
     /// This is a composite HID device.
     pub is_hid_interface: bool,
 
+    /// USB bus ID and device address, if known.
+    ///
+    /// Tells identical probes (same VID/PID, no serial number) apart while they stay plugged
+    /// in. It is not part of the string form of a [`DebugProbeSelector`].
+    pub usb_location: Option<(String, u8)>,
+
     /// A reference to the [`ProbeFactory`] that created this info object.
     probe_factory: &'static dyn ProbeFactory,
 }
@@ -928,6 +1032,7 @@ impl DebugProbeInfo {
             probe_factory,
             interface,
             is_hid_interface,
+            usb_location: None,
         }
     }
 
@@ -1148,5 +1253,28 @@ mod test {
 
         assert!(probe_info.is_probe_type::<ftdi::FtdiProbeFactory>());
         assert!(!probe_info.is_probe_type::<jlink::JLinkFactory>());
+    }
+
+    #[test]
+    fn reset_line_blocks_only_asserts() {
+        let mut nreset = swd::Pins(0);
+        nreset.set_nreset(true);
+        let low = swd::Pins(0);
+        let mut line = ResetLine::default();
+        line.check_assert().unwrap();
+        line.check_pins(low, nreset).unwrap();
+
+        line.set_connected(false);
+        assert!(matches!(
+            line.check_assert(),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        assert!(matches!(
+            line.check_pins(low, nreset),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        // Release, and pins without nRESET, stay possible.
+        line.check_pins(nreset, nreset).unwrap();
+        line.check_pins(low, low).unwrap();
     }
 }

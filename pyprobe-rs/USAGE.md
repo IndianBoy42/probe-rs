@@ -23,7 +23,7 @@ underlying mechanism being used — a probe-rs RPC endpoint on the managed
 - [Core dumps](#core-dumps)
 - [Error handling](#error-handling)
 - [Enums](#enums)
-- [Testing without hardware](#testing-without-hardware)
+- [Testing and hardware requirements](#testing-and-hardware-requirements)
 - [Asyncio](#asyncio)
 - [Python ↔ RPC API mapping](#python--rpc-api-mapping)
 
@@ -80,11 +80,9 @@ rules explain every surprising behavior:
    previous kernel). Foreign servers (spawned by another client, or a remote
    host) are never restarted; their `ProbeBusy` error names the fix.
 
-`FakeProbe` is still consumed once (`into_probe()` / `Probe.from_fake()`),
-but the resulting attach is now a **server-side dry run**: the server swaps in
-its own fake probe and claims no device. The direct form is
-`Session.auto_attach(chip, dry_run=True)` (see
-[Testing without hardware](#testing-without-hardware)).
+`FakeProbe` is still consumed once (`into_probe()` / `Probe.from_fake()`) and
+yields a local handle, but its `attach()` raises: the RPC protocol has no
+fake-probe attach (see [Testing and hardware requirements](#testing-and-hardware-requirements)).
 
 ## Server lifecycle
 
@@ -173,6 +171,7 @@ import pyprobe_rs as pr
 probes = pr.list_probes()                  # -> list[ProbeInfo]
 for p in probes:
     print(p.vid, p.pid, p.serial, p.identifier, p.probe_type, p.inaccessible)
+    print(p.usb_location)                  # ("1-2", 5) or None
 
 probe = probes[0].open()                   # local handle, or a server-side selector
 # or by selector:
@@ -201,6 +200,11 @@ handle, so probe-level calls (`set_speed`, `get_name`, …) raise, but
 With no server active, probes are listed locally and `open()` returns a real
 local handle; those entries always report `probe_type == ""` and
 `inaccessible == False`. Listing probes never starts a server.
+
+`usb_location` is the probe's USB bus ID and device address. Two probes can
+share a VID/PID (clones, or two interfaces of one probe); the location is what
+tells them apart, and it is what the server uses to pick one when several
+entries are otherwise identical.
 
 `get_name()` returns the debug-formatted descriptor of the underlying probe —
 a long USB dump on CMSIS-DAP probes. Use `ProbeInfo.identifier` for a short
@@ -576,12 +580,9 @@ pr.download_file(sess, "fw.elf", "elf", opts)
 
 Two options changed meaning under the RPC facade:
 
-- `opts.dry_run` is no longer a per-download switch — the server derives
-  dry-run behavior from the *session* (attach with
-  `Session.auto_attach(..., dry_run=True)`). Setting it now raises
-  `ValueError` instead of being silently ignored on a destructive
-  operation. Dry-run sessions also skip the boot step (the mocked core
-  cannot run a boot sequence).
+- `opts.dry_run` has no wire form at all: probe-rs removed dry runs, so a
+  download cannot be simulated. Setting it raises `ValueError` instead of
+  being silently ignored on a destructive operation.
 - `opts.preverify` is implemented client-side: the image is verified first
   and the write is skipped when it already matches flash.
 
@@ -860,7 +861,7 @@ All enums live at module level and support `==` comparison:
 | `WireProtocol` | `Swd`, `Jtag` | `probe_rs::probe::WireProtocol` |
 | `Architecture` | `Arm`, `Riscv`, `Xtensa` | `probe_rs_target::Architecture` |
 | `CoreType` | `Armv6m`, `Armv7a`, `Armv7r`, `Armv7m`, `Armv7em`, `Armv8a`, `Armv8m`, `Riscv`, `Riscv64`, `Xtensa` | `probe_rs_target::CoreType` |
-| `InstructionSet` | `Thumb2`, `A32`, `A64`, `RV32`, `RV32C`, `RV64`, `RV64C`, `Xtensa` | `probe_rs_target::InstructionSet` |
+| `InstructionSet` | `Thumb2`, `A32`, `A64`, `RV32`, `RV32C`, `RV32F`, `RV32FC`, `RV64`, `RV64C`, `RV64F`, `RV64FC`, `Xtensa` | `probe_rs_target::InstructionSet` (RISC-V carries `xlen`, `c`, `f`) |
 | `Endian` | `Little`, `Big` | `probe_rs_target::Endian` (unused: `core.endianness()` raises) |
 | `ChannelMode` | `NoBlockSkip`, `NoBlockTrim`, `BlockIfFull` | `rtt::ChannelMode` (attach-time only) |
 | `VectorCatchCondition` | `HardFault`, `CoreReset`, `SecureFault`, `All`, `Svc`, `Hlt` | `VectorCatchCondition` (enable only) |
@@ -868,42 +869,41 @@ All enums live at module level and support `==` comparison:
 | `HaltKind` | `Breakpoint`, `Watchpoint`, `Step`, `Request`, `External`, `Exception`, `Multiple`, `Unknown` | `HaltReason` |
 | `TraceSink` | `Swo`, `Tpiu`, `TraceMemory` | accepted by `setup_tracing`, which then raises |
 
-## Testing without hardware
+## Testing and hardware requirements
 
-Two equivalent dry-run paths — the server swaps in its own fake probe and
-claims no device or probe lease:
+Every session is RPC-managed, and the RPC protocol has **no fake-probe
+attach**: probe-rs removed `--dry-run` and the `dry_run` field of the attach
+request. `dry_run` is therefore rejected explicitly instead of being silently
+ignored:
 
 ```python
-# explicit FakeProbe (consumes the FakeProbe):
-fp = pr.FakeProbe.with_mocked_core()            # or pr.FakeProbe.new()
-sess = pr.Probe.from_fake(fp).attach("Cortex-M4", pr.Permissions())
-
-# direct dry-run attach:
-sess = pr.Session.auto_attach("Cortex-M4", dry_run=True)
-
-core = sess.core(0)
-core.halt(1000)
-core.write_word_32(0x2000_0000, 0xDEADBEEF)
+pr.Session.auto_attach("Cortex-M4", dry_run=True)
+# ProbeRsError: kind == "NotImplemented"
 ```
 
-What the mock covers: control flow, 8/32/64-bit memory access, registers,
-error paths. What it does not: flash or RTT contents (there is no RTT control
-block, so `attach_rtt` fails cleanly), and **16-bit accesses panic inside the
-mock** — the server drops the connection and you get `ServerGone`; a fresh
-attach recovers. `reset`/`reset_and_halt` support is state-dependent on the
-mock; failures are clean classified errors, never dead connections.
+`pr.FakeProbe` still builds a local `probe-rs` fake probe (`Probe.from_fake()`
+or `FakeProbe.into_probe()`) and probe-level calls on it work, but `attach()`
+raises the same error — there is no server-side fake session to attach to.
 
-Two pytest suites cover the no-hardware surface:
+So a test either exercises the API surface (no session) or needs a DUT:
 
-- `tests/test_smoke.py` — binding smoke: targets, registry, dry-run attach,
-  memory/register round trips, options, coredump round trip.
-- `tests/test_rpc_lifecycle.py` — spawns a **real `probe-rs serve`** and
-  drives dry-run sessions through the lifecycle: idempotent `open()`,
-  `close()`/`close_all()` fail-fast, `ServerGone` recovery, RTT and debug
-  surface shapes, and the asyncio wrapper.
+- `tests/test_smoke.py` — pure API surface: version, targets and registry,
+  enum proxies, option defaults, and the dry-run rejection contract. The
+  session-dependent contracts (register aliases/widths, `setup_tracing`
+  argument checking, format validation, coredump round trip) take the
+  probe-gated `session` fixture.
+- `tests/test_rpc_lifecycle.py` — spawns a **real `probe-rs serve`**:
+  idempotent `open()`, `dry_run` rejection, `close()`/`close_all()`
+  fail-fast, dropping a session without `close()`, the asyncio wrapper.
+  Session tests are probe-gated.
+- `tests/test_hil.py` — the hardware matrix (core, memory, registers,
+  breakpoints, flash, RTT, DWARF, remote loopback, soak).
+
+Session tests read `PYPROBE_RS_PY_HIL_CONFIG` from `tests/conftest.py` and
+skip without it, so a plain run stays hardware-free:
 
 ```bash
-uv run pytest tests/        # no hardware needed; uses the embedded server when present
+uv run pytest tests/        # hardware-free subset; session tests skip
 ```
 
 ```bash
@@ -964,7 +964,7 @@ Endpoints marked *direct* are local probe-rs calls that bypass the server;
 | `pr.list_probes()` | `probe/list` (server view) or direct `Lister::list_all()` when no server is active |
 | `pr.Lister().open(sel)` / `ProbeInfo.open()` | direct `Lister::open(DebugProbeSelector)` / `DebugProbeInfo::open()` |
 | `Probe.attach()` / `.attach_under_reset()` | `probe/attach` (prefers that probe's selector; local USB handle released first) |
-| `pr.Session.auto_attach(..., dry_run=True)` | `probe/attach` with `dry_run` (server swaps in a fake probe) |
+| `pr.Session.auto_attach(..., dry_run=True)` | none — raises `NotImplemented` (the protocol has no fake-probe attach) |
 | `pr.Session.auto_attach(..., wait_for_probe=s)` | `probe/attach` with `wait_for_probe` (probe lease queue) |
 | `sess.core(i)` / `sess.list_cores()` | `target/metadata` (attach-time metadata; index checked client-side) |
 | `sess.target()` / `sess.architecture()` | direct local `config::Registry` lookup by metadata target name |
@@ -1011,6 +1011,6 @@ Endpoints marked *direct* are local probe-rs calls that bypass the server;
 | `pr.CoreDump.load()` / `.store()` | direct local ELF-coredump file I/O |
 | `pr.list_targets()` / `pr.get_target_by_name()` / `pr.Registry` | direct local `config::Registry` |
 | `pr.SessionConfig` / `pr.Permissions` | fields of the `probe/attach` request |
-| `pr.FakeProbe` / `Probe.from_fake()` | `probe/attach` with `dry_run` |
+| `pr.FakeProbe` / `Probe.from_fake()` | local `probe_rs::probe::fake_probe` handle only; `attach()` raises `NotImplemented` |
 | `pr.aio(obj)` / `obj.aio` | pure-Python executor wrapper (no RPC) |
 | `pr.ProbeRsError` | bridge error taxonomy + server `RpcError` strings (as `.kind`) |

@@ -7,7 +7,7 @@
 
 use probe_rs_rpc::core_ops::{
     WireBreakpointCause, WireCoreStatus, WireCoreType, WireHaltReason, WireInstructionSet,
-    WireRegisterId, WireRegisterValue, WireSteppingMode, WireVectorCatchCondition,
+    WireRegisterId, WireRegisterValue, WireSteppingMode, WireVectorCatchCondition, WireXlen,
 };
 use probe_rs_rpc_client::{ClientError, CoreInterface, SessionInterface};
 use pyo3::prelude::*;
@@ -68,8 +68,14 @@ fn registers_for(
         WireInstructionSet::Thumb2 => probe_rs::CoreType::Armv7m,
         WireInstructionSet::A32 => probe_rs::CoreType::Armv7a,
         WireInstructionSet::A64 => probe_rs::CoreType::Armv8a,
-        WireInstructionSet::RV32 | WireInstructionSet::RV32C => probe_rs::CoreType::Riscv,
-        WireInstructionSet::RV64 | WireInstructionSet::RV64C => probe_rs::CoreType::Riscv64,
+        WireInstructionSet::Riscv {
+            xlen: WireXlen::X32,
+            ..
+        } => probe_rs::CoreType::Riscv,
+        WireInstructionSet::Riscv {
+            xlen: WireXlen::X64,
+            ..
+        } => probe_rs::CoreType::Riscv64,
         WireInstructionSet::Xtensa => probe_rs::CoreType::Xtensa,
     };
     CoreRegisters::for_core_type(
@@ -83,7 +89,11 @@ fn registers_for(
 fn instruction_set_is_64_bit(instruction_set: WireInstructionSet) -> bool {
     matches!(
         instruction_set,
-        WireInstructionSet::A64 | WireInstructionSet::RV64 | WireInstructionSet::RV64C
+        WireInstructionSet::A64
+            | WireInstructionSet::Riscv {
+                xlen: WireXlen::X64,
+                ..
+            }
     )
 }
 
@@ -132,10 +142,14 @@ pub(crate) fn wire_instruction_set_to_local(
         WireInstructionSet::Thumb2 => I::Thumb2,
         WireInstructionSet::A32 => I::A32,
         WireInstructionSet::A64 => I::A64,
-        WireInstructionSet::RV32 => I::RV32,
-        WireInstructionSet::RV32C => I::RV32C,
-        WireInstructionSet::RV64 => I::RV64,
-        WireInstructionSet::RV64C => I::RV64C,
+        WireInstructionSet::Riscv { xlen, c, f } => I::Riscv {
+            xlen: match xlen {
+                WireXlen::X32 => probe_rs_target::Xlen::X32,
+                WireXlen::X64 => probe_rs_target::Xlen::X64,
+            },
+            c,
+            f,
+        },
         WireInstructionSet::Xtensa => I::Xtensa,
     }
 }
@@ -405,10 +419,10 @@ impl CoreHandle {
             return Ok((WireRegisterId(reg.id().0), Some(reg.size_in_bits() as u32)));
         }
         for (alias, role) in ROLE_ALIASES {
-            if alias.eq_ignore_ascii_case(&name) {
-                if let Some(reg) = role_register(regs, *role) {
-                    return Ok((WireRegisterId(reg.id().0), Some(reg.size_in_bits() as u32)));
-                }
+            if alias.eq_ignore_ascii_case(&name)
+                && let Some(reg) = role_register(regs, *role)
+            {
+                return Ok((WireRegisterId(reg.id().0), Some(reg.size_in_bits() as u32)));
             }
         }
         Err(unknown_register(&name, regs))
@@ -982,14 +996,14 @@ impl CoreHandle {
             .collect();
         let mut seen: HashSet<String> = out.iter().map(|r| r.name.clone()).collect();
         for (alias, role) in ROLE_ALIASES {
-            if let Some(reg) = role_register(regs, *role) {
-                if seen.insert((*alias).to_string()) {
-                    out.push(CoreRegisterInfo {
-                        name: (*alias).to_string(),
-                        id: reg.id().0,
-                        size_in_bits: reg.size_in_bits() as u32,
-                    });
-                }
+            if let Some(reg) = role_register(regs, *role)
+                && seen.insert((*alias).to_string())
+            {
+                out.push(CoreRegisterInfo {
+                    name: (*alias).to_string(),
+                    id: reg.id().0,
+                    size_in_bits: reg.size_in_bits() as u32,
+                });
             }
         }
         Ok(out)

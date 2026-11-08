@@ -346,14 +346,6 @@ pub(crate) const MSTATUS: CoreRegister = CoreRegister {
     unwind_rule: UnwindRule::Preserve,
 };
 
-pub(crate) const SEPC: CoreRegister = CoreRegister {
-    roles: &[RegisterRole::Core("sepc")],
-    id: RegisterId(0x141),
-    dwarf_id: Some(DWARF_CSR_BASE + 0x141),
-    data_type: RegisterDataType::UnsignedInteger(32),
-    unwind_rule: UnwindRule::Preserve,
-};
-
 // ── Floating-point CSRs (32-bit in both RV32 and RV64) ───────────────────────
 
 pub(crate) const FFLAGS: CoreRegister = CoreRegister {
@@ -775,6 +767,16 @@ pub(crate) const FT11: CoreRegister = CoreRegister {
 pub static RISCV_CORE_REGISTERS: LazyLock<CoreRegisters> =
     LazyLock::new(|| CoreRegisters::new(RISCV_COMMON_REGS_SET.iter().collect::<Vec<_>>()));
 
+/// The RISCV core registers of an RV32E core, which only has x0-x15.
+pub static RISCV_RV32E_CORE_REGISTERS: LazyLock<CoreRegisters> = LazyLock::new(|| {
+    CoreRegisters::new(
+        RISCV_COMMON_REGS_SET[..16]
+            .iter()
+            .chain(&RISCV_COMMON_REGS_SET[32..])
+            .collect(),
+    )
+});
+
 /// The RISCV core registers with FPU (RV32).
 pub static RISCV_WITH_FP_CORE_REGISTERS: LazyLock<CoreRegisters> = LazyLock::new(|| {
     CoreRegisters::new(
@@ -788,7 +790,7 @@ pub static RISCV_WITH_FP_CORE_REGISTERS: LazyLock<CoreRegisters> = LazyLock::new
 // Non-FPU registers
 static RISCV_COMMON_REGS_SET: &[CoreRegister] = &[
     ZERO, RA, SP, GP, TP, T0, T1, T2, FP, S1, A0, A1, A2, A3, A4, A5, A6, A7, S2, S3, S4, S5, S6,
-    S7, S8, S9, S10, S11, T3, T4, T5, T6, PC, MEPC, MCAUSE, MSTATUS, SEPC,
+    S7, S8, S9, S10, S11, T3, T4, T5, T6, PC, MEPC, MCAUSE, MSTATUS,
 ];
 
 // FPU registers
@@ -797,3 +799,21 @@ static RISCV_WITH_FP_REGS_SET: &[CoreRegister] = &[
     FA4, FA5, FA6, FA7, FS2_FP, FS3_FP, FS4_FP, FS5_FP, FS6_FP, FS7_FP, FS8_FP, FS9_FP, FS10_FP,
     FS11_FP, FT8, FT9, FT10, FT11,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rv32e_has_no_registers_above_x15() {
+        let ids: Vec<_> = RISCV_RV32E_CORE_REGISTERS
+            .all_registers()
+            .map(|r| r.id())
+            .collect();
+        assert!(!ids.contains(&A6.id()));
+        assert!(!ids.contains(&T6.id()));
+        assert!(ids.contains(&A5.id()));
+        assert!(ids.contains(&PC.id()));
+        assert_eq!(RISCV_CORE_REGISTERS.all_registers().count() - ids.len(), 16);
+    }
+}

@@ -8,7 +8,7 @@ use crate::probe::{ChainParams, DebugProbe, DebugProbeError, JtagChainState, Wir
 use super::{BitSequence, BitbangJtag, JtagBatch, TapState, run_bitbang_batch};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum RegisterState {
+pub(crate) enum RegisterState {
     Select,
     Capture,
     Shift,
@@ -51,7 +51,7 @@ impl RegisterState {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum OldJtagState {
+pub(crate) enum OldJtagState {
     Reset,
     Idle,
     Dr(RegisterState),
@@ -89,7 +89,7 @@ impl OldJtagState {
         Some(tms)
     }
 
-    fn update(&mut self, tms: bool) {
+    pub(crate) fn update(&mut self, tms: bool) {
         *self = match *self {
             Self::Reset if tms => Self::Reset,
             Self::Reset => Self::Idle,
@@ -300,6 +300,8 @@ impl DebugProbe for GoldenRecorder {
         })
     }
 
+    fn set_reset_line_connected(&mut self, _connected: bool) {}
+
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
         Ok(())
     }
@@ -468,6 +470,23 @@ fn record_reset() -> Vec<(bool, bool, bool)> {
         .shift_bits(tms, tdi, std::iter::repeat(false))
         .unwrap();
     recorder.take_triples()
+}
+
+/// A batch that clocks TCK in every stable state.
+pub(crate) fn clock_in_every_stable_state() -> JtagBatch {
+    let mut batch = JtagBatch::new();
+    for state in [
+        TapState::TestLogicReset,
+        TapState::RunTestIdle,
+        TapState::ShiftIr,
+        TapState::ShiftDr,
+        TapState::PauseIr,
+        TapState::PauseDr,
+    ] {
+        batch.enter(state);
+        batch.clock(3);
+    }
+    batch
 }
 
 /// The bit-bang lowering of any batch, as (TMS, TDI, capture) per clock.

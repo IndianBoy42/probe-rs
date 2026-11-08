@@ -266,11 +266,11 @@ impl SessionConfig {
             speed: self.speed,
             connect_under_reset: self.connect_under_reset,
             cycle_power: false,
-            dry_run: false,
             allow_erase_all: self.allow_erase_all,
             attach_timeout: self
                 .attach_timeout
                 .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+            target_serial: false,
         }
     }
 }

@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use super::DataSizeSetup;
 
 use crate::architecture::arm::{
     ArmError, DapAccess, FullyQualifiedApAddress,
@@ -12,7 +13,7 @@ use crate::architecture::arm::{
 ///
 /// The memory AP can be used to access a memory-mapped
 /// set of debug resources of the attached system.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AmbaApb4Apb5 {
     address: FullyQualifiedApAddress,
     csw: CSW,
@@ -25,8 +26,9 @@ impl AmbaApb4Apb5 {
         probe: &mut P,
         address: FullyQualifiedApAddress,
     ) -> Result<Self, ArmError> {
-        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
+        // Read CSW last, so the CSW write below needs no change of register bank.
         let cfg = probe.read_raw_ap_register(&address, CFG::ADDRESS)?;
+        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
 
         let (csw, cfg) = (csw.try_into()?, cfg.try_into()?);
 
@@ -47,6 +49,17 @@ impl super::MemoryApType for AmbaApb4Apb5 {
         self.csw = probe.read_ap_register(self)?;
         Ok(self.csw)
     }
+
+    fn datasize_setup(&self, data_size: DataSize) -> Result<DataSizeSetup, ArmError> {
+        match data_size {
+            DataSize::U32 => Ok(DataSizeSetup::Ready),
+            _ => Err(ArmError::UnsupportedTransferWidth(
+                data_size.to_byte_count() * 8,
+            )),
+        }
+    }
+
+    fn note_datasize(&mut self, _data_size: DataSize) {}
 
     fn try_set_datasize<P: ApAccess + ?Sized>(
         &mut self,

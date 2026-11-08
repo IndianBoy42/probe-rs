@@ -124,15 +124,19 @@ Every failure raises `pr.ProbeRsError` with a `.kind` attribute and a message
 that states the one-line fix: `"ProbeBusy"`, `"ServerGone"`, `"Connection"`,
 `"ServerVersion"`, `"Timeout"`, `"Flash"`, `"Rtt"`, `"Register"`, …
 
-## Testing without hardware
+## Testing
 
-```python
-probe = pr.Probe.from_fake(pr.FakeProbe.with_mocked_core())
-sess = probe.attach("Cortex-M4", pr.Permissions())   # server-side dry run
+Sessions are RPC-managed and the protocol has no fake-probe attach (probe-rs
+removed dry runs), so `Session.auto_attach(..., dry_run=True)` raises
+`ProbeRsError` with `kind == "NotImplemented"`.
+
+`uv run pytest tests/` runs the hardware-free API tests and skips the session
+tests. Session and hardware tests read `PYPROBE_RS_PY_HIL_CONFIG` (a DUT TOML
+in the smoke-tester schema):
+
+```bash
+PYPROBE_RS_PY_HIL_CONFIG=/path/to/dut.toml uv run pytest tests/ -m hil
 ```
-
-The no-hardware suite: `uv run pytest tests/` (spawns a real server, dry-run
-sessions; see `tests/test_rpc_lifecycle.py`).
 
 See [USAGE.md](USAGE.md) for the complete guide: configuration, registers,
 breakpoints, flashing options and progress callbacks, RTT streaming, the DWARF

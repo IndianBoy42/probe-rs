@@ -46,7 +46,7 @@ use crate::{
         },
         traits::DebugPortWire,
     },
-    config::CoreExt,
+    config::MemoryApExt,
     probe::BitSequence,
     probe::swd::Port,
 };
@@ -110,7 +110,7 @@ const CPUSS_AP_CTL_ENABLE: u32 = 0x0000_53F7;
 bitfield! {
     /// SRSS soft reset control register payload.
     #[derive(Clone, Copy)]
-    struct SrssResSoftCtl(u32);
+    struct SrssResSoftCtl(pub u32);
     impl Debug;
 
     pub trig_soft, set_trig_soft: 0;
@@ -465,6 +465,7 @@ impl ArmDebugSequence for PsocC3X7X8 {
         interface: &mut dyn ArmDebugInterface,
         core_ap: &FullyQualifiedApAddress,
         core_type: probe_rs_target::CoreType,
+        target: &mut crate::Target,
     ) -> Result<(), ArmError> {
         if let Some(core_index) = self.ppca_core_index(core_ap) {
             self.ppca_acquire(interface, core_index, false)
@@ -472,7 +473,7 @@ impl ArmDebugSequence for PsocC3X7X8 {
                     tracing::warn!("PSoC C3 x7/x8: ppca_acquire for Core{core_index} failed: {e}");
                 })
         } else {
-            DefaultArmSequence(()).on_attach(interface, core_ap, core_type)
+            DefaultArmSequence(()).on_attach(interface, core_ap, core_type, target)
         }
     }
 

@@ -18,7 +18,8 @@ use super::board::Drive;
 use super::device::Ch347Device;
 
 pub(super) const TIMEOUT: Duration = Duration::from_millis(500);
-/// A full round at the slowest clock takes under a second.
+/// A full round at the slowest clock takes under a second. The chip takes the frames of a
+/// round only as fast as it clocks them out.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Long enough for a reply already in the chip to arrive.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(20);
@@ -49,15 +50,19 @@ pub(crate) enum Ch347Error {
     BatchTooLarge,
     #[error("the reset GPIO did not switch to {0:?}")]
     Reset(Drive),
-    #[error("target reset needs a board with a reset GPIO; this is a generic CH347")]
+    #[error("the probe has no reset line: name the reset pin in the driver settings")]
     NoResetPin,
+    #[error("the reset line is on the TRST pin, which JTAG drives: use SWD")]
+    ResetOnTrst,
+    #[error("GPIO{0} is the LED of the board, not a reset line")]
+    ResetPinIsLed(usize),
 }
 
 impl ProbeError for Ch347Error {}
 
 /// The bulk pipe pair of the chip's vendor interface.
 pub(crate) trait Transport: Debug + Send {
-    fn write(&mut self, data: &[u8]) -> io::Result<()>;
+    fn write(&mut self, data: &[u8], timeout: Duration) -> io::Result<()>;
     /// Reads one transfer of at most the buffer's length and returns its length.
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
 }
@@ -97,8 +102,8 @@ impl UsbTransport {
 }
 
 impl Transport for UsbTransport {
-    fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let written = self.out.write_bulk(data, TIMEOUT)?;
+    fn write(&mut self, data: &[u8], timeout: Duration) -> io::Result<()> {
+        let written = self.out.write_bulk(data, timeout)?;
         if written == data.len() {
             Ok(())
         } else {
@@ -130,7 +135,7 @@ impl Ch347Device {
         payload: &[u8],
         reply_len: usize,
     ) -> Result<Vec<u8>, DebugProbeError> {
-        self.send(&frame(command, payload))?;
+        self.send(&frame(command, payload), TIMEOUT)?;
 
         let mut reply = vec![0; HEADER_LEN + reply_len];
         let len = self.read_transfer(&mut reply, TIMEOUT)?;
@@ -158,7 +163,7 @@ impl Ch347Device {
         frames: &[u8],
         replies: &[(u8, usize)],
     ) -> Result<Vec<u8>, DebugProbeError> {
-        self.send(frames)?;
+        self.send(frames, ROUND_TIMEOUT)?;
 
         let total = replies.iter().map(|(_, len)| HEADER_LEN + len).sum();
         let mut stream = vec![0; total];
@@ -186,12 +191,12 @@ impl Ch347Device {
     }
 
     /// Writes `data` unless the reply stream is out of sync.
-    fn send(&mut self, data: &[u8]) -> Result<(), DebugProbeError> {
+    fn send(&mut self, data: &[u8], timeout: Duration) -> Result<(), DebugProbeError> {
         if self.out_of_sync {
             return Err(Ch347Error::OutOfSync.into());
         }
         tracing::trace!("> {data:02x?}");
-        self.transport.write(data).map_err(|e| {
+        self.transport.write(data, timeout).map_err(|e| {
             self.out_of_sync = true;
             DebugProbeError::Usb(e)
         })

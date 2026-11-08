@@ -1139,42 +1139,19 @@ mod test {
     };
     use probe_rs::{
         architecture::arm::FullyQualifiedApAddress,
-        integration::{FakeProbe, Operation},
-        probe::{DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeFactory},
+        integration::{FakeProbe, FakeProbeFactory, Operation},
+        probe::DebugProbeInfo,
     };
     use probe_rs_rpc_client::RpcClient;
     use serde_json::json;
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
-        fmt::Display,
         path::PathBuf,
     };
     use test_case::test_case;
     use time::UtcOffset;
 
     const TEST_CHIP_NAME: &str = "nRF52833_xxAA";
-
-    #[derive(Debug)]
-    struct MockProbeFactory;
-
-    impl Display for MockProbeFactory {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("Mocked Probe")
-        }
-    }
-
-    impl ProbeFactory for MockProbeFactory {
-        fn open(
-            &self,
-            _selector: &DebugProbeSelector,
-        ) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-            todo!()
-        }
-
-        fn list_probes(&self) -> Vec<probe_rs::probe::list::ProbeListItem> {
-            todo!()
-        }
-    }
 
     /// Helper function to get the expected capabilities for the debugger
     ///
@@ -1547,7 +1524,7 @@ mod test {
             0x12,
             0x23,
             Some("mock_serial".to_owned()),
-            &MockProbeFactory,
+            &FakeProbeFactory,
             None,
             false,
         );
@@ -1583,7 +1560,12 @@ mod test {
         // `FakeProbe` is visible to `probe/attach`), and drive the DAP
         // session through `RpcBackend` — the same path production uses.
         let probe_broker = Arc::new(crate::rpc::probe_broker::ProbeBroker::new());
-        let (local_server, tx, rx) = RpcApp::create_server_with_lister(16, lister, probe_broker);
+        let (local_server, tx, rx) = RpcApp::create_server_with_lister(
+            16,
+            lister,
+            probe_broker,
+            crate::rpc::functions::HostFiles::Allow,
+        );
         let handle = tokio::spawn(async move { local_server.run().await });
 
         let client = RpcClient::new_local_from_wire(tx, rx);

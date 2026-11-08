@@ -18,7 +18,7 @@ use pyo3::types::PyDict;
 /// pyo3 0.29 removed the `PyObject` alias; spell it out once here.
 type PyObject = Py<PyAny>;
 
-use crate::error::{BridgeError, py_err_with_kind, to_bridge_err, to_py_err};
+use crate::error::{BridgeError, dry_run_unsupported, py_err_with_kind, to_bridge_err, to_py_err};
 use crate::open_state;
 use crate::rpc::{Bridge, Connection, DEFAULT_TIMEOUT, call_with_recovery, rpc_call};
 use crate::types::*;
@@ -220,7 +220,6 @@ fn attach_with_heal(
     cfg: &SessionConfig,
     selector: Option<WireProbeSelector>,
     allow_erase: bool,
-    dry_run: bool,
     wait: Option<Duration>,
     connect_under_reset: bool,
     deadline: Duration,
@@ -233,7 +232,6 @@ fn attach_with_heal(
             cfg,
             selector.clone(),
             allow_erase,
-            dry_run,
             wait,
             connect_under_reset,
             deadline,
@@ -253,7 +251,6 @@ fn attach_with_heal(
             cfg,
             selector,
             allow_erase,
-            dry_run,
             wait,
             connect_under_reset,
             deadline,
@@ -288,7 +285,6 @@ impl Session {
         speed: Option<u32>,
         protocol: Option<WireProtocolProxy>,
         allow_erase_all: bool,
-        dry_run: bool,
         connect_under_reset: bool,
         wait_for_probe: Option<f64>,
     ) -> PyResult<Session> {
@@ -306,7 +302,6 @@ impl Session {
                 &cfg,
                 selector,
                 allow_erase_all,
-                dry_run,
                 wait,
                 connect_under_reset,
                 deadline,
@@ -356,6 +351,9 @@ impl Session {
         wait_for_probe: Option<f64>,
         connect_under_reset: bool,
     ) -> PyResult<Session> {
+        if dry_run {
+            return Err(dry_run_unsupported());
+        }
         let cfg = config.unwrap_or(SessionConfig {
             speed: None,
             protocol: None,
@@ -370,7 +368,6 @@ impl Session {
             &cfg,
             None,
             allow_erase,
-            dry_run,
             wait,
             connect_under_reset,
             deadline,
@@ -924,25 +921,25 @@ fn attach_with(
     cfg: &SessionConfig,
     selector: Option<WireProbeSelector>,
     allow_erase: bool,
-    dry_run: bool,
     wait: Option<Duration>,
     connect_under_reset: bool,
     deadline: Duration,
 ) -> Result<Connection, BridgeError> {
     py.detach(|| {
         let client = open_state::ensure_server_client()?;
-        let entry = resolve_probe_entry(&client, selector.as_ref(), dry_run)?;
+        let entry = resolve_probe_entry(&client, selector.as_ref())?;
         let request = AttachRequest {
             chip: Some(target.to_string()),
             protocol: cfg.wire_protocol(),
             probe: entry,
             speed: cfg.speed,
             connect_under_reset,
-            dry_run,
             allow_erase_all: allow_erase,
             resume_target: false,
             wait_for_probe: wait,
             client: Some(client_label()),
+            // pyprobe-rs does not forward the target's serial port.
+            target_serial: false,
         };
         // The reattach recovery rebuilds the transport from the same source
         // (module-managed server or remote host) as the original attach.
@@ -961,13 +958,10 @@ fn attach_with(
     })
 }
 
-/// Pick a probe entry for attach, honoring an optional selector. Dry runs
-/// accept a synthetic entry because the server swaps in a fake probe and
-/// claims no device.
+/// Pick a probe entry for attach, honoring an optional selector.
 fn resolve_probe_entry(
     client: &RpcClient,
     selector: Option<&WireProbeSelector>,
-    dry_run: bool,
 ) -> Result<DebugProbeEntry, BridgeError> {
     let probes = rpc_call(DEFAULT_TIMEOUT, "probe list", client.list_probes())?;
     let found = match selector {
@@ -976,17 +970,6 @@ fn resolve_probe_entry(
     };
     if let Some(entry) = found {
         return Ok(entry);
-    }
-    if dry_run {
-        return Ok(DebugProbeEntry {
-            identifier: "dry-run".into(),
-            vendor_id: 0,
-            product_id: 0,
-            interface: None,
-            serial_number: "dry-run".into(),
-            probe_type: "dry-run".into(),
-            inaccessible: false,
-        });
     }
     Err(BridgeError::Attach(
         "no accessible debug probe found; connect one and check pyprobe_rs.list_probes()".into(),

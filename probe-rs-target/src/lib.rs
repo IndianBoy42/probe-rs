@@ -16,6 +16,7 @@ mod chip_family;
 mod flash_algorithm;
 mod flash_properties;
 mod memory;
+mod memory_port;
 pub(crate) mod serialize;
 
 pub use chip::{
@@ -24,7 +25,7 @@ pub use chip::{
     XtensaFpuProperties, XtensaWindowProperties,
 };
 pub use chip_family::{
-    Architecture, ChipFamily, CoreType, Endian, InstructionSet, TargetDescriptionSource,
+    Architecture, ChipFamily, CoreType, Endian, InstructionSet, TargetDescriptionSource, Xlen,
 };
 pub use flash_algorithm::{RawFlashAlgorithm, TransferEncoding};
 pub use flash_properties::FlashProperties;
@@ -32,6 +33,7 @@ pub use memory::{
     GenericRegion, MemoryAccess, MemoryRange, MemoryRegion, NvmRegion, PageInfo, RamRegion,
     RegionMergeIterator, SectorDescription, SectorInfo,
 };
+pub use memory_port::{ArmMemoryPortOptions, MemoryPort, MemoryPortOptions};
 
 #[cfg(feature = "bincode")]
 mod builtin_targets {
@@ -85,9 +87,12 @@ mod builtin_targets {
     fn visit_dirs(dir: impl AsRef<Path>, process: &mut impl FnMut(&Path)) -> io::Result<()> {
         // Inner function to avoid generating multiple implementations for the different path types.
         fn visit_dirs_impl(dir: &Path, process: &mut impl FnMut(&Path)) -> io::Result<()> {
-            for entry in read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
+            // Sorted, as `read_dir`'s order depends on the filesystem.
+            let mut paths = read_dir(dir)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?;
+            paths.sort();
+            for path in paths {
                 if path.is_dir() {
                     visit_dirs_impl(&path, process)?;
                 } else {

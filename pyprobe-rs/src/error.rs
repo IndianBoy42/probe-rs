@@ -25,6 +25,19 @@ pub fn to_py_err<E: std::fmt::Display + 'static>(e: E) -> PyErr {
     })
 }
 
+/// The RPC protocol has no fake-probe attach: upstream removed `--dry-run` and
+/// the `dry_run` fields of the attach request. Reject the request loudly rather
+/// than attaching to a real probe the caller did not intend to touch.
+pub fn dry_run_unsupported() -> PyErr {
+    py_err_with_kind(
+        "dry-run sessions are no longer supported: probe-rs removed the fake-probe \
+         attach path from the RPC protocol. Attach a real probe instead; the probe-gated \
+         suite lives in pyprobe-rs/tests/test_hil.py"
+            .into(),
+        "NotImplemented",
+    )
+}
+
 fn error_kind<E: std::fmt::Display + 'static>(e: &E) -> String {
     let any: &dyn std::any::Any = e;
     if let Some(err) = any.downcast_ref::<probe_rs::Error>() {
@@ -37,6 +50,9 @@ fn error_kind<E: std::fmt::Display + 'static>(e: &E) -> String {
             probe_rs::Error::MissingPermissions(_) => "MissingPermissions",
             probe_rs::Error::Timeout => "Timeout",
             probe_rs::Error::NotImplemented(_) => "NotImplemented",
+            // The scan chain reached no core: a probe/protocol problem, not a
+            // core-index problem, so the fix is on the probe side.
+            probe_rs::Error::NoCoreOnJtagScanChain(_) => "Probe",
             probe_rs::Error::CoreDisabled(_)
             | probe_rs::Error::CoreNotFound(_)
             | probe_rs::Error::GenericCoreError(_)
@@ -45,9 +61,9 @@ fn error_kind<E: std::fmt::Display + 'static>(e: &E) -> String {
             | probe_rs::Error::RegisterAddressOutOfBounds(_)
             | probe_rs::Error::WriteRegister { .. }
             | probe_rs::Error::ReadRegister { .. } => "Register",
-            probe_rs::Error::MemoryNotAligned(_) | probe_rs::Error::InvalidDataLength(_) => {
-                "Memory"
-            }
+            probe_rs::Error::MemoryNotAligned(_)
+            | probe_rs::Error::InvalidDataLength(_)
+            | probe_rs::Error::MemoryAccessPortNotFound(_) => "Memory",
             probe_rs::Error::BreakpointOperation(_) => "Breakpoint",
         }
         .into();

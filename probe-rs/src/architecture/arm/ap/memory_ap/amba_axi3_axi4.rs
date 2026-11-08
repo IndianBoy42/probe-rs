@@ -5,13 +5,13 @@ use crate::architecture::arm::{
     ap::{AccessPortType, ApAccess, ApRegAccess, ApRegister, CFG, define_ap_register},
 };
 
-use super::{AddressIncrement, DataSize};
+use super::{AddressIncrement, DataSize, DataSizeSetup};
 
 /// Memory AP
 ///
 /// The memory AP can be used to access a memory-mapped
 /// set of debug resources of the attached system.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AmbaAxi3Axi4 {
     address: FullyQualifiedApAddress,
     csw: CSW,
@@ -24,8 +24,9 @@ impl AmbaAxi3Axi4 {
         probe: &mut P,
         address: FullyQualifiedApAddress,
     ) -> Result<Self, ArmError> {
-        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
+        // Read CSW last, so the CSW write below needs no change of register bank.
         let cfg = probe.read_raw_ap_register(&address, CFG::ADDRESS)?;
+        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
         let (csw, cfg) = (csw.try_into()?, cfg.try_into()?);
 
         let me = Self { address, csw, cfg };
@@ -45,6 +46,29 @@ impl super::MemoryApType for AmbaAxi3Axi4 {
         const { assert!(crate::architecture::arm::ap::CSW::ADDRESS == CSW::ADDRESS) };
         self.csw = probe.read_ap_register(self)?;
         Ok(self.csw)
+    }
+
+    fn datasize_setup(&self, data_size: DataSize) -> Result<DataSizeSetup, ArmError> {
+        if data_size == self.csw.Size() {
+            return Ok(DataSizeSetup::Ready);
+        }
+
+        match data_size {
+            DataSize::U8 | DataSize::U16 | DataSize::U32 => {
+                let mut csw = self.csw;
+                csw.set_Size(data_size);
+                Ok(DataSizeSetup::Write(csw.into()))
+            }
+            // An AP that does not support the size reports a supported one instead, so the write
+            // has to be read back before any transfer relies on it.
+            DataSize::U64 | DataSize::U128 | DataSize::U256 => Ok(DataSizeSetup::Separately),
+            // `try_set_datasize` has always let an unrecognised size through untouched.
+            DataSize::Unknown(_) => Ok(DataSizeSetup::Ready),
+        }
+    }
+
+    fn note_datasize(&mut self, data_size: DataSize) {
+        self.csw.set_Size(data_size);
     }
 
     fn try_set_datasize<P: ApAccess + ?Sized>(

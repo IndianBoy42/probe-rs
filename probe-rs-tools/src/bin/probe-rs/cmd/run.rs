@@ -6,7 +6,7 @@ use probe_rs_rpc::rtt_client::ScanRegion;
 use probe_rs_rpc::test::{Test, TestDefinition};
 use probe_rs_rpc_client::RpcClient;
 
-use crate::util::cli::{self, parse_metadata, rtt_client};
+use crate::util::cli::{self, DecoderSettings, TargetOutput, parse_metadata, rtt_client};
 use crate::util::common_options::{BinaryDownloadOptions, ProbeOptions};
 use probe_rs_rpc::format::FormatOptions;
 use probe_rs_rpc::rtt_config::ChannelMode;
@@ -95,6 +95,10 @@ pub struct TestOptions {
     )]
     pub skip_test: Vec<String>,
 
+    /// Show the output of all tests while they run. By default, only the output of failed tests is shown.
+    #[clap(long = "nocapture", help_heading = "TEST OPTIONS")]
+    pub nocapture: bool,
+
     /// Options which are ignored, but exist for compatibility with libtest.
     /// E.g. so that vscode and intellij can invoke the test runner with the args they are used to
     #[clap(flatten)]
@@ -104,11 +108,7 @@ pub struct TestOptions {
 /// Options which are ignored, but exist for compatibility with libtest.
 #[derive(Debug, clap::Parser)]
 struct NoOpTestOptions {
-    // No-op, ignored (libtest-mimic always runs in no-capture mode)
-    #[clap(long = "nocapture", hide = true)]
-    nocapture: bool,
-
-    /// No-op, ignored. libtest-mimic does not currently capture stdout.
+    /// No-op, ignored. Flag only exists for CLI compatibility with libtest.
     #[clap(long = "show-output", hide = true)]
     show_output: bool,
 
@@ -159,10 +159,19 @@ pub(crate) struct MonitoringOptions {
     #[clap(long, help_heading = "LOG CONFIGURATION")]
     pub(crate) log_format: Option<String>,
 
+    /// Zephyr dictionary logging database (`log_dictionary.json`) to decode Zephyr
+    /// dictionary-based logs with.
+    ///
+    /// Not needed if the database is embedded into the ELF file
+    /// (`CONFIG_LOG_DICTIONARY_DB_EMBED`).
+    #[clap(long, help_heading = "LOG CONFIGURATION")]
+    pub(crate) zephyr_log_dictionary: Option<PathBuf>,
+
     /// File name to store formatted output at. Different channels can be assigned to different
     /// files using channel=file arguments to multiple occurrences (eg. `--target-output-file
     /// defmt=out/defmt.txt --target-output-file out/default`). Channel names can be prefixed with
-    /// `rtt:` or `semihosting:` (eg. `semihosting:stdout`) to disambiguate.
+    /// `rtt:` or `semihosting:` (eg. `semihosting:stdout`) to disambiguate. The target
+    /// serial port is the `serial` channel.
     #[clap(long, help_heading = "LOG CONFIGURATION")]
     pub(crate) target_output_file: Vec<String>,
 
@@ -247,15 +256,15 @@ impl Cmd {
 
         // TODO: Skip attach_probe & flashing, if user only wants to list tests (only possible when using embedded_test with protocol version >= 1)
 
-        let session = cli::attach_probe(&client, self.probe_options, elf_meta, false).await?;
+        // Show the output of the serial port to the target.
+        let probe_options = ProbeOptions {
+            target_serial: true,
+            ..self.probe_options
+        };
+        let session = cli::attach_probe(&client, probe_options, elf_meta, false).await?;
 
-        let rtt_client = rtt_client(
-            &session,
-            &file_meta,
-            &self.monitor_options,
-            Some(utc_offset),
-        )
-        .await?;
+        let rtt_client = rtt_client(&session, &file_meta, &self.monitor_options).await?;
+        let decoders = DecoderSettings::new(&file_meta, &self.monitor_options, Some(utc_offset));
 
         // Flash firmware
         let boot_info = cli::flash(
@@ -281,6 +290,7 @@ impl Cmd {
                     ignored: self.test_options.ignored,
                     include_ignored: self.test_options.include_ignored,
                     format: self.test_options.format,
+                    nocapture: self.test_options.nocapture,
                     skip: self.test_options.skip_test.clone(),
                     filter: if self.test_options.filter.is_empty() {
                         None
@@ -292,7 +302,7 @@ impl Cmd {
                 },
                 &self.monitor_options,
                 &self.path,
-                Some(rtt_client),
+                TargetOutput::new(decoders, Some(rtt_client)),
             )
             .await
         } else {
@@ -301,7 +311,7 @@ impl Cmd {
                 MonitorMode::Run(boot_info),
                 Some(&self.path),
                 &self.monitor_options,
-                Some(rtt_client),
+                TargetOutput::new(decoders, Some(rtt_client)),
                 VectorCatchConfig {
                     catch_hardfault: !self.run_options.no_catch_hardfault,
                     catch_reset: !self.run_options.no_catch_reset,

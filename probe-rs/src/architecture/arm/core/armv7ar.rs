@@ -29,7 +29,7 @@ use crate::{
         VectorCatchCondition,
     },
     error::Error,
-    memory::{MemoryNotAlignedError, valid_32bit_address},
+    memory::{MemoryNotAlignedError, Operation, OperationKind, valid_32bit_address},
     semihosting::{SemihostingCommand, decode_semihosting_syscall},
 };
 use std::{
@@ -61,11 +61,6 @@ impl<'a> BankedAccess<'a> {
             .write_raw_ap_register(&self.ap, self.dtrrx, value)
     }
 
-    fn set_dtrrx_repeated(&mut self, values: &[u32]) -> Result<(), ArmError> {
-        self.interface
-            .write_raw_ap_register_repeated(&self.ap, self.dtrrx, values)
-    }
-
     fn dscr(&mut self) -> Result<Dbgdscr, ArmError> {
         self.interface
             .read_raw_ap_register(&self.ap, self.dscr)
@@ -77,46 +72,137 @@ impl<'a> BankedAccess<'a> {
             .write_raw_ap_register(&self.ap, self.dscr, value.into())
     }
 
-    fn set_itr(&mut self, value: u32) -> Result<(), ArmError> {
-        self.interface
-            .write_raw_ap_register(&self.ap, self.itr, value)
+    /// Leave DCC Fast mode, then return DBGDSCR.
+    ///
+    /// Used when a batched exit fails.
+    fn leave_fast_mode(&mut self) -> Result<Dbgdscr, ArmError> {
+        let mut dscr = self.dscr()?;
+        dscr.set_extdccmode(0);
+        self.set_dscr(dscr)?;
+        self.dscr()
     }
 
-    fn dtrtx(&mut self) -> Result<u32, ArmError> {
-        self.interface.read_raw_ap_register(&self.ap, self.dtrtx)
+    /// Wait for the instruction to complete, then return DBGDSCR.
+    fn exit_value(&mut self, mut dscr: Dbgdscr) -> Result<Dbgdscr, ArmError> {
+        let start = Instant::now();
+        while !dscr.instrcoml_l() {
+            if start.elapsed() >= OPERATION_TIMEOUT {
+                return Err(ArmError::Timeout);
+            }
+            dscr = self.dscr()?;
+        }
+        dscr.set_extdccmode(0);
+        Ok(dscr)
     }
 
-    fn dtrtx_repeated(&mut self, buf: &mut [u32]) -> Result<(), ArmError> {
-        self.interface
-            .read_raw_ap_register_repeated(&self.ap, self.dtrtx, buf)?;
-        Ok(())
-    }
-
-    /// Operate the core in DCC Fast mode. For more information, see
+    /// Enter DCC Fast mode and run `instruction` for each word in `data`, returning
+    /// DBGDSCR as a result. For more information, see
     /// ARM Architecture Reference Manual ARMv7-A and ARMv7-R edition
     /// section C8.2.2.
     ///
     /// In this mode, writing to the ITR register does not immediately
     /// trigger the instruction. Instead, it waits for a read from DTRTX
-    /// or a write to DTRRX. By placing an instruction with address-increment
+    /// (or a write to DTRRX). By placing an instruction with address-increment
     /// in the pipeline this way, a load or store can be retriggered
     /// repeatedly to quickly stream memory.
-    fn with_dcc_fast_mode<R>(
+    ///
+    /// Reads lag the loads by one operation so the last word is collected after
+    /// leaving Fast mode. In case of failure, the error is returned after leaving
+    /// Fast mode.
+    fn read_in_fast_mode(
         &mut self,
-        f: impl FnOnce(&mut Self) -> Result<R, ArmError>,
-    ) -> Result<R, ArmError> {
-        // Place DSCR in DCC Fast mode
-        let mut dscr = self.dscr()?;
-        dscr.set_extdccmode(2);
-        self.set_dscr(dscr)?;
-        let result = f(self);
+        instruction: u32,
+        data: &mut [u32],
+    ) -> Result<Dbgdscr, ArmError> {
+        if data.is_empty() {
+            // Nothing to stream.
+            return self.dscr();
+        }
+        let count = data.len();
+        let mut fast = self.dscr()?;
+        fast.set_extdccmode(2);
 
-        // Return DSCR back to DCC Non Blocking mode
-        let mut dscr = self.dscr()?;
-        dscr.set_extdccmode(0);
-        self.set_dscr(dscr)?;
+        let mut accesses = vec![
+            (self.dscr, Some(u32::from(fast))),
+            (self.itr, Some(instruction)),
+        ];
+        accesses.extend(std::iter::repeat_n((self.dtrtx, None), count));
+        accesses.push((self.dscr, None));
+        let mut streamed = vec![0; count + 1];
+        if let Err(error) =
+            self.interface
+                .access_raw_ap_registers(&self.ap, &accesses, &mut streamed)
+        {
+            let _ = self.leave_fast_mode()?;
+            return Err(error);
+        }
+        // The first word read was left over from before the first load.
+        data[..count - 1].copy_from_slice(&streamed[1..count]);
+        let non_blocking = match self.exit_value(Dbgdscr(streamed[count])) {
+            Ok(val) => val,
+            Err(error) => {
+                let _ = self.leave_fast_mode()?;
+                return Err(error);
+            }
+        };
 
-        result
+        let mut tail = [0; 2];
+        let leave = [
+            (self.dscr, Some(u32::from(non_blocking))),
+            (self.dtrtx, None),
+            (self.dscr, None),
+        ];
+        match self
+            .interface
+            .access_raw_ap_registers(&self.ap, &leave, &mut tail)
+        {
+            Ok(()) => {
+                data[count - 1] = tail[0];
+                Ok(Dbgdscr(tail[1]))
+            }
+            Err(error) => {
+                let _ = self.leave_fast_mode()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Enter DCC Fast mode and run `instruction` for every word of `data`, returning
+    /// `DBGDSCR` as a result. See [`Self::read_in_fast_mode`] for more information.
+    fn write_in_fast_mode(&mut self, instruction: u32, data: &[u32]) -> Result<Dbgdscr, ArmError> {
+        let mut fast = self.dscr()?;
+        fast.set_extdccmode(2);
+
+        let mut accesses = vec![
+            (self.dscr, Some(u32::from(fast))),
+            (self.itr, Some(instruction)),
+        ];
+        accesses.extend(data.iter().map(|&word| (self.dtrrx, Some(word))));
+        accesses.push((self.dscr, None));
+        let mut dscr = [0];
+        if let Err(error) = self
+            .interface
+            .access_raw_ap_registers(&self.ap, &accesses, &mut dscr)
+        {
+            self.leave_fast_mode()?;
+            return Err(error);
+        }
+        let non_blocking = self.exit_value(Dbgdscr(dscr[0]))?;
+
+        let leave = [
+            (self.dscr, Some(u32::from(non_blocking))),
+            (self.dscr, None),
+        ];
+        match self
+            .interface
+            .access_raw_ap_registers(&self.ap, &leave, &mut dscr)
+        {
+            Ok(()) => Ok(Dbgdscr(dscr[0])),
+            Err(error) => {
+                self.leave_fast_mode()?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -181,6 +267,12 @@ impl<'probe> Armv7ar<'probe> {
             };
 
             state.current_state = core_state;
+
+            // DBGVCR persists across sessions. U is shared by HardFault and HLT, count it as HLT.
+            let address = Dbgvcr::get_mmio_address_from_base(base_address)?;
+            let dbgvcr = Dbgvcr(memory.read_word_32(address)?);
+            state.catch_hardfault = dbgvcr.sp() || dbgvcr.sd();
+            state.catch_hlt = dbgvcr.su();
         }
 
         let mut core = Self {
@@ -285,14 +377,13 @@ impl<'probe> Armv7ar<'probe> {
         instruction: u32,
         value: u32,
     ) -> Result<(), Error> {
-        // Move value
+        // Move `value`, and see whether the core has it
         let address = Dbgdtrrx::get_mmio_address_from_base(self.base_address)?;
-        self.memory.write_word_32(address, value)?;
+        let mut dbgdscr =
+            write_then_read_dbgdscr(&mut *self.memory, self.base_address, address, value)?;
 
         // Wait for RXfull
         let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
-        let mut dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-
         let start = Instant::now();
         while !dbgdscr.rxfull_l() {
             dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
@@ -400,11 +491,116 @@ impl<'probe> Armv7ar<'probe> {
         super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
     }
 
+    fn set_vector_catch(
+        &mut self,
+        condition: VectorCatchCondition,
+        enable: bool,
+    ) -> Result<(), Error> {
+        let address = Dbgvcr::get_mmio_address_from_base(self.base_address)?;
+        let mut dbgvcr = Dbgvcr(self.memory.read_word_32(address)?);
+
+        match condition {
+            VectorCatchCondition::CoreReset => dbgvcr.set_r(enable),
+            VectorCatchCondition::Svc => dbgvcr.set_ss(enable),
+            // Undefined Instruction, Prefetch Abort and Data Abort.
+            VectorCatchCondition::HardFault => {
+                self.state.catch_hardfault = enable;
+                dbgvcr.set_sp(enable);
+                dbgvcr.set_sd(enable);
+            }
+            VectorCatchCondition::Hlt => self.state.catch_hlt = enable,
+            VectorCatchCondition::SecureFault | VectorCatchCondition::All => {
+                return Err(Error::NotImplemented(
+                    "vector catch condition SecureFault/All",
+                ));
+            }
+        }
+        if matches!(
+            condition,
+            VectorCatchCondition::HardFault | VectorCatchCondition::Hlt
+        ) {
+            dbgvcr.set_su(self.state.catch_hardfault || self.state.catch_hlt);
+        }
+
+        self.memory.write_word_32(address, dbgvcr.into())?;
+        Ok(())
+    }
+
+    /// Whether the core halted on the Undefined Instruction vector catch, which only HLT
+    /// semihosting asked for. Call it after [`check_for_semihosting`] found no semihosting call.
+    fn undef_left_to_application(&mut self) -> Result<bool, Error> {
+        if !self.state.catch_hlt || self.state.catch_hardfault {
+            return Ok(false);
+        }
+        let pc: u32 = self.read_core_reg(self.program_counter().id)?.try_into()?;
+        Ok(pc & VECTOR_TABLE_MASK == UNDEF_VECTOR_OFFSET)
+    }
+
+    /// Resumes a core halted by the Undefined Instruction vector catch into the exception handler.
+    fn resume_into_undef_handler(&mut self) -> Result<(), Error> {
+        let address = Dbgvcr::get_mmio_address_from_base(self.base_address)?;
+        let dbgvcr = Dbgvcr(self.memory.read_word_32(address)?);
+
+        // The catch may match the vector address, so step over the vector with it disabled.
+        let mut stepping = dbgvcr;
+        stepping.set_su(false);
+        self.memory.write_word_32(address, stepping.into())?;
+        let stepped = self.step();
+        self.memory.write_word_32(address, dbgvcr.into())?;
+        stepped?;
+
+        self.update_status()?;
+        self.run()
+    }
+
+    /// Reads the core status. Unlike [`CoreInterface::status`], it never resumes the core.
+    fn update_status(&mut self) -> Result<CoreStatus, Error> {
+        let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
+        let dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
+
+        if dbgdscr.halted() {
+            let mut reason = dbgdscr.halt_reason();
+
+            // Set the status so semihosting decoding can read registers
+            self.set_core_status(CoreStatus::Halted(reason));
+
+            self.read_fp_reg_count()?;
+
+            // Check for semihosting on SVC & HLT (UNDEF) vector catch
+            if let HaltReason::Exception = reason {
+                let lr: u32 = self.read_core_reg(RegisterId(14))?.try_into()?;
+                let catch_hlt = self.state.catch_hlt;
+
+                self.state.semihosting_command = check_for_semihosting(
+                    self.state.semihosting_command.take(),
+                    self,
+                    lr,
+                    catch_hlt,
+                )?;
+                if let Some(command) = self.state.semihosting_command {
+                    reason = HaltReason::Breakpoint(BreakpointCause::Semihosting(command));
+                    self.set_core_status(CoreStatus::Halted(reason));
+                }
+            }
+
+            return Ok(CoreStatus::Halted(reason));
+        }
+        // Core is neither halted nor sleeping, so we assume it is running.
+        if self.state.current_state.is_halted() {
+            tracing::warn!("Core is running, but we expected it to be halted");
+        }
+
+        self.set_core_status(CoreStatus::Running);
+
+        Ok(CoreStatus::Running)
+    }
+
     pub(crate) fn halted_access<R>(
         &mut self,
         op: impl FnOnce(&mut Self) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let was_running = !(self.state.current_state.is_halted() || self.status()?.is_halted());
+        let was_running =
+            !(self.state.current_state.is_halted() || self.update_status()?.is_halted());
 
         if was_running {
             self.halt(Duration::from_millis(100))?;
@@ -597,20 +793,40 @@ fn check_and_clear_data_abort(
     Ok(())
 }
 
+/// Write a debug register and read back DBGDSCR in one batched probe transaction.
+fn write_then_read_dbgdscr(
+    memory: &mut dyn ArmMemoryInterface,
+    base_address: u64,
+    address: u64,
+    value: u32,
+) -> Result<Dbgdscr, ArmError> {
+    let dbgdscr_address = Dbgdscr::get_mmio_address_from_base(base_address)?;
+    let mut dbgdscr = 0;
+    {
+        let mut operations = [
+            Operation::new(address, OperationKind::WriteWord32(value)),
+            Operation::new(
+                dbgdscr_address,
+                OperationKind::Read32(std::slice::from_mut(&mut dbgdscr)),
+            ),
+        ];
+        memory.execute_operations(&mut operations)?;
+    }
+    Ok(Dbgdscr(dbgdscr))
+}
+
 /// Execute a single instruction.
 fn execute_instruction(
     memory: &mut dyn ArmMemoryInterface,
     base_address: u64,
     instruction: u32,
 ) -> Result<Dbgdscr, ArmError> {
-    // Run instruction
+    // Run instruction and see whether it has completed
     let address = Dbgitr::get_mmio_address_from_base(base_address)?;
-    memory.write_word_32(address, instruction)?;
+    let mut dbgdscr = write_then_read_dbgdscr(memory, base_address, address, instruction)?;
 
     // Wait for completion
     let address = Dbgdscr::get_mmio_address_from_base(base_address)?;
-    let mut dbgdscr = Dbgdscr(memory.read_word_32(address)?);
-
     let start = Instant::now();
     while !dbgdscr.instrcoml_l() {
         dbgdscr = Dbgdscr(memory.read_word_32(address)?);
@@ -634,14 +850,12 @@ fn set_instruction_input(
     base_address: u64,
     value: u32,
 ) -> Result<(), ArmError> {
-    // Move value
+    // Move value, and see whether the core has it
     let address = Dbgdtrrx::get_mmio_address_from_base(base_address)?;
-    memory.write_word_32(address, value)?;
+    let mut dbgdscr = write_then_read_dbgdscr(memory, base_address, address, value)?;
 
     // Wait for RXfull
     let address = Dbgdscr::get_mmio_address_from_base(base_address)?;
-    let mut dbgdscr = Dbgdscr(memory.read_word_32(address)?);
-
     let start = Instant::now();
     while !dbgdscr.rxfull_l() {
         dbgdscr = Dbgdscr(memory.read_word_32(address)?);
@@ -725,40 +939,14 @@ impl CoreInterface for Armv7ar<'_> {
     }
 
     fn status(&mut self) -> Result<crate::core::CoreStatus, Error> {
-        // determine current state
-        let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
-        let dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-
-        if dbgdscr.halted() {
-            let mut reason = dbgdscr.halt_reason();
-
-            // Set the status so semihosting decoding can read registers
-            self.set_core_status(CoreStatus::Halted(reason));
-
-            self.read_fp_reg_count()?;
-
-            // Check for semihosting on SVC & HLT (UNDEF) vector catch
-            if let HaltReason::Exception = reason {
-                let lr: u32 = self.read_core_reg(RegisterId(14))?.try_into()?;
-
-                self.state.semihosting_command =
-                    check_for_semihosting(self.state.semihosting_command.take(), self, lr)?;
-                if let Some(command) = self.state.semihosting_command {
-                    reason = HaltReason::Breakpoint(BreakpointCause::Semihosting(command));
-                    self.set_core_status(CoreStatus::Halted(reason));
-                }
-            }
-
-            return Ok(CoreStatus::Halted(reason));
+        let status = self.update_status()?;
+        if status == CoreStatus::Halted(HaltReason::Exception)
+            && self.undef_left_to_application()?
+        {
+            self.resume_into_undef_handler()?;
+            return Ok(CoreStatus::Running);
         }
-        // Core is neither halted nor sleeping, so we assume it is running.
-        if self.state.current_state.is_halted() {
-            tracing::warn!("Core is running, but we expected it to be halted");
-        }
-
-        self.set_core_status(CoreStatus::Running);
-
-        Ok(CoreStatus::Running)
+        Ok(status)
     }
 
     fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error> {
@@ -770,7 +958,7 @@ impl CoreInterface for Armv7ar<'_> {
             self.reset_register_cache();
         }
         // Update core status
-        let _ = self.status()?;
+        let _ = self.update_status()?;
 
         // try to read the program counter
         let pc_value = self.read_core_reg(self.program_counter().into())?;
@@ -835,7 +1023,7 @@ impl CoreInterface for Armv7ar<'_> {
 
         // Recompute / verify current state
         self.set_core_status(CoreStatus::Running);
-        let _ = self.status()?;
+        let _ = self.update_status()?;
 
         Ok(())
     }
@@ -852,7 +1040,7 @@ impl CoreInterface for Armv7ar<'_> {
 
         // Recompute / verify current state
         self.set_core_status(CoreStatus::Running);
-        let _ = self.status()?;
+        let _ = self.update_status()?;
 
         Ok(())
     }
@@ -890,7 +1078,7 @@ impl CoreInterface for Armv7ar<'_> {
         // Clear any cached semihosting command from before reset
         self.state.semihosting_command = None;
 
-        let _ = self.status()?;
+        let _ = self.update_status()?;
 
         // try to read the program counter
         let pc_value = self.read_core_reg(self.program_counter().into())?;
@@ -932,16 +1120,16 @@ impl CoreInterface for Armv7ar<'_> {
         self.memory
             .write_word_32(bp_control_addr, bp_control.into())?;
 
-        // Resume
-        self.run()?;
-
-        // Wait for halt
-        self.wait_for_core_halted(Duration::from_millis(100))?;
+        // Resume and wait for halt
+        let stepped = self
+            .run()
+            .and_then(|()| self.wait_for_core_halted(Duration::from_millis(100)));
 
         // Reset breakpoint
         self.memory.write_word_32(bp_value_addr, saved_bp_value)?;
         self.memory
             .write_word_32(bp_control_addr, saved_bp_control)?;
+        stepped?;
 
         // try to read the program counter
         let pc_value = self.read_core_reg(self.program_counter().into())?;
@@ -1252,43 +1440,11 @@ impl CoreInterface for Armv7ar<'_> {
     }
 
     fn enable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        let address = Dbgvcr::get_mmio_address_from_base(self.base_address)?;
-        let mut dbgvcr = Dbgvcr(self.memory.read_word_32(address)?);
-
-        match condition {
-            VectorCatchCondition::CoreReset => dbgvcr.set_r(true),
-            VectorCatchCondition::Svc => dbgvcr.set_ss(true),
-            VectorCatchCondition::Hlt => dbgvcr.set_su(true),
-            // HardFault/SecureFault are Cortex-M concepts, not applicable to ARMv7-A/R
-            _ => {
-                return Err(Error::NotImplemented(
-                    "vector catch condition Hardfault/SecureFault",
-                ));
-            }
-        }
-
-        self.memory.write_word_32(address, dbgvcr.into())?;
-        Ok(())
+        self.set_vector_catch(condition, true)
     }
 
     fn disable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        let address = Dbgvcr::get_mmio_address_from_base(self.base_address)?;
-        let mut dbgvcr = Dbgvcr(self.memory.read_word_32(address)?);
-
-        match condition {
-            VectorCatchCondition::CoreReset => dbgvcr.set_r(false),
-            VectorCatchCondition::Svc => dbgvcr.set_ss(false),
-            VectorCatchCondition::Hlt => dbgvcr.set_su(false),
-            // HardFault/SecureFault are Cortex-M concepts, not applicable to ARMv7-A/R
-            _ => {
-                return Err(Error::NotImplemented(
-                    "vector catch condition Hardfault/SecureFault",
-                ));
-            }
-        }
-
-        self.memory.write_word_32(address, dbgvcr.into())?;
-        Ok(())
+        self.set_vector_catch(condition, false)
     }
 }
 
@@ -1398,37 +1554,22 @@ impl MemoryInterface for Armv7ar<'_> {
 
                 let mut banked = core.banked_access()?;
 
-                // Ignore any errors encountered here -- they will set a Data Abort
-                // which we will pick up in `check_and_clear_data_abort()`
-                if banked
-                    .with_dcc_fast_mode(|banked| {
-                        // LDC p14, c5, [r0], #4
-                        banked.set_itr(build_ldc(14, 5, 0, 4))?;
-
-                        // Throw away the first value, which is from a previous operation
-                        let _ = banked.dtrtx()?;
-
-                        // Continually write the tx register, which will auto-increment.
-                        // Because reads lag by one instruction, we need to break before
-                        // we read the final value. If we don't we will end up reading one
-                        // extra word past the buffer, which may end up outside valid RAM.
-                        banked.dtrtx_repeated(&mut data[0..count - 1])?;
-                        Ok(())
-                    })
-                    .is_ok()
-                {
-                    // Grab the last value that we skipped during the main sequence.
-                    // Ignore any errors here since they will generate an abort that
-                    // will be caught below.
-                    if let Ok(last) = banked.dtrtx()
-                        && let Some(v) = data.last_mut()
-                    {
-                        *v = last;
+                // LDC p14, c5, [r0], #4
+                let dscr = match banked.read_in_fast_mode(build_ldc(14, 5, 0, 4), data) {
+                    Ok(dscr) => dscr,
+                    Err(error) => {
+                        if let Ok(dscr) = banked.dscr() {
+                            let _ = check_and_clear_data_abort(
+                                &mut *core.memory,
+                                core.base_address,
+                                dscr,
+                            );
+                        }
+                        return Err(error.into());
                     }
-                }
+                };
 
                 // Check if we had any aborts, if so clear them and fail
-                let dscr = banked.dscr()?;
                 check_and_clear_data_abort(&mut *core.memory, core.base_address, dscr)?;
             } else {
                 for (i, word) in data.iter_mut().enumerate() {
@@ -1594,19 +1735,21 @@ impl MemoryInterface for Armv7ar<'_> {
 
                 let mut banked = core.banked_access()?;
 
-                banked
-                    .with_dcc_fast_mode(|banked| {
-                        // STC p14, c5, [r0], #4
-                        banked.set_itr(build_stc(14, 5, 0, 4))?;
-
-                        // Continually write the tx register, which will auto-increment
-                        banked.set_dtrrx_repeated(data)?;
-                        Ok(())
-                    })
-                    .ok();
-
+                // STC p14, c5, [r0], #4
                 // Check if we had any aborts, if so clear them and fail
-                let dscr = banked.dscr()?;
+                let dscr = match banked.write_in_fast_mode(build_stc(14, 5, 0, 4), data) {
+                    Ok(dscr) => dscr,
+                    Err(error) => {
+                        if let Ok(dscr) = banked.dscr() {
+                            let _ = check_and_clear_data_abort(
+                                &mut *core.memory,
+                                core.base_address,
+                                dscr,
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                };
                 check_and_clear_data_abort(&mut *core.memory, core.base_address, dscr)?;
             } else {
                 // Slow path -- perform multiple writes
@@ -1687,6 +1830,11 @@ impl MemoryInterface for Armv7ar<'_> {
     }
 }
 
+/// Offset of the Undefined Instruction vector in the vector table.
+const UNDEF_VECTOR_OFFSET: u32 = 0x04;
+/// The vector table is 32-byte aligned.
+const VECTOR_TABLE_MASK: u32 = 32 - 1;
+
 /// Check if the current vector catch halt is a semihosting call.
 ///
 /// Supports two semihosting mechanisms on A/R-profile cores:
@@ -1699,6 +1847,7 @@ pub(crate) fn check_for_semihosting(
     cached_command: Option<SemihostingCommand>,
     core: &mut dyn CoreInterface,
     lr: u32,
+    catch_hlt: bool,
 ) -> Result<Option<SemihostingCommand>, Error> {
     // Return cached command if already decoded (avoid re-decoding on repeated status() calls)
     if let Some(command) = cached_command {
@@ -1713,9 +1862,7 @@ pub(crate) fn check_for_semihosting(
     // - UNDEF vector (0x04): HLT-based semihosting (HLT is undefined on ARMv7)
     let pc: u32 = core.read_core_reg(core.program_counter().id)?.try_into()?;
 
-    const UNDEF_VECTOR_OFFSET: u32 = 0x04;
     const SVC_VECTOR_OFFSET: u32 = 0x08;
-    const VECTOR_TABLE_MASK: u32 = 32 - 1;
 
     let vector_offset = pc & VECTOR_TABLE_MASK;
 
@@ -1727,6 +1874,12 @@ pub(crate) fn check_for_semihosting(
             pc,
             vector_offset
         );
+        return Ok(None);
+    }
+
+    // The Undefined Instruction vector catch is also used by HardFault, only service HLT when
+    // asked to.
+    if vector_offset == UNDEF_VECTOR_OFFSET && !catch_hlt {
         return Ok(None);
     }
 
@@ -1787,205 +1940,16 @@ pub(crate) fn check_for_semihosting(
 #[cfg(test)]
 mod test {
     use crate::{
-        architecture::arm::{
-            FullyQualifiedApAddress, communication_interface::SwdSequence,
-            sequences::DefaultArmSequence,
-        },
-        probe::{BitSequence, DebugProbeError},
+        architecture::arm::{FullyQualifiedApAddress, sequences::DefaultArmSequence},
+        probe::DebugProbeError,
     };
 
     use super::*;
+    use crate::architecture::arm::core::mock::MockProbe;
+    use crate::architecture::arm::dp::{DpAddress, DpRegisterAddress};
+    use std::collections::VecDeque;
 
     const TEST_BASE_ADDRESS: u64 = 0x8000_1000;
-
-    fn address_to_reg_num(address: u64) -> u32 {
-        ((address - TEST_BASE_ADDRESS) / 4) as u32
-    }
-
-    #[derive(Debug)]
-    pub struct ExpectedMemoryOp {
-        read: bool,
-        address: u64,
-        value: u32,
-    }
-
-    pub struct MockProbe {
-        expected_ops: Vec<ExpectedMemoryOp>,
-    }
-
-    impl MockProbe {
-        pub fn new() -> Self {
-            MockProbe {
-                expected_ops: vec![],
-            }
-        }
-
-        pub fn expected_read(&mut self, addr: u64, value: u32) {
-            self.expected_ops.push(ExpectedMemoryOp {
-                read: true,
-                address: addr,
-                value,
-            });
-        }
-
-        pub fn expected_write(&mut self, addr: u64, value: u32) {
-            self.expected_ops.push(ExpectedMemoryOp {
-                read: false,
-                address: addr,
-                value,
-            });
-        }
-    }
-
-    impl MemoryInterface<ArmError> for MockProbe {
-        fn read_8(&mut self, _address: u64, _data: &mut [u8]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn read_16(&mut self, _address: u64, _data: &mut [u16]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), ArmError> {
-            if self.expected_ops.is_empty() {
-                panic!(
-                    "Received unexpected read_32 op: register {:#}",
-                    address_to_reg_num(address)
-                );
-            }
-
-            assert_eq!(data.len(), 1);
-
-            let expected_op = self.expected_ops.remove(0);
-
-            assert!(
-                expected_op.read,
-                "R/W mismatch for register: Expected {:#} Actual: {:#}",
-                address_to_reg_num(expected_op.address),
-                address_to_reg_num(address)
-            );
-            assert_eq!(
-                expected_op.address,
-                address,
-                "Read from unexpected register: Expected {:#} Actual: {:#}",
-                address_to_reg_num(expected_op.address),
-                address_to_reg_num(address)
-            );
-
-            data[0] = expected_op.value;
-
-            Ok(())
-        }
-
-        fn read(&mut self, address: u64, data: &mut [u8]) -> Result<(), ArmError> {
-            self.read_8(address, data)
-        }
-
-        fn write_8(&mut self, _address: u64, _data: &[u8]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn write_16(&mut self, _address: u64, _data: &[u16]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), ArmError> {
-            if self.expected_ops.is_empty() {
-                panic!(
-                    "Received unexpected write_32 op: register {:#}",
-                    address_to_reg_num(address)
-                );
-            }
-
-            assert_eq!(data.len(), 1);
-
-            let expected_op = self.expected_ops.remove(0);
-
-            assert!(
-                !expected_op.read,
-                "Read/write mismatch on register: {:#}",
-                address_to_reg_num(address)
-            );
-            assert_eq!(
-                expected_op.address,
-                address,
-                "Write to unexpected register: Expected {:#} Actual: {:#}",
-                address_to_reg_num(expected_op.address),
-                address_to_reg_num(address)
-            );
-
-            assert_eq!(
-                expected_op.value, data[0],
-                "Write value mismatch Expected {:#X} Actual: {:#X}",
-                expected_op.value, data[0]
-            );
-
-            Ok(())
-        }
-
-        fn write(&mut self, address: u64, data: &[u8]) -> Result<(), ArmError> {
-            self.write_8(address, data)
-        }
-
-        fn flush(&mut self) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn read_64(&mut self, _address: u64, _data: &mut [u64]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn write_64(&mut self, _address: u64, _data: &[u64]) -> Result<(), ArmError> {
-            todo!()
-        }
-
-        fn supports_8bit_transfers(&self) -> Result<bool, ArmError> {
-            Ok(false)
-        }
-
-        fn supports_native_64bit_access(&mut self) -> bool {
-            false
-        }
-    }
-
-    impl ArmMemoryInterface for MockProbe {
-        fn fully_qualified_address(&self) -> FullyQualifiedApAddress {
-            todo!()
-        }
-
-        fn get_arm_debug_interface(
-            &mut self,
-        ) -> Result<&mut dyn crate::architecture::arm::ArmDebugInterface, DebugProbeError> {
-            Err(DebugProbeError::NotImplemented {
-                function_name: "get_arm_debug_interface",
-            })
-        }
-
-        fn generic_status(&mut self) -> Result<crate::architecture::arm::ap::CSW, ArmError> {
-            Err(ArmError::Probe(DebugProbeError::NotImplemented {
-                function_name: "generic_status",
-            }))
-        }
-
-        fn base_address(&mut self) -> Result<u64, ArmError> {
-            todo!()
-        }
-    }
-
-    impl SwdSequence for MockProbe {
-        fn swj_sequence(&mut self, _bits: &BitSequence) -> Result<(), DebugProbeError> {
-            todo!()
-        }
-
-        fn swj_pins(
-            &mut self,
-            _pin_out: u32,
-            _pin_select: u32,
-            _pin_wait: u32,
-        ) -> Result<u32, DebugProbeError> {
-            todo!()
-        }
-    }
 
     fn add_status_expectations(probe: &mut MockProbe, halted: bool) {
         let mut dbgdscr = Dbgdscr(0);
@@ -1994,6 +1958,13 @@ mod test {
         probe.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
+        );
+    }
+
+    fn add_vector_catch_expectations(probe: &mut MockProbe) {
+        probe.expected_read(
+            Dbgvcr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
+            0,
         );
     }
 
@@ -2149,20 +2120,238 @@ mod test {
         );
     }
 
-    impl Drop for MockProbe {
-        fn drop(&mut self) {
-            if !self.expected_ops.is_empty() {
-                panic!("self.expected_ops is not empty: {:?}", self.expected_ops);
+    /// Feeding the core is a write to a debug register followed by a read of DBGDSCR. The two
+    /// reach the memory interface as one batch, or every step would cost two probe round trips.
+    #[test]
+    fn a_debug_register_write_and_the_dbgdscr_read_are_one_batch() {
+        let dtrrx = Dbgdtrrx::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap();
+        let dbgdscr = Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
+        probe.expected_write(dtrrx, 0x1234_5678);
+        probe.expected_read(dbgdscr, 0x4000_0000);
+
+        let read =
+            write_then_read_dbgdscr(&mut probe, TEST_BASE_ADDRESS, dtrrx, 0x1234_5678).unwrap();
+
+        assert_eq!(u32::from(read), 0x4000_0000);
+        assert_eq!(
+            probe.batches,
+            vec![vec![(dtrrx, Some(0x1234_5678)), (dbgdscr, None)]]
+        );
+    }
+
+    /// A DAP that records every batch of raw AP accesses and answers reads from a script.
+    struct RecordingDap {
+        batches: Vec<Vec<(u64, Option<u32>)>>,
+        reads: VecDeque<u32>,
+        /// The batch, counted from zero, that fails with a probe error.
+        failing_batch: Option<usize>,
+    }
+
+    impl RecordingDap {
+        fn new(reads: &[u32]) -> Self {
+            Self {
+                batches: Vec::new(),
+                reads: reads.iter().copied().collect(),
+                failing_batch: None,
             }
         }
+
+        /// The values written to DBGDSCR, in order.
+        fn dscr_writes(&self) -> Vec<Dbgdscr> {
+            self.batches
+                .iter()
+                .flatten()
+                .filter(|(address, _)| *address == BD2::ADDRESS)
+                .filter_map(|(_, value)| value.map(Dbgdscr))
+                .collect()
+        }
+    }
+
+    impl DapAccess for RecordingDap {
+        fn read_raw_dp_register(
+            &mut self,
+            _dp: DpAddress,
+            _address: DpRegisterAddress,
+        ) -> Result<u32, ArmError> {
+            unimplemented!()
+        }
+
+        fn write_raw_dp_register(
+            &mut self,
+            _dp: DpAddress,
+            _address: DpRegisterAddress,
+            _value: u32,
+        ) -> Result<(), ArmError> {
+            unimplemented!()
+        }
+
+        fn read_raw_ap_register(
+            &mut self,
+            ap: &FullyQualifiedApAddress,
+            address: u64,
+        ) -> Result<u32, ArmError> {
+            let mut value = [0];
+            self.access_raw_ap_registers(ap, &[(address, None)], &mut value)?;
+            Ok(value[0])
+        }
+
+        fn write_raw_ap_register(
+            &mut self,
+            ap: &FullyQualifiedApAddress,
+            address: u64,
+            value: u32,
+        ) -> Result<(), ArmError> {
+            self.access_raw_ap_registers(ap, &[(address, Some(value))], &mut [])
+        }
+
+        fn access_raw_ap_registers(
+            &mut self,
+            _ap: &FullyQualifiedApAddress,
+            accesses: &[(u64, Option<u32>)],
+            values: &mut [u32],
+        ) -> Result<(), ArmError> {
+            let index = self.batches.len();
+            self.batches.push(accesses.to_vec());
+            if self.failing_batch == Some(index) {
+                return Err(ArmError::Probe(DebugProbeError::Other(
+                    "the probe went away".to_string(),
+                )));
+            }
+            let reads = accesses.iter().filter(|(_, value)| value.is_none()).count();
+            for value in &mut values[..reads] {
+                *value = self
+                    .reads
+                    .pop_front()
+                    .expect("a scripted value for every read");
+            }
+            Ok(())
+        }
+    }
+
+    fn banked(dap: &mut RecordingDap) -> BankedAccess<'_> {
+        BankedAccess {
+            interface: dap,
+            ap: FullyQualifiedApAddress::v1_with_default_dp(1),
+            dtrrx: BD0::ADDRESS,
+            itr: BD1::ADDRESS,
+            dscr: BD2::ADDRESS,
+            dtrtx: BD3::ADDRESS,
+        }
+    }
+
+    /// DBGDSCR with the last instruction complete: in Non-blocking mode, and in Fast mode.
+    fn done_and_fast() -> (u32, u32) {
+        let mut done = Dbgdscr(0);
+        done.set_instrcoml_l(true);
+        let done = u32::from(done);
+        let mut fast = Dbgdscr(done);
+        fast.set_extdccmode(2);
+        (done, u32::from(fast))
+    }
+
+    const LDC: u32 = 0xEC50_5E04;
+    const STC: u32 = 0xEC40_5E04;
+
+    #[test]
+    fn a_fast_mode_read_is_three_batches_with_the_last_word_after_leaving() {
+        let (done, fast) = done_and_fast();
+        // DBGDSCR before; the stale word, two loaded words and DBGDSCR while streaming; the last
+        // word and DBGDSCR after leaving.
+        let mut dap = RecordingDap::new(&[done, 0xDEAD, 11, 22, fast, 33, done]);
+        let mut data = [0; 3];
+
+        let dscr = banked(&mut dap).read_in_fast_mode(LDC, &mut data).unwrap();
+
+        assert_eq!(data, [11, 22, 33]);
+        assert_eq!(u32::from(dscr), done);
+        assert_eq!(
+            dap.batches,
+            vec![
+                vec![(BD2::ADDRESS, None)],
+                vec![
+                    (BD2::ADDRESS, Some(fast)),
+                    (BD1::ADDRESS, Some(LDC)),
+                    (BD3::ADDRESS, None),
+                    (BD3::ADDRESS, None),
+                    (BD3::ADDRESS, None),
+                    (BD2::ADDRESS, None),
+                ],
+                vec![
+                    (BD2::ADDRESS, Some(done)),
+                    (BD3::ADDRESS, None),
+                    (BD2::ADDRESS, None),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fast_mode_write_is_three_batches() {
+        let (done, fast) = done_and_fast();
+        let mut dap = RecordingDap::new(&[done, fast, done]);
+
+        let dscr = banked(&mut dap)
+            .write_in_fast_mode(STC, &[1, 2, 3])
+            .unwrap();
+
+        assert_eq!(u32::from(dscr), done);
+        assert_eq!(
+            dap.batches,
+            vec![
+                vec![(BD2::ADDRESS, None)],
+                vec![
+                    (BD2::ADDRESS, Some(fast)),
+                    (BD1::ADDRESS, Some(STC)),
+                    (BD0::ADDRESS, Some(1)),
+                    (BD0::ADDRESS, Some(2)),
+                    (BD0::ADDRESS, Some(3)),
+                    (BD2::ADDRESS, None),
+                ],
+                vec![(BD2::ADDRESS, Some(done)), (BD2::ADDRESS, None)],
+            ]
+        );
+    }
+
+    /// A probe error while streaming is returned, after Fast mode has been left so that the
+    /// next read of DTRTX does not run the load again.
+    #[test]
+    fn a_failed_stream_leaves_fast_mode_and_returns_the_error() {
+        let (done, fast) = done_and_fast();
+        // DBGDSCR before; then, leaving by hand, DBGDSCR in Fast mode and after.
+        let mut dap = RecordingDap::new(&[done, fast, done]);
+        dap.failing_batch = Some(1);
+        let mut data = [0; 3];
+
+        let error = banked(&mut dap)
+            .read_in_fast_mode(LDC, &mut data)
+            .unwrap_err();
+
+        assert!(matches!(error, ArmError::Probe(_)), "{error:?}");
+        assert_eq!(data, [0; 3]);
+        assert_eq!(dap.batches.len(), 5);
+        let left = dap.dscr_writes().last().map(|dscr| dscr.extdccmode());
+        assert_eq!(left, Some(0));
+    }
+
+    #[test]
+    fn an_empty_fast_mode_read_only_reads_dbgdscr() {
+        let (done, _) = done_and_fast();
+        let mut dap = RecordingDap::new(&[done]);
+
+        let dscr = banked(&mut dap).read_in_fast_mode(LDC, &mut []).unwrap();
+
+        assert_eq!(u32::from(dscr), done);
+        assert_eq!(dap.batches, vec![vec![(BD2::ADDRESS, None)]]);
     }
 
     #[test]
     fn armv7a_new() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2181,11 +2370,12 @@ mod test {
 
     #[test]
     fn armv7a_core_halted() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2221,11 +2411,12 @@ mod test {
 
     #[test]
     fn armv7a_wait_for_core_halted() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2262,11 +2453,12 @@ mod test {
 
     #[test]
     fn armv7a_status_running() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2295,11 +2487,12 @@ mod test {
 
     #[test]
     fn armv7a_status_halted() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2333,11 +2526,12 @@ mod test {
     fn armv7a_read_core_reg_common() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2373,11 +2567,12 @@ mod test {
     fn armv7a_read_core_reg_pc() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2413,11 +2608,12 @@ mod test {
     fn armv7a_read_core_reg_cpsr() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2453,11 +2649,12 @@ mod test {
     fn armv7a_halt() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, false);
+        add_vector_catch_expectations(&mut probe);
 
         // Write halt request
         let mut dbgdrcr = Dbgdrcr(0);
@@ -2499,11 +2696,12 @@ mod test {
 
     #[test]
     fn armv7a_run() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2555,11 +2753,12 @@ mod test {
     #[test]
     fn armv7a_available_breakpoint_units() {
         const BP_COUNT: u32 = 4;
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2586,11 +2785,12 @@ mod test {
         const BP_COUNT: u32 = 4;
         const BP1: u64 = 0x2345;
         const BP2: u64 = 0x8000_0000;
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2656,11 +2856,12 @@ mod test {
     #[test]
     fn armv7a_set_hw_breakpoint() {
         const BP_VALUE: u64 = 0x2345;
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2700,11 +2901,12 @@ mod test {
 
     #[test]
     fn armv7a_clear_hw_breakpoint() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2738,11 +2940,12 @@ mod test {
         const MEMORY_VALUE: u32 = 0xBA5EBA11;
         const MEMORY_ADDRESS: u64 = 0x12345678;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);
@@ -2765,11 +2968,12 @@ mod test {
     }
 
     fn test_read_word(value: u32, address: u64, memory_word_address: u64, endian: Endian) -> u8 {
-        let mut probe = MockProbe::new();
+        let mut probe = MockProbe::new(TEST_BASE_ADDRESS);
         let mut state = CortexARState::new();
 
         // Add expectations
         add_status_expectations(&mut probe, true);
+        add_vector_catch_expectations(&mut probe);
         add_enable_itr_expectations(&mut probe);
         add_read_reg_expectations(&mut probe, 0, 0);
         add_read_fp_count_expectations(&mut probe);

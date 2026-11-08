@@ -9,7 +9,9 @@ macro_rules! info_command {
         pub struct $name {}
 
         impl Request for $name {
-            const COMMAND_ID: CommandId = CommandId::Info;
+            fn command(&self) -> CommandId {
+                CommandId::Info
+            }
 
             type Response = $response_type;
 
@@ -47,7 +49,9 @@ info_command!(0xF0, CapabilitiesCommand, Capabilities);
 pub struct TestDomainTimeCommand {}
 
 impl Request for TestDomainTimeCommand {
-    const COMMAND_ID: CommandId = CommandId::Info;
+    fn command(&self) -> CommandId {
+        CommandId::Info
+    }
 
     type Response = u32;
 
@@ -97,30 +101,36 @@ impl ParseFromResponse for Option<String> {
 
 impl ParseFromResponse for u8 {
     fn from_response(buffer: &[u8]) -> Result<Self, SendError> {
-        if buffer[0] != 1 {
+        if buffer.first() != Some(&1) {
             Err(SendError::UnexpectedAnswer)
         } else {
-            Ok(buffer.pread_with(1, LE).unwrap())
+            buffer
+                .pread_with(1, LE)
+                .map_err(|_| SendError::NotEnoughData)
         }
     }
 }
 
 impl ParseFromResponse for u16 {
     fn from_response(buffer: &[u8]) -> Result<Self, SendError> {
-        if buffer[0] != 2 {
+        if buffer.first() != Some(&2) {
             Err(SendError::UnexpectedAnswer)
         } else {
-            Ok(buffer.pread_with(1, LE).unwrap())
+            buffer
+                .pread_with(1, LE)
+                .map_err(|_| SendError::NotEnoughData)
         }
     }
 }
 
 impl ParseFromResponse for u32 {
     fn from_response(buffer: &[u8]) -> Result<Self, SendError> {
-        if buffer[0] != 4 {
+        if buffer.first() != Some(&4) {
             Err(SendError::UnexpectedAnswer)
         } else {
-            Ok(buffer.pread_with(1, LE).unwrap())
+            buffer
+                .pread_with(1, LE)
+                .map_err(|_| SendError::NotEnoughData)
         }
     }
 }
@@ -163,5 +173,23 @@ impl ParseFromResponse for Capabilities {
         } else {
             Err(SendError::UnexpectedAnswer)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_reply_is_an_error() {
+        let packet_size = PacketSizeCommand {};
+        assert!(matches!(
+            packet_size.parse_response(&[]),
+            Err(SendError::UnexpectedAnswer)
+        ));
+        assert!(matches!(
+            packet_size.parse_response(&[0x02, 0x40]),
+            Err(SendError::NotEnoughData)
+        ));
     }
 }

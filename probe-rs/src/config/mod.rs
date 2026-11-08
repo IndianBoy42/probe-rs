@@ -29,7 +29,7 @@ mod target;
 pub use probe_rs_target::{
     Chip, ChipFamily, Core, CoreType, Endian, FlashProperties, GenericRegion, InstructionSet,
     MemoryAccess, MemoryRange, MemoryRegion, NvmRegion, PageInfo, RamRegion, RawFlashAlgorithm,
-    ScanChainElement, SectorDescription, SectorInfo, TargetDescriptionSource,
+    ScanChainElement, SectorDescription, SectorInfo, TargetDescriptionSource, Xlen,
 };
 
 pub use registry::{Registry, RegistryError};
@@ -37,4 +37,4 @@ pub use target::{DebugSequence, Target, TargetSelector};
 
 // Crate-internal API
 pub(crate) use chip_info::ChipInfo;
-pub(crate) use target::CoreExt;
+pub(crate) use target::MemoryApExt;

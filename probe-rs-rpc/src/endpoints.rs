@@ -26,11 +26,16 @@ use crate::flash::{
 };
 use crate::info::{InfoEvent, TargetInfoRequest, TargetMetadataRequest, TargetMetadataResponse};
 use crate::memory::{ReadBytesRequest, ReadMemoryRequest, WriteMemoryRequest};
-use crate::monitor::{MonitorRequest, MonitorResponse, RttEvent, SemihostingEvent};
+use crate::monitor::{
+    MonitorRequest, MonitorResponse, RttEvent, SemihostingEvent, SerialEvent, SerialWriteRequest,
+    SerialWriteResponse,
+};
 use crate::probe::{
     AttachRequest, AttachResponse, ListProbesResponse, SelectProbeRequest, SelectProbeResponse,
 };
-use crate::reset::{ResetCoreAndHaltRequest, ResetCoreRequest};
+use crate::reset::{
+    ResetCoreAndHaltRequest, ResetCoreRequest, ResetTargetRequest, ResetTargetResponse,
+};
 use crate::rtt_client::{
     CreateRttClientRequest, CreateRttClientResponse, PollRttUpRequest, PollRttUpResponse,
     RttChannelRequest, RttChannelsResponse, RttDownRequest, RttDownResponse,
@@ -107,6 +112,8 @@ endpoints! {
     | CleanUpRttEndpoint           | RttChannelRequest      | NoResponse              | "rtt/clean_up"            |
     | ClearRttControlBlockEndpoint | RttChannelRequest      | NoResponse              | "rtt/clear_control_block" |
 
+    | SerialWriteEndpoint | SerialWriteRequest | SerialWriteResponse | "serial/write" |
+
     | ListTestsEndpoint         | ListTestsRequest        | ListTestsResponse       | "tests/list"       |
     | RunTestEndpoint           | RunTestRequest          | RunTestResponse         | "tests/run"        |
     | TestKickoffEndpoint       | TestKickoffRequest      | TestKickoffResponse     | "tests/kickoff"    |
@@ -122,6 +129,7 @@ endpoints! {
     | TargetInfoEndpoint        | TargetInfoRequest       | NoResponse              | "info"             |
     | ResetCoreEndpoint         | ResetCoreRequest        | NoResponse              | "reset"            |
     | ResetCoreAndHaltEndpoint  | ResetCoreAndHaltRequest | ResetAndHaltResponse    | "reset_and_halt"   |
+    | ResetTargetEndpoint       | ResetTargetRequest      | ResetTargetResponse     | "reset/target"     |
 
     | CoreStatusEndpoint           | CoreAccessRequest        | CoreStatusResponse         | "core/status"             |
     | CoreHaltEndpoint             | CoreHaltRequest          | CoreInfoResponse           | "core/halt"               |
@@ -166,4 +174,5 @@ topics! {
     | ProgressEventTopic  | ProgressEvent    | "flash/progress" |     |
     | RttTopic            | RttEvent         | "rtt"            |     |
     | SemihostingTopic    | SemihostingEvent | "semihosting"    |     |
+    | SerialTopic         | SerialEvent      | "serial"         |     |
 }

@@ -127,14 +127,11 @@ pub(crate) struct Connection {
     /// Set by [`Connection::sever`]; makes later calls fail fast even while
     /// other Arc clones keep this object alive.
     pub(crate) closed: AtomicBool,
-    /// Attach-time dry_run: the session runs on a mocked core, so the flash
-    /// path skips the boot step (a boot sequence just times out on it).
-    pub(crate) dry_run: bool,
     /// Where to rebuild the transport from after a dead-link failure.
     source: ConnSource,
     /// The attach request this connection was built with; reused by
     /// [`Connection::reattach`] so the rebuilt session keeps the original
-    /// attach policy (chip, speed, permissions, dry-run).
+    /// attach policy (chip, speed, permissions).
     request: AttachRequest,
     /// DWARF file pushed via `load_debug_info`; re-pushed after a reattach
     /// because the debug state lives in the (new) server session.
@@ -164,13 +161,11 @@ impl Connection {
         request: AttachRequest,
         source: ConnSource,
     ) -> Result<Self, BridgeError> {
-        let dry_run = request.dry_run;
         let session = Self::attach_session(client.clone(), request.clone()).await?;
         Ok(Self {
             inner: Mutex::new(Some(ConnectionInner { session })),
             breakpoints: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
-            dry_run,
             source,
             request,
             debug_info: Mutex::new(None),
@@ -450,16 +445,17 @@ pub(crate) mod test_support {
                 product_id: 0,
                 interface: None,
                 serial_number: "test".into(),
+                usb_location: None,
                 probe_type: "test".into(),
                 inaccessible: false,
             },
             speed: None,
             connect_under_reset: false,
-            dry_run: true,
             allow_erase_all: false,
             resume_target: false,
             wait_for_probe: None,
             client: None,
+            target_serial: false,
         }
     }
     pub(crate) fn for_tests() -> Arc<Connection> {
@@ -474,7 +470,6 @@ pub(crate) mod test_support {
             inner: Mutex::new(Some(ConnectionInner { session })),
             breakpoints: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
-            dry_run: true,
             source: ConnSource::Local,
             request: test_attach_request(),
             debug_info: Mutex::new(None),
@@ -502,7 +497,6 @@ pub(crate) mod test_support {
                 inner: Mutex::new(Some(ConnectionInner { session })),
                 breakpoints: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
-                dry_run: true,
                 source: ConnSource::Local,
                 request: test_attach_request(),
                 debug_info: Mutex::new(None),

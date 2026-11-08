@@ -7,7 +7,8 @@ use postcard_rpc::{
     Topic, TopicDirection,
     header::{VarSeq, VarSeqKind},
     host_client::{
-        HostClient, HostClientConfig, HostErr, IoClosed, SchemaError, SchemaReport, Subscription,
+        HostClient, HostClientConfig, HostErr, IoClosed, MultiSubRxError, SchemaError,
+        SchemaReport, Subscription,
     },
     standard_icd::{GetAllSchemaDataTopic, GetAllSchemasEndpoint, OwnedSchemaData, WireError},
 };
@@ -61,12 +62,13 @@ use probe_rs_rpc::info::{
 use probe_rs_rpc::memory::{ReadBytesRequest, ReadMemoryRequest, WriteMemoryRequest};
 use probe_rs_rpc::monitor::{
     MonitorExitReason, MonitorMode, MonitorOptions, MonitorRequest, RttEvent, SemihostingEvent,
+    SerialEvent, SerialWriteRequest,
 };
 use probe_rs_rpc::probe::{
     AttachRequest, AttachResult, DebugProbeEntry, DebugProbeSelector, SelectProbeRequest,
     SelectProbeResult,
 };
-use probe_rs_rpc::reset::{ResetCoreAndHaltRequest, ResetCoreRequest};
+use probe_rs_rpc::reset::{ResetCoreAndHaltRequest, ResetCoreRequest, ResetTargetRequest};
 use probe_rs_rpc::rtt_client::{
     CreateRttClientRequest, PollRttUpRequest, RttChannelRequest, RttChannels, RttClientData,
     RttDownRequest, RttPollResult, ScanRegion,
@@ -80,7 +82,10 @@ use probe_rs_rpc::stack_trace::{
 use probe_rs_rpc::test::{
     ListTestsRequest, RunTestRequest, Test, TestKickoffRequest, TestResult, Tests,
 };
-use probe_rs_rpc::transport::memory::{PostcardReceiver, PostcardSender, WireRx, WireTx};
+use probe_rs_rpc::transport::{
+    Closer,
+    memory::{PostcardReceiver, PostcardSender, WireRx, WireTx},
+};
 use probe_rs_rpc::{
     AttachEndpoint, BootEndpoint, BuildEndpoint, ChipInfoEndpoint, CleanUpRttEndpoint,
     ClearCoreDebugStateEndpoint, ClearRttControlBlockEndpoint, CoreClearHwBpsEndpoint,
@@ -93,13 +98,14 @@ use probe_rs_rpc::{
     LoadChipFamilyEndpoint, LoadDebugInfoEndpoint, LoadRegionEndpoint, LoadSvdEndpoint,
     MonitorEndpoint, NewFlashLoaderEndpoint, PollRttUpEndpoint, ProgressEventTopic,
     ReadBytesEndpoint, ReadMemory8Endpoint, ReadMemory16Endpoint, ReadMemory32Endpoint,
-    ReadMemory64Endpoint, ResetCoreAndHaltEndpoint, ResetCoreEndpoint,
+    ReadMemory64Endpoint, ResetCoreAndHaltEndpoint, ResetCoreEndpoint, ResetTargetEndpoint,
     ResolveSourceBreakpointsEndpoint, ResolveSourceLocationsEndpoint, ResumeCoresEndpoint,
     RpcError, RpcResult, RttDownEndpoint, RttTopic, RunTestEndpoint, ScopesEndpoint,
-    SelectProbeEndpoint, SemihostingTopic, SetVariableEndpoint, TakeRichStackTraceEndpoint,
-    TakeStackTraceEndpoint, TargetInfoDataTopic, TargetInfoEndpoint, TargetMetadataEndpoint,
-    TempFileDataEndpoint, TestKickoffEndpoint, TokioSpawner, VariablesEndpoint, VerifyEndpoint,
-    WriteMemory8Endpoint, WriteMemory16Endpoint, WriteMemory32Endpoint, WriteMemory64Endpoint,
+    SelectProbeEndpoint, SemihostingTopic, SerialTopic, SerialWriteEndpoint, SetVariableEndpoint,
+    TakeRichStackTraceEndpoint, TakeStackTraceEndpoint, TargetInfoDataTopic, TargetInfoEndpoint,
+    TargetMetadataEndpoint, TempFileDataEndpoint, TestKickoffEndpoint, TokioSpawner,
+    VariablesEndpoint, VerifyEndpoint, WriteMemory8Endpoint, WriteMemory16Endpoint,
+    WriteMemory32Endpoint, WriteMemory64Endpoint,
 };
 use probe_rs_rpc::{FlashLoader, Key, RttClient, Session};
 
@@ -185,6 +191,7 @@ where
     let (tx, rx) = ws_stream.split();
 
     let tx = WebsocketTx::new(tx);
+    let closer = tx.closer();
     tx.send(challenge_response).await.map_err(|err| {
         TransportError::Message(format!("Failed to send challenge response: {err:?}"))
     })?;
@@ -198,15 +205,69 @@ where
             })
         })),
     )
+    .with_closer(closer)
     .ensure_compatible()
     .await
 }
 
+/// Returns the URI of the worker endpoint of a `ws://` or `wss://` server.
+#[cfg(feature = "remote")]
+fn worker_uri(connection_string: &str) -> Result<http::Uri, ClientError> {
+    use http::{
+        Uri,
+        uri::{PathAndQuery, Scheme},
+    };
+    use std::str::FromStr;
+
+    let mut parts = Uri::from_str(connection_string)
+        .map_err(|_| ClientError::InvalidRemoteHost)?
+        .into_parts();
+    // A scheme is case-insensitive, but tungstenite accepts only the lowercase form.
+    let scheme = parts
+        .scheme
+        .as_ref()
+        .map(|scheme| scheme.as_str().to_ascii_lowercase());
+    let Some(scheme @ ("ws" | "wss")) = scheme.as_deref() else {
+        return Err(ClientError::InvalidRemoteHost);
+    };
+    let path_and_query = parts.path_and_query.as_ref();
+    let has_query = path_and_query.is_some_and(|path_and_query| path_and_query.query().is_some());
+    let has_host = parts
+        .authority
+        .as_ref()
+        .is_some_and(|authority| !authority.host().is_empty());
+    if !has_host || has_query {
+        return Err(ClientError::InvalidRemoteHost);
+    }
+
+    let prefix = path_and_query
+        .map_or("", |path_and_query| path_and_query.path())
+        .trim_end_matches('/');
+    let worker = PathAndQuery::try_from(format!("{prefix}/worker"))
+        .map_err(|_| ClientError::InvalidRemoteHost)?;
+    parts.scheme = Some(Scheme::from_str(scheme).map_err(|_| ClientError::InvalidRemoteHost)?);
+    parts.path_and_query = Some(worker);
+    Uri::from_parts(parts).map_err(|_| ClientError::InvalidRemoteHost)
+}
+
+/// Returns `uri` without the user information, which can hold a password.
+#[cfg(feature = "remote")]
+fn without_userinfo(uri: &http::Uri) -> String {
+    let authority = uri.authority().map_or("", |authority| authority.as_str());
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    format!(
+        "{}://{host_and_port}{}",
+        uri.scheme_str().unwrap_or_default(),
+        uri.path()
+    )
+}
+
 /// Connect to a `probe-rs serve` server.
 ///
-/// `host` selects the transport by its prefix:
+/// `connection_string` selects the transport by its prefix:
 ///
-/// - `ws://` or `wss://`: a websocket.
+/// - `ws://` or `wss://`: a websocket. A path, for example the prefix of a
+///   reverse proxy, comes before the `/worker` endpoint.
 /// - `ssh://`, followed by `[user@]destination[:port]`: a websocket that runs
 ///   over `ssh -W`. The port defaults to 3000, and names the port of the
 ///   server on the loopback interface of the remote host, not the ssh port.
@@ -219,47 +280,22 @@ pub async fn connect(
     token: Option<&str>,
     user_agent: &str,
 ) -> Result<RpcClient, ClientError> {
-    use http::{Uri, uri::PathAndQuery};
     use rustls::ClientConfig;
-    use std::str::FromStr;
     use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::ClientRequestBuilder};
 
-    let mut parts = Uri::from_str(connection_string)
-        .map_err(|_| ClientError::InvalidRemoteHost)?
-        .into_parts();
+    #[cfg(unix)]
+    if let Some(path) = connection_string.strip_prefix("socket://") {
+        tracing::debug!("Socket path detected, will connect via Unix socket.");
 
-    let authority = parts
-        .authority
-        .clone()
-        .ok_or(ClientError::InvalidRemoteHost)?;
-    let scheme = parts
-        .scheme
-        .as_ref()
-        .ok_or(ClientError::InvalidRemoteHost)?;
-    let path_and_query = parts.path_and_query.ok_or(ClientError::InvalidRemoteHost)?;
-
-    match scheme.as_str() {
-        #[cfg(unix)]
-        "socket" => {
-            tracing::debug!("Socket path detected, will connect via Unix socket.");
-
-            return connect_unix(path_and_query.path()).await;
-        }
-        "ssh" => {
-            return ssh::connect(authority.host(), token, user_agent).await;
-        }
-        "ws" | "wss" => {
-            if path_and_query != PathAndQuery::from_static("/") {
-                Err(ClientError::InvalidRemoteHost)?
-            }
-        }
-        _ => Err(ClientError::InvalidRemoteHost)?,
+        return connect_unix(path).await;
     }
 
-    let uri = {
-        parts.path_and_query = Some(PathAndQuery::from_static("/worker"));
-        Uri::from_parts(parts).map_err(|_| ClientError::InvalidRemoteHost)?
-    };
+    if let Some(destination) = connection_string.strip_prefix("ssh://") {
+        return ssh::connect(destination, token, user_agent).await;
+    }
+
+    let uri = worker_uri(connection_string)?;
+    let shown_uri = without_userinfo(&uri);
 
     // We could check the host address for localhost and then set the `is_localhost` option, but
     // there are setups where the user uses port forwarding and the file actually needs to be
@@ -268,10 +304,13 @@ pub async fn connect(
     let req = ClientRequestBuilder::new(uri).with_header("User-Agent", user_agent);
 
     // TODO: implement something more secure
-    let rustls_connector = ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let rustls_connector = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| TransportError::Message(format!("Failed to configure TLS: {error}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(tls::NoCertificateVerification::new(
-            rustls::crypto::ring::default_provider(),
+            (*provider).clone(),
         )))
         .with_no_client_auth();
 
@@ -284,7 +323,9 @@ pub async fn connect(
         ))),
     )
     .await
-    .map_err(|_| TransportError::Message(format!("Failed to connect to {}", authority.host())))?;
+    .map_err(|error| {
+        TransportError::Message(format!("Failed to connect to {shown_uri}: {error}"))
+    })?;
 
     // Respond to the challenge
     let challenge = resp
@@ -382,6 +423,7 @@ pub struct RpcClient {
     client: HostClient<WireError>,
     upload_cache: Arc<Mutex<UploadCache>>,
     is_localhost: bool,
+    closer: Option<Closer>,
 }
 
 impl Drop for RpcClient {
@@ -412,7 +454,27 @@ impl RpcClient {
             ),
             upload_cache: Arc::new(Mutex::new(UploadCache::default())),
             is_localhost: false,
+            closer: None,
         }
+    }
+
+    /// Sets the handle that [`RpcClient::close`] uses to close the connection.
+    pub fn with_closer(mut self, closer: Closer) -> Self {
+        self.closer = Some(closer);
+        self
+    }
+
+    /// Closes the connection for all clones of this client, and waits until the close message is sent.
+    pub async fn close(self) {
+        if let Some(closer) = &self.closer
+            && tokio::time::timeout(Duration::from_secs(2), closer.close())
+                .await
+                .is_err()
+        {
+            // A hung server must not stop the command from ending.
+            tracing::debug!("Timed out while closing the connection");
+        }
+        self.client.close();
     }
 
     pub fn is_local_session(&self) -> bool {
@@ -440,8 +502,12 @@ impl RpcClient {
         expected: &SchemaReport,
     ) -> Result<SchemaReport, SchemaError<WireError>> {
         // Our own copy of hostClient::get_schema_report so that we can tune capacity.
-        let expected_messages =
-            expected.endpoints.len() + expected.topics_in.len() + expected.topics_out.len();
+        // The subscription drops the oldest message when it is full, so it must hold
+        // every message of a matching server.
+        let expected_messages = expected.types.len()
+            + expected.endpoints.len()
+            + expected.topics_in.len()
+            + expected.topics_out.len();
         let Ok(mut sub) = self
             .client
             .subscribe_multi::<GetAllSchemaDataTopic>(expected_messages)
@@ -450,25 +516,34 @@ impl RpcClient {
             return Err(SchemaError::Comms(HostErr::Closed));
         };
 
-        let collect_task = tokio::task::spawn({
-            async move {
-                let mut got = vec![];
-                while let Ok(Ok(val)) =
-                    tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
-                {
-                    got.push(val);
-                }
-                got
-            }
-        });
-        let trigger_task = self.client.send_resp::<GetAllSchemasEndpoint>(&()).await;
-        let data = collect_task.await;
-        let (resp, data) = match (trigger_task, data) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Ok(_), Err(_)) => return Err(SchemaError::TaskError),
-            (Err(e), Ok(_)) => return Err(SchemaError::Comms(e)),
-            (Err(e1), Err(_e2)) => return Err(SchemaError::Comms(e1)),
+        let receive = |message| match message {
+            Ok(data) => Ok(data),
+            Err(MultiSubRxError::IoClosed) => Err(SchemaError::Comms(HostErr::Closed)),
+            Err(MultiSubRxError::Lagged(_)) => Err(SchemaError::LostData),
         };
+
+        // Receive the data while the request runs, so that the subscription does not fill up.
+        let mut data = vec![];
+        let mut request = std::pin::pin!(self.client.send_resp::<GetAllSchemasEndpoint>(&()));
+        let resp = loop {
+            tokio::select! {
+                resp = &mut request => break resp.map_err(SchemaError::Comms)?,
+                message = sub.recv() => data.push(receive(message)?),
+            }
+        };
+
+        // The server sends the response after the data, so the rest of the data
+        // is already in the subscription. The timeout covers a message that the
+        // subscription cannot decode.
+        let sent =
+            resp.types_sent + resp.endpoints_sent + resp.topics_in_sent + resp.topics_out_sent;
+        while data.len() < sent as usize {
+            match tokio::time::timeout(Duration::from_millis(500), sub.recv()).await {
+                Ok(message) => data.push(receive(message)?),
+                Err(_) => return Err(SchemaError::LostData),
+            }
+        }
+
         let mut rpt = SchemaReport::default();
         let mut e_and_t = vec![];
 
@@ -699,6 +774,15 @@ impl RpcClient {
     ) -> Result<SelectProbeResult, ClientError> {
         self.send_resp::<SelectProbeEndpoint, _>(&SelectProbeRequest { probe: selector })
             .await
+    }
+
+    /// Resets the target with the reset line of the probe or through the debug interface. The
+    /// probe settings select the method if the request does not.
+    pub async fn reset_target(
+        &self,
+        request: ResetTargetRequest,
+    ) -> Result<AttachResult<()>, ClientError> {
+        self.send_resp::<ResetTargetEndpoint, _>(&request).await
     }
 
     pub async fn info(
@@ -1013,6 +1097,16 @@ impl SessionInterface {
                 },
                 on_msg,
             )
+            .await
+    }
+
+    /// Writes to the serial port to the target. Returns the number of bytes written.
+    pub async fn send_to_serial(&self, data: Vec<u8>) -> Result<u32, ClientError> {
+        self.client
+            .send_resp::<SerialWriteEndpoint, _>(&SerialWriteRequest {
+                sessid: self.sessid,
+                data,
+            })
             .await
     }
 
@@ -1811,9 +1905,11 @@ pub(crate) trait MultiSubscription {
     }
 }
 
+#[derive(Debug)]
 pub enum MonitorEvent {
     Rtt(RttEvent),
     Semihosting(SemihostingEvent),
+    Serial(SerialEvent),
 }
 
 impl MultiTopic for MonitorEvent {
@@ -1831,13 +1927,19 @@ impl MultiTopic for MonitorEvent {
         // one for RTT, one for semihosting, then introduce a MultiSubscription impl for them
         let rtt = RttTopic::subscribe(client, depth).await?;
         let semihosting = SemihostingTopic::subscribe(client, depth).await?;
-        Ok(MonitorSubscription { rtt, semihosting })
+        let serial = SerialTopic::subscribe(client, depth).await?;
+        Ok(MonitorSubscription {
+            rtt,
+            semihosting,
+            serial,
+        })
     }
 }
 
 pub(crate) struct MonitorSubscription {
     rtt: <RttTopic as MultiTopic>::Subscription,
     semihosting: <SemihostingTopic as MultiTopic>::Subscription,
+    serial: <SerialTopic as MultiTopic>::Subscription,
 }
 impl MultiSubscription for MonitorSubscription {
     type Message = MonitorEvent;
@@ -1846,6 +1948,7 @@ impl MultiSubscription for MonitorSubscription {
         tokio::select! {
             message = self.rtt.recv() => message.map(MonitorEvent::Rtt),
             message = self.semihosting.recv() => message.map(MonitorEvent::Semihosting),
+            message = self.serial.recv() => message.map(MonitorEvent::Serial),
         }
     }
 }
@@ -1858,5 +1961,132 @@ where
 
     async fn next(&mut self) -> Option<Self::Message> {
         self.recv().await
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::{RpcClient, without_userinfo, worker_uri};
+    use futures_util::StreamExt as _;
+    use std::time::Duration;
+    use tokio::io::DuplexStream;
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message, protocol::Role},
+    };
+
+    fn websocket_client(client_ws: WebSocketStream<DuplexStream>) -> RpcClient {
+        use probe_rs_rpc::transport::websocket::{WebsocketRx, WebsocketTx};
+        use tokio_util::bytes::Bytes;
+
+        let (tx, rx) = client_ws.split();
+        let tx = WebsocketTx::new(tx);
+        let closer = tx.closer();
+        RpcClient::new_from_wire(
+            tx,
+            WebsocketRx::new(rx.map(|message| {
+                message.map(|message| match message {
+                    Message::Binary(binary) => binary,
+                    _ => Bytes::new(),
+                })
+            })),
+        )
+        .with_closer(closer)
+    }
+
+    /// Reads the server side of the websocket until it ends, and checks for a close frame.
+    async fn assert_close_frame(mut server_ws: WebSocketStream<DuplexStream>) {
+        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut messages = Vec::new();
+            while let Some(message) = server_ws.next().await {
+                messages.push(format!("{message:?}"));
+            }
+            messages
+        })
+        .await
+        .expect("the websocket stayed open");
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.starts_with("Ok(Close(")),
+            "no close frame, the server got: {messages:?}"
+        );
+    }
+
+    /// The client must end the websocket with a close frame, so that the
+    /// server can tell a clean exit from a lost connection.
+    #[tokio::test]
+    async fn dropping_the_client_closes_the_websocket() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+
+        drop(websocket_client(client_ws));
+
+        assert_close_frame(server_ws).await;
+    }
+
+    /// A CLI command ends its runtime right after it is done with the client.
+    /// The close frame must be sent before that.
+    #[test]
+    fn the_close_frame_is_sent_before_the_runtime_stops() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        client_runtime.block_on(async {
+            let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            websocket_client(client_ws).close().await;
+        });
+        drop(client_runtime);
+
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        server_runtime.block_on(async {
+            let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            assert_close_frame(server_ws).await;
+        });
+    }
+
+    #[test]
+    fn a_websocket_path_comes_before_the_worker_endpoint() {
+        for (connection_string, uri) in [
+            ("ws://host:3000", "ws://host:3000/worker"),
+            ("ws://host:3000/", "ws://host:3000/worker"),
+            ("wss://host/probe", "wss://host/probe/worker"),
+            ("wss://host/probe/", "wss://host/probe/worker"),
+            ("ws://host//", "ws://host/worker"),
+            ("WSS://host/probe", "wss://host/probe/worker"),
+            ("ws://user@host:3000", "ws://user@host:3000/worker"),
+        ] {
+            assert_eq!(worker_uri(connection_string).unwrap().to_string(), uri);
+        }
+    }
+
+    #[test]
+    fn an_error_shows_the_uri_without_the_password() {
+        let uri = worker_uri("wss://user:secret@host:3000/probe").unwrap();
+        assert_eq!(without_userinfo(&uri), "wss://host:3000/probe/worker");
+    }
+
+    #[test]
+    fn other_connection_strings_are_refused() {
+        for connection_string in [
+            "http://host:3000",
+            "HTTP://host:3000",
+            "host:3000",
+            "ws://:3000",
+            "ws://host/probe?token=1",
+        ] {
+            assert!(
+                worker_uri(connection_string).is_err(),
+                "{connection_string}"
+            );
+        }
     }
 }

@@ -1,7 +1,6 @@
 on:
-  push:
-    branches: [master, staging, trying]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
   workflow_dispatch:
 
@@ -10,17 +9,15 @@ name: Run smoke test
 env:
   CARGO_INCREMENTAL: 0
 
-# Cancel any currently running workflows from the same PR, branch, or
-# tag when a new workflow is triggered.
-#
-# https://stackoverflow.com/a/66336834
-concurrency:
-  cancel-in-progress: true
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-
 jobs:
   build-smoke-tester:
+    # Skip the slow hardware tests on draft PRs.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04-arm
+    # A new run of the same PR, branch, or tag cancels this job.
+    concurrency:
+      cancel-in-progress: true
+      group: ${{ github.workflow }}-build-smoke-tester-${{ github.event.pull_request.number || github.ref }}
 
     steps:
       - name: Checkout sources
@@ -32,7 +29,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Cache Dependencies
-        uses: Swatinem/rust-cache@v2.9.2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Show rust info
         run: rustup show
@@ -46,7 +43,12 @@ jobs:
           path: smoke_tester.tar.zst
 
   build-probe-rs:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+    # A new run of the same PR, branch, or tag cancels this job.
+    concurrency:
+      cancel-in-progress: true
+      group: ${{ github.workflow }}-build-probe-rs-${{ github.event.pull_request.number || github.ref }}
 
     steps:
       - name: Checkout sources
@@ -56,12 +58,12 @@ jobs:
         run: rustup target add aarch64-unknown-linux-gnu
 
       - name: Install cross
-        uses: taiki-e/install-action@v2.87.17
+        uses: taiki-e/install-action@v2.89.0
         with:
           tool: cross
 
       - name: Cache Dependencies
-        uses: Swatinem/rust-cache@v2.9.2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build probe-rs
         run: cross build --release --target aarch64-unknown-linux-gnu -p probe-rs-tools
@@ -73,10 +75,15 @@ jobs:
 
   test:
     runs-on: ["self-hosted", "linux", "ARM64", "${{ matrix.runner }}"]
+    # Do not cancel a running hardware job: that can leave the boards in a bad state.
+    # A new run of the same PR, branch, or tag waits for it.
+    concurrency:
+      cancel-in-progress: false
+      group: ${{ github.workflow }}-test-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ["smoke-test", "smoke-tester-2", "probe-rs-tester-0"]
+        runner: ["smoke-tester-2", "probe-rs-tester-0"]
 
     needs: build-smoke-tester
 
@@ -98,11 +105,123 @@ jobs:
           name: smoke_tester
 
       - name: Run smoke-tester
+        env:
+          # The runner empties its temp directory for each job.
+          SMOKE_TESTER_BENCH_OUT: ${{ runner.temp }}/bench.jsonl
         run: |
-          cargo-nextest nextest run --archive-file smoke_tester.tar.zst --profile ci-hardware --workspace-remap $GITHUB_WORKSPACE/src
+          cargo-nextest nextest run --archive-file smoke_tester.tar.zst --profile ci-hardware --workspace-remap "$GITHUB_WORKSPACE/src"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: bench-${{ matrix.runner }}
+          path: ${{ runner.temp }}/bench.jsonl
+          if-no-files-found: ignore
+          overwrite: true
+
+  bench-report:
+    needs: test
+    if: ${{ !cancelled() && needs.test.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      # The test jobs upload nothing if they fail early. The report then shows no results.
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: bench-*
+          path: bench
+
+      # The baseline of each test is its result of the nearest first-parent ancestor of the base
+      # commit. Its results of the last 30 give the noise. The comment workflow uses
+      # report/baseline.jsonl.
+      - name: Find the baseline
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          mkdir baseline
+          if [ -n "$BASE" ] && git fetch -q --depth=30 origin "$BASE" && git fetch -q --depth=1 origin bench-data; then
+            for sha in $(git rev-list --first-parent -n 30 "$BASE"); do
+              if git cat-file -e "FETCH_HEAD:$sha.jsonl" 2> /dev/null; then
+                git show "FETCH_HEAD:$sha.jsonl" > "baseline/$sha.jsonl"
+                echo "$sha" >> baseline/order
+              fi
+            done
+          fi
+          if [ ! -s baseline/order ]; then
+            echo "::warning::No baseline in the last 30 first-parent commits of ${BASE:-the base}."
+          fi
+
+      - name: Compare with the baseline
+        run: |
+          args=(--run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          if [ -s baseline/order ]; then
+            while read -r sha; do
+              args+=(--baseline "baseline/$sha.jsonl")
+            done < baseline/order
+          fi
+          python3 smoke-tester/bench_report.py bench report "${args[@]}"
+          cat report/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report
+          path: report
+          overwrite: true
+
+  bench-publish:
+    needs: bench-report
+    # The merge queue tests the commit that lands on master. Publish the results also if a test job
+    # failed.
+    if: ${{ !cancelled() && needs.bench-report.result == 'success' && github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-report
+          path: ${{ runner.temp }}/report
+
+      # Other publish jobs can push at the same time. If the push fails, start again from the new
+      # branch head.
+      - name: Add the results to the bench-data branch
+        run: |
+          results="$RUNNER_TEMP/report/results.jsonl"
+          [ -s "$results" ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            if git fetch -q --depth=1 origin bench-data; then
+              git switch -q --detach FETCH_HEAD
+            else
+              git switch -q --orphan "bench-data-$attempt"
+            fi
+            cp "$results" "$GITHUB_SHA.jsonl"
+            git add "$GITHUB_SHA.jsonl"
+            git diff --cached --quiet && exit 0
+            git commit -q -m "Add benchmark results for $GITHUB_SHA"
+            git push -q origin HEAD:refs/heads/bench-data && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1
 
   embedded-test:
     runs-on: ["self-hosted", "linux", "ARM64", "${{ matrix.runner }}"]
+    # Do not cancel a running hardware job: that can leave the boards in a bad state.
+    # A new run of the same PR, branch, or tag waits for it.
+    concurrency:
+      cancel-in-progress: false
+      group: ${{ github.workflow }}-embedded-test-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
     strategy:
       matrix:
         runner: ["smoke-tester-2"]

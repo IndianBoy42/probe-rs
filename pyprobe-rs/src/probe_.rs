@@ -44,6 +44,7 @@ impl ListerPy {
                 product_id: p.pid,
                 interface: None,
                 serial_number: p.serial,
+                usb_location: None,
             }
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -54,7 +55,7 @@ impl ListerPy {
         Ok(ProbePy {
             inner: Some(probe),
             selector: Some(sel),
-            dry_run: false,
+            is_fake: false,
             speed_khz: None,
             protocol: None,
             enumerated_remotely: false,
@@ -70,6 +71,9 @@ pub struct ProbeInfo {
     product_id: u16,
     interface: Option<u8>,
     serial_number: Option<String>,
+    /// USB bus ID and device address. Distinguishes probes that share a
+    /// VID/PID/serial; `None` for locally-listed probes whose info omits it.
+    usb_location: Option<(String, u8)>,
     probe_type: String,
     inaccessible: bool,
     /// Present only for locally-listed probes; RPC listings carry no probe
@@ -86,6 +90,7 @@ impl From<DebugProbeInfo> for ProbeInfo {
             // DebugProbeInfo cannot expose its interface (private field).
             interface: None,
             serial_number: info.serial_number.clone(),
+            usb_location: info.usb_location.clone(),
             // DebugProbeInfo cannot expose its probe factory (private
             // field), so the type name is only known for RPC listings.
             probe_type: String::new(),
@@ -104,6 +109,7 @@ impl ProbeInfo {
             product_id: entry.product_id,
             interface: entry.interface,
             serial_number: Some(entry.serial_number.clone()).filter(|s| !s.is_empty()),
+            usb_location: entry.usb_location.clone(),
             probe_type: entry.probe_type.clone(),
             inaccessible: entry.inaccessible,
             local: None,
@@ -129,6 +135,15 @@ impl ProbeInfo {
     #[getter]
     fn serial(&self) -> Option<String> {
         self.serial_number.clone()
+    }
+
+    /// USB bus ID and device address, e.g. `("1-2", 5)`, when known.
+    ///
+    /// Two probes can share a VID/PID/serial (clones, or two interfaces of one
+    /// probe); the location is what tells them apart.
+    #[getter]
+    fn usb_location(&self) -> Option<(String, u8)> {
+        self.usb_location.clone()
     }
 
     /// Probe identifier name.
@@ -165,8 +180,9 @@ impl ProbeInfo {
                     product_id: self.product_id,
                     serial_number: self.serial_number.clone(),
                     interface: self.interface,
+                    usb_location: self.usb_location.clone(),
                 }),
-                dry_run: false,
+                is_fake: false,
                 speed_khz: None,
                 protocol: None,
                 enumerated_remotely: false,
@@ -188,8 +204,9 @@ impl ProbeInfo {
                 product_id: self.product_id,
                 serial_number: self.serial_number.clone(),
                 interface: self.interface,
+                usb_location: self.usb_location.clone(),
             }),
-            dry_run: false,
+            is_fake: false,
             speed_khz: None,
             protocol: None,
             enumerated_remotely: true,
@@ -230,10 +247,10 @@ fn no_local_handle(enumerated_remotely: bool) -> PyErr {
 pub struct ProbePy {
     pub(crate) inner: Option<Probe>,
     pub(crate) selector: Option<probe_rs::probe::DebugProbeSelector>,
-    /// Set when built from a FakeProbe: attach becomes a server-side
-    /// dry-run session (mocked core, no probe lease) so hardware-less
-    /// tests keep working through the RPC facade.
-    pub(crate) dry_run: bool,
+    /// Set when built from a FakeProbe. Such a probe has a local handle only:
+    /// the RPC protocol no longer carries a fake-probe attach, so `attach()`
+    /// raises instead of claiming a real probe.
+    pub(crate) is_fake: bool,
     /// Locally applied probe settings; forwarded into the attach request
     /// because the server owns the real probe handle after attach.
     pub(crate) speed_khz: Option<u32>,
@@ -249,7 +266,7 @@ impl From<Probe> for ProbePy {
         Self {
             inner: Some(p),
             selector: None,
-            dry_run: false,
+            is_fake: false,
             speed_khz: None,
             protocol: None,
             enumerated_remotely: false,
@@ -403,7 +420,7 @@ impl ProbePy {
         Ok(ProbePy {
             inner: Some(inner.into_probe()),
             selector: None,
-            dry_run: true,
+            is_fake: true,
             speed_khz: None,
             protocol: None,
             enumerated_remotely: false,
@@ -429,6 +446,9 @@ impl ProbePy {
         connect_under_reset: bool,
         wait_for_probe: Option<f64>,
     ) -> PyResult<Session> {
+        if self.is_fake {
+            return Err(crate::error::dry_run_unsupported());
+        }
         // Release the local USB claim before the server opens the probe.
         self.inner.take();
         let selector = self
@@ -439,6 +459,7 @@ impl ProbePy {
                 product_id: sel.product_id,
                 interface: sel.interface,
                 serial_number: sel.serial_number,
+                usb_location: sel.usb_location,
             });
         crate::session::Session::attach_selected(
             target,
@@ -446,7 +467,6 @@ impl ProbePy {
             self.speed_khz,
             self.protocol,
             allow_erase,
-            self.dry_run,
             connect_under_reset,
             wait_for_probe,
         )
@@ -487,7 +507,7 @@ impl FakeProbePy {
         Ok(ProbePy {
             inner: Some(fp.into_probe()),
             selector: None,
-            dry_run: true,
+            is_fake: true,
             speed_khz: None,
             protocol: None,
             enumerated_remotely: false,

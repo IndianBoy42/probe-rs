@@ -26,9 +26,9 @@ use crate::rpc::{
         },
         info::{target_info, target_metadata},
         memory::{read_bytes, read_memory, write_memory},
-        monitor::monitor,
+        monitor::{monitor, write_serial},
         probe::{attach, list_probes, select_probe},
-        reset::{reset, reset_and_halt},
+        reset::{reset, reset_and_halt, reset_target},
         rtt_client::{
             clean_up_rtt, clear_rtt_control_block, create_rtt_client, get_rtt_channels,
             poll_rtt_up, write_rtt_down,
@@ -37,7 +37,12 @@ use crate::rpc::{
         test::{list_tests, run_test, test_kickoff},
     },
 };
-use probe_rs_rpc::transport::memory::{WireRx, WireTx};
+use crate::util::probe_config::ConfiguredLister;
+use probe_rs_rpc::semihosting_options::SemihostingOptions;
+use probe_rs_rpc::transport::{
+    MAX_REQUEST_LEN,
+    memory::{WireRx, WireTx},
+};
 
 use anyhow::anyhow;
 use futures_util::FutureExt;
@@ -82,13 +87,14 @@ pub struct RpcSpawnContext {
     sender: PostcardSender<WireTxImpl>,
     probe_broker: Arc<ProbeBroker>,
     lister: Arc<dyn ProbeLister + Send + Sync>,
+    host_files: HostFiles,
 }
 
 pub(crate) trait MultiTopicWriter {
     type Sender: Send + 'static;
     type Publisher: MultiTopicPublisher;
 
-    fn create(token: CancellationToken) -> (Self::Sender, Self::Publisher);
+    fn create() -> (Self::Sender, Self::Publisher);
 }
 
 impl<T> MultiTopicWriter for T
@@ -99,9 +105,9 @@ where
     type Sender = Sender<T::Message>;
     type Publisher = TopicPublisher<T>;
 
-    fn create(token: CancellationToken) -> (Self::Sender, Self::Publisher) {
+    fn create() -> (Self::Sender, Self::Publisher) {
         let (tx, rx) = channel::<T::Message>(256);
-        (tx, TopicPublisher { rx, token })
+        (tx, TopicPublisher { rx })
     }
 }
 
@@ -115,7 +121,6 @@ where
     T::Message: Serialize + Sized + Send + 'static,
 {
     rx: Receiver<T::Message>,
-    token: CancellationToken,
 }
 
 impl<T> MultiTopicPublisher for TopicPublisher<T>
@@ -124,30 +129,18 @@ where
     T::Message: Serialize + Sized + Send + 'static,
 {
     async fn publish(mut self, sender: &PostcardSender<WireTxImpl>) {
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = self.token.cancelled() => break,
-                Some(event) = self.rx.recv() => {
-                    sender
-                        .publish::<T>(VarSeq::Seq2(0), &event)
-                        .await
-                        .unwrap();
-                }
+        // Run until the task drops its sender, also after a cancel, so that its last events reach
+        // the client.
+        while let Some(event) = self.rx.recv().await {
+            if sender.publish::<T>(VarSeq::Seq2(0), &event).await.is_err() {
+                tracing::debug!("Client is gone, dropping the events of {}", T::PATH);
+                break;
             }
         }
-        std::mem::drop(self.rx);
-
-        futures_util::future::pending().await
     }
 }
 
 impl RpcSpawnContext {
-    fn dry_run(&self, sessid: Key<Session>) -> bool {
-        self.shared_session(sessid).dry_run()
-    }
-
     fn session_blocking(
         &self,
         sessid: Key<Session>,
@@ -182,13 +175,28 @@ impl RpcSpawnContext {
         Lister::with_lister(Box::new(ArcLister(self.lister.clone())))
     }
 
+    /// Returns the semihosting options of a request, or an error if they map paths and the
+    /// server does not give access to its files.
+    pub(crate) fn semihosting_options(
+        &self,
+        options: SemihostingOptions,
+    ) -> anyhow::Result<SemihostingOptions> {
+        if self.host_files == HostFiles::Deny && !options.mappings().is_empty() {
+            anyhow::bail!(
+                "This server does not give semihosting access to its files. \
+                Remove the semihosting file mappings."
+            );
+        }
+        Ok(options)
+    }
+
     pub(crate) async fn set_session(
         &self,
         session: probe_rs::Session,
-        dry_run: bool,
-        lease: Option<crate::rpc::probe_broker::ProbeLease>,
+        target_serial: Option<crate::rpc::SharedTargetSerial>,
+        lease: crate::rpc::probe_broker::ProbeLease,
     ) -> Key<Session> {
-        self.state.set_session(session, dry_run, lease).await
+        self.state.set_session(session, target_serial, lease).await
     }
 
     pub async fn run_blocking<T, F, REQ, RESP>(&mut self, request: REQ, task: F) -> RESP
@@ -199,18 +207,15 @@ impl RpcSpawnContext {
         REQ: Send + 'static,
         RESP: Send + 'static,
     {
-        let token = self.cancellation_token();
-        let (sender, publisher) = T::create(token);
+        let (sender, publisher) = T::create();
 
         let ctx = self.clone();
         let blocking = tokio::task::spawn_blocking(move || task(ctx, request, sender));
 
-        tokio::select! {
-            _ =  publisher.publish(&self.sender) => unreachable!(),
-            response = blocking => {
-                response.unwrap()
-            }
-        }
+        // The publisher returns once the task has dropped its sender, so the events the task
+        // sent are all published before its response.
+        let (_, response) = tokio::join!(publisher.publish(&self.sender), blocking);
+        response.unwrap()
     }
 }
 
@@ -276,6 +281,15 @@ pub(crate) enum ProbeAccess {
     Deny(Vec<String>),
 }
 
+/// Semihosting access to the files of the server host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostFiles {
+    /// The server runs in the client process, so its files are the files of the client.
+    Allow,
+    /// The server accepts connections from other processes. A client must not access its files.
+    Deny,
+}
+
 pub struct RpcContext {
     /// State associated with a single connection.
     state: ConnectionState,
@@ -286,6 +300,7 @@ pub struct RpcContext {
     /// [`RpcContext::lister`] repackages it as an owned [`Lister`] per call.
     lister: Arc<dyn ProbeLister + Send + Sync>,
     probe_broker: Arc<ProbeBroker>,
+    host_files: HostFiles,
 }
 
 /// Shim that lets a [`Lister`] own a reference to the shared
@@ -306,13 +321,21 @@ impl SpawnContext for RpcContext {
     type SpawnCtxt = RpcSpawnContext;
 
     fn spawn_ctxt(&mut self) -> Self::SpawnCtxt {
-        self.state.token = CancellationToken::new();
         RpcSpawnContext {
             state: self.state.clone(),
             sender: self.sender.clone().unwrap(),
             probe_broker: self.probe_broker.clone(),
             lister: self.lister.clone(),
+            host_files: self.host_files,
         }
+    }
+}
+
+impl Drop for RpcContext {
+    fn drop(&mut self) {
+        // The connection is gone. Stop its requests, so that they release the session and the
+        // probe lease.
+        self.state.token.cancel();
     }
 }
 
@@ -323,12 +346,15 @@ impl RpcContext {
     pub fn with_lister(
         lister: Arc<dyn ProbeLister + Send + Sync>,
         probe_broker: Arc<ProbeBroker>,
+        host_files: HostFiles,
     ) -> Self {
+        let configs = probe_broker.probe_configs().clone();
         Self {
             state: ConnectionState::new(),
             sender: None,
-            lister,
+            lister: Arc::new(ConfiguredLister::new(ArcLister(lister), configs)),
             probe_broker,
+            host_files,
         }
     }
 
@@ -370,6 +396,11 @@ impl RpcContext {
         tokio::sync::OwnedMutexGuard::map(guard, |e: &mut (dyn Any + Send)| {
             &mut e.downcast_mut::<SessionEntry>().unwrap().session
         })
+    }
+
+    /// Returns the serial port to the target of a session.
+    pub fn target_serial(&self, sid: Key<Session>) -> Option<crate::rpc::SharedTargetSerial> {
+        self.state.target_serial(sid)
     }
 
     pub fn debug_states(&self) -> DebugStatesMap {
@@ -429,7 +460,22 @@ async fn cancel_handler(
     _msg: (),
     _sender: &PostcardSender<WireTxImpl>,
 ) {
-    ctx.state.token.cancel();
+    // Stop all running requests. Requests that start later get a new token.
+    std::mem::take(&mut ctx.state.token).cancel();
+}
+
+/// Sends the reply of a spawned handler.
+pub(crate) async fn reply<E>(
+    sender: &PostcardSender<WireTxImpl>,
+    header: VarHeader,
+    resp: &E::Response,
+) where
+    E: postcard_rpc::Endpoint,
+    E::Response: Serialize + Schema,
+{
+    if sender.reply::<E>(header.seq_no, resp).await.is_err() {
+        tracing::debug!("Client is gone, dropping the reply of {}", E::PATH);
+    }
 }
 
 pub fn spawn_fn(
@@ -494,6 +540,7 @@ postcard_rpc::define_dispatch! {
         | BootEndpoint                     | async | boot                       |
         | MonitorEndpoint                  | spawn | monitor                    |
         | RttDownEndpoint                  | async | write_rtt_down             |
+        | SerialWriteEndpoint              | async | write_serial               |
         | GetRttChannelsEndpoint           | async | get_rtt_channels           |
         | PollRttUpEndpoint                | async | poll_rtt_up                |
         | CleanUpRttEndpoint               | async | clean_up_rtt               |
@@ -514,6 +561,7 @@ postcard_rpc::define_dispatch! {
         | TargetInfoEndpoint               | async | target_info                |
         | ResetCoreEndpoint                | async | reset                      |
         | ResetCoreAndHaltEndpoint         | async | reset_and_halt             |
+        | ResetTargetEndpoint              | spawn | reset_target               |
 
         | CoreStatusEndpoint               | async | core_status                |
         | CoreHaltEndpoint                 | async | core_halt                  |
@@ -586,11 +634,13 @@ impl RpcApp {
         depth: usize,
         probe_access: ProbeAccess,
         probe_broker: Arc<ProbeBroker>,
+        host_files: HostFiles,
     ) -> (RpcServer, TxChannel, RxChannel) {
         Self::create_server_with_lister(
             depth,
             Arc::new(LimitedLister::new(probe_access)),
             probe_broker,
+            host_files,
         )
     }
 
@@ -600,6 +650,7 @@ impl RpcApp {
         depth: usize,
         lister: Arc<dyn ProbeLister + Send + Sync>,
         probe_broker: Arc<ProbeBroker>,
+        host_files: HostFiles,
     ) -> (RpcServer, TxChannel, RxChannel) {
         let client_to_server = channel::<Result<Vec<u8>, WireRxErrorKind>>(depth);
         let server_to_client = channel::<Vec<u8>>(depth);
@@ -610,7 +661,10 @@ impl RpcApp {
         let spawner = TokioSpawner::default();
         let handler_panicked = spawner.handler_panicked.clone();
 
-        let mut dispatcher = RpcApp::new(RpcContext::with_lister(lister, probe_broker), spawner);
+        let mut dispatcher = RpcApp::new(
+            RpcContext::with_lister(lister, probe_broker, host_files),
+            spawner,
+        );
         let vkk = dispatcher.min_key_len();
         dispatcher
             .context
@@ -621,7 +675,7 @@ impl RpcApp {
                 server: Server::new(
                     server_to_client_tx,
                     client_to_server_rx,
-                    vec![0u8; 1024 * 1024].into_boxed_slice(), // 1MB buffer
+                    vec![0u8; MAX_REQUEST_LEN].into_boxed_slice(),
                     dispatcher,
                     vkk,
                 ),
@@ -669,5 +723,148 @@ pub(crate) mod convert {
         fn from(e: OperationError) -> RpcError {
             rpc_error_anyhow_from(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use postcard_rpc::header::VarKeyKind;
+    use probe_rs_rpc::{RttTopic, monitor::RttEvent};
+
+    #[tokio::test]
+    async fn run_blocking_publishes_every_event_before_it_returns() {
+        const EVENTS: usize = 16;
+
+        // A wire that holds a single frame keeps the publisher behind the task.
+        let (wire_tx, mut wire_rx) = channel::<Vec<u8>>(1);
+        let frames = tokio::spawn(async move {
+            let mut frames = 0;
+            while wire_rx.recv().await.is_some() {
+                frames += 1;
+            }
+            frames
+        });
+
+        let mut ctx = RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+            host_files: HostFiles::Allow,
+        };
+
+        ctx.run_blocking::<RttTopic, _, _, _>((), |_, (), sender| {
+            for _ in 0..EVENTS {
+                let event = RttEvent::Output {
+                    channel: 0,
+                    bytes: vec![0],
+                };
+                sender.blocking_send(event).unwrap();
+            }
+        })
+        .await;
+
+        drop(ctx);
+        assert_eq!(frames.await.unwrap(), EVENTS);
+    }
+
+    fn context_with_host_files(host_files: HostFiles) -> RpcSpawnContext {
+        let (wire_tx, _) = channel::<Vec<u8>>(1);
+        RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+            host_files,
+        }
+    }
+
+    #[test]
+    fn remote_server_rejects_semihosting_file_mappings() {
+        let mut mapped = SemihostingOptions::new();
+        mapped
+            .add_file("in.txt".to_owned(), "/etc/passwd".to_owned())
+            .unwrap();
+
+        let remote = context_with_host_files(HostFiles::Deny);
+        assert!(remote.semihosting_options(mapped.clone()).is_err());
+        assert!(
+            remote
+                .semihosting_options(SemihostingOptions::new())
+                .is_ok()
+        );
+
+        let local = context_with_host_files(HostFiles::Allow);
+        assert!(local.semihosting_options(mapped).is_ok());
+    }
+
+    /// The client can go away while a task publishes events. The server must
+    /// not panic.
+    #[tokio::test]
+    async fn run_blocking_survives_a_closed_connection() {
+        let (wire_tx, wire_rx) = channel::<Vec<u8>>(1);
+        drop(wire_rx);
+
+        let mut ctx = RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+            host_files: HostFiles::Allow,
+        };
+        let result = tokio::spawn(async move {
+            ctx.run_blocking::<RttTopic, _, _, _>((), |_, (), sender| {
+                let event = RttEvent::Output {
+                    channel: 0,
+                    bytes: vec![0],
+                };
+                _ = sender.blocking_send(event);
+            })
+            .await
+        })
+        .await;
+
+        assert!(result.is_ok(), "run_blocking panicked");
+    }
+
+    /// A task can send events after a cancel, for example the RTT output of
+    /// its last poll. The publisher must forward them.
+    #[tokio::test]
+    async fn run_blocking_publishes_events_sent_after_a_cancel() {
+        let (wire_tx, mut wire_rx) = channel::<Vec<u8>>(16);
+        let frames = tokio::spawn(async move {
+            let mut frames = 0;
+            while wire_rx.recv().await.is_some() {
+                frames += 1;
+            }
+            frames
+        });
+
+        let mut ctx = RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+            host_files: HostFiles::Allow,
+        };
+        let token = ctx.cancellation_token();
+
+        let sent = ctx
+            .run_blocking::<RttTopic, _, _, _>((), move |_, (), sender| {
+                token.cancel();
+                // Give the publisher time to see the cancel.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let event = RttEvent::Output {
+                    channel: 0,
+                    bytes: vec![0],
+                };
+                sender.blocking_send(event).is_ok()
+            })
+            .await;
+
+        drop(ctx);
+        assert!(sent, "the publisher stopped at the cancel");
+        assert_eq!(frames.await.unwrap(), 1);
     }
 }

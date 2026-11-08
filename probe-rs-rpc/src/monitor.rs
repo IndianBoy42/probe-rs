@@ -56,13 +56,13 @@ pub struct SemihostingExitError {
 
 pub type MonitorResponse = RpcResult<MonitorExitReason>;
 
-#[derive(Serialize, Deserialize, Clone, Schema)]
+#[derive(Debug, Serialize, Deserialize, Clone, Schema)]
 pub struct ChannelInfo {
     pub name: String,
     pub buffer_size: u64,
 }
 
-#[derive(Serialize, Deserialize, Schema)]
+#[derive(Debug, Serialize, Deserialize, Schema)]
 pub enum RttEvent {
     Discovered {
         up_channels: Vec<ChannelInfo>,
@@ -74,7 +74,23 @@ pub enum RttEvent {
     },
 }
 
-#[derive(Serialize, Deserialize, Schema)]
+#[derive(Debug, Serialize, Deserialize, Schema)]
 pub enum SemihostingEvent {
-    Output { stream: String, data: String },
+    Output { stream: String, bytes: Vec<u8> },
 }
+
+/// Data from the serial port to the target.
+#[derive(Debug, Serialize, Deserialize, Schema)]
+pub enum SerialEvent {
+    Output { bytes: Vec<u8> },
+}
+
+/// Writes data to the serial port to the target.
+#[derive(Debug, Serialize, Deserialize, Schema)]
+pub struct SerialWriteRequest {
+    pub sessid: Key<Session>,
+    pub data: Vec<u8>,
+}
+
+/// The number of bytes written.
+pub type SerialWriteResponse = RpcResult<u32>;

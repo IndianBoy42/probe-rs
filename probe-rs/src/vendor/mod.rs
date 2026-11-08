@@ -2,7 +2,7 @@
 
 use std::{ops::Deref, sync::LazyLock};
 
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RecursiveRwLock, RecursiveRwLockReadGuard};
 use probe_rs_target::Chip;
 
 use crate::{
@@ -23,11 +23,13 @@ use crate::{
 
 pub mod amd;
 pub mod asrmicro;
+pub mod gigadevice;
 pub mod holtek;
 pub mod infineon;
 pub mod maxim;
 pub mod microchip;
 pub mod nordicsemi;
+pub mod nsing;
 pub mod nuclei;
 pub mod nxp;
 pub mod raspberrypi;
@@ -37,8 +39,10 @@ pub mod sifli;
 pub mod silabs;
 pub mod st;
 pub mod ti;
+pub mod tridentiot;
 pub mod vorago;
 pub mod wch;
+pub mod whxy;
 
 /// Vendor support trait.
 pub trait Vendor: Send + Sync + std::fmt::Display {
@@ -55,7 +59,7 @@ pub trait Vendor: Send + Sync + std::fmt::Display {
         Ok(None)
     }
 
-    /// Tries to identify an RISC-V chip. Returns `Some(target name)` on success.
+    /// Tries to identify a RISC-V chip. Returns `Some(target name)` on success.
     fn try_detect_riscv_chip(
         &self,
         _registry: &Registry,
@@ -85,7 +89,7 @@ pub trait Vendor: Send + Sync + std::fmt::Display {
     }
 }
 
-static VENDORS: LazyLock<RwLock<Vec<&'static dyn Vendor>>> = LazyLock::new(|| {
+static VENDORS: LazyLock<RecursiveRwLock<Vec<&'static dyn Vendor>>> = LazyLock::new(|| {
     let vendors: Vec<&'static dyn Vendor> = vec![
         &asrmicro::Asrmicro,
         &amd::Amd,
@@ -105,9 +109,13 @@ static VENDORS: LazyLock<RwLock<Vec<&'static dyn Vendor>>> = LazyLock::new(|| {
         &sifli::Sifli,
         &renesas::Renesas,
         &wch::Wch,
+        &gigadevice::GigaDevice,
+        &nsing::Nsing,
+        &whxy::Whxy,
+        &tridentiot::TridentIot,
     ];
 
-    RwLock::new(vendors)
+    RecursiveRwLock::new(vendors)
 });
 
 /// Registers a new vendor.
@@ -118,7 +126,7 @@ pub(crate) fn register_vendor(vendor: &'static dyn Vendor) {
 
 /// Returns a readable view of all known vendors.
 fn vendors<'a>() -> impl Deref<Target = [&'a dyn Vendor]> {
-    RwLockReadGuard::map(VENDORS.read_recursive(), |v| v.as_slice())
+    RecursiveRwLockReadGuard::map(VENDORS.read(), |v| v.as_slice())
 }
 
 /// Tries to create a debug sequence for the given chip.

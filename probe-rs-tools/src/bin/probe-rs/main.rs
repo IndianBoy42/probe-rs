@@ -7,40 +7,50 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use colored::Colorize;
-use figment::Figment;
-use figment::providers::{Data, Format as _, Json, Toml, Yaml};
-use figment::value::Value;
+use figment2::Figment;
+use figment2::providers::{Data, Format as _, Json, Toml, Yaml};
+use figment2::value::Value;
 use itertools::Itertools;
 use probe_rs::config::Registry;
-use probe_rs::probe::list::Lister;
+use probe_rs::probe::list::{AllProbesLister, Lister};
 use report::Report;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::rpc::functions::RpcApp;
+use crate::rpc::probe_broker::ProbeBroker;
+use crate::util::cli::FirmwareExited;
 use crate::util::logging::setup_logging;
+use crate::util::probe_config::{ConfiguredLister, ProbeConfigs};
 use probe_rs_rpc_client::{RemoteParams, RpcClient};
 
 const MAX_LOG_FILES: usize = 20;
 
 #[cfg(feature = "remote")]
-pub(crate) const HOST_LONG_HELP: &str = "Remote host to connect to.\n\n\
-    Accepted URL prefixes:\n  \
-    ws://, wss://   a probe-rs serve websocket\n  \
-    ssh://          a probe-rs serve websocket, tunnelled through ssh\n  \
-    socket://       a probe-rs serve unix socket (Unix only)\n\n\
-    The ssh:// form takes [user@]destination[:port] and runs \
-    `ssh <destination> -W 127.0.0.1:<port>`, so the server must listen on the \
-    loopback interface of the remote host. The port defaults to 3000.\n\n\
-    probe-rs gives ssh no other options. Name the destination in your ssh \
-    configuration file to select an identity file, a jump host, or an ssh \
-    port other than 22.";
+pub(crate) const HOST_LONG_HELP: &str = r"Remote host to connect to.
+
+Accepted URL prefixes:
+  ws://, wss://   a probe-rs serve websocket
+  ssh://          a probe-rs serve websocket, tunnelled through ssh
+  socket://       a probe-rs serve unix socket (Unix only)
+
+A ws:// or wss:// URL can have a path, for example the prefix of a reverse
+proxy.
+
+The ssh:// form takes [user@]destination[:port] and runs
+`ssh <destination> -W 127.0.0.1:<port>`, so the server must listen on the
+loopback interface of the remote host. The port defaults to 3000.
+
+probe-rs gives ssh no other options. Name the destination in your ssh
+configuration file to select an identity file, a jump host, or an ssh port
+other than 22.";
 
 type ConfigPreset = HashMap<String, Value>;
 
@@ -51,6 +61,9 @@ pub(crate) struct Config {
 
     /// A named set of `--key=value` pairs.
     pub presets: HashMap<String, ConfigPreset>,
+
+    /// Settings for each probe, keyed by probe selector.
+    pub probes: ProbeConfigs,
 }
 
 #[derive(clap::Parser)]
@@ -118,16 +131,20 @@ struct Cli {
 }
 
 impl Cli {
-    async fn run(self, client: RpcClient, _config: Config, utc_offset: UtcOffset) -> Result<()> {
-        let lister = Lister::new();
+    async fn run(self, client: RpcClient, config: Config, utc_offset: UtcOffset) -> Result<()> {
+        let lister = Lister::with_lister(Box::new(ConfiguredLister::new(
+            AllProbesLister::new(),
+            config.probes.clone(),
+        )));
         let mut registry = Registry::from_builtin_families();
         match self.subcommand {
             Subcommand::DapServer(cmd) => {
                 let log_path = self.log_file.as_deref();
-                cmd::dap_server::run(cmd, Some(client), None, utc_offset, log_path).await
+                cmd::dap_server::run(cmd, Some(client), None, config.probes, utc_offset, log_path)
+                    .await
             }
             #[cfg(feature = "remote")]
-            Subcommand::Serve(cmd) => cmd.run(_config.server).await,
+            Subcommand::Serve(cmd) => cmd.run(config.server, config.probes).await,
             Subcommand::List(cmd) => cmd.run(client).await,
             Subcommand::Info(cmd) => cmd.run(client).await,
             Subcommand::Gdb(cmd) => cmd.run(client).await,
@@ -312,7 +329,24 @@ fn multicall_check(args: &[OsString], want: &str) -> Option<Vec<OsString>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            if let Some(error) = error.downcast_ref::<FirmwareExited>() {
+                // not a probe-rs error, don't print "Error:"
+                eprintln!("{error}");
+                let code = error.exit_code();
+                ExitCode::from(code)
+            } else {
+                eprintln!("Error: {error:?}");
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     probe_rs_espressif::register_plugin();
     #[cfg(target_os = "linux")]
     probe_rs_linux::register_plugin();
@@ -380,9 +414,17 @@ async fn main() -> Result<()> {
             unreachable!("checked DapServer above");
         };
         let log_path = log_path.as_deref();
-        cmd::dap_server::run(cmd, None, connection_params, utc_offset, log_path).await
+        cmd::dap_server::run(
+            cmd,
+            None,
+            connection_params,
+            config.probes,
+            utc_offset,
+            log_path,
+        )
+        .await
     } else {
-        run_app(connection_params, async |client| {
+        run_app(connection_params, config.probes.clone(), async |client| {
             anyhow::ensure!(
                 client.is_local_session() || cli.subcommand.is_remote_cmd(),
                 "The subcommand is not supported in remote mode."
@@ -404,6 +446,7 @@ async fn main() -> Result<()> {
 /// Runs the callback using either a local or remote RPC client.
 async fn run_app<R>(
     #[cfg_attr(not(feature = "remote"), expect(unused_variables))] connection_params: RemoteParams,
+    probe_configs: ProbeConfigs,
     cb: impl AsyncFnOnce(RpcClient) -> Result<R>,
 ) -> Result<R> {
     #[cfg(feature = "remote")]
@@ -416,13 +459,19 @@ async fn run_app<R>(
         )
         .await?;
 
-        return cb(client).await;
+        let result = cb(client.clone()).await;
+        client.close().await;
+        return result;
     }
 
     // Create a local server to run commands against.
-    let probe_broker = Arc::new(crate::rpc::probe_broker::ProbeBroker::new());
-    let (local_server, tx, rx) =
-        RpcApp::create_server(16, rpc::functions::ProbeAccess::All, probe_broker);
+    let probe_broker = Arc::new(ProbeBroker::new_with_config(probe_configs));
+    let (local_server, tx, rx) = RpcApp::create_server(
+        16,
+        rpc::functions::ProbeAccess::All,
+        probe_broker,
+        rpc::functions::HostFiles::Allow,
+    );
     let handle = tokio::spawn(async move { local_server.run().await });
 
     // Run the command locally.
@@ -569,17 +618,18 @@ fn compile_report(
 }
 
 fn load_config() -> anyhow::Result<Config> {
-    // Paths to search for the configuration file.
-    // cwd
-    let mut paths = vec![PathBuf::from(".")];
-    // path to executable
-    if let Ok(exe) = std::env::current_exe() {
-        paths.push(exe.parent().unwrap().to_path_buf());
-    }
+    // Paths to search for the configuration file, lowest priority first.
+    let mut paths = vec![];
     // home directory
     if let Some(home) = directories::UserDirs::new().map(|user| user.home_dir().to_path_buf()) {
         paths.push(home);
     }
+    // path to executable
+    if let Ok(exe) = std::env::current_exe() {
+        paths.push(exe.parent().unwrap().to_path_buf());
+    }
+    // cwd and its parents, so a project file wins.
+    paths.push(PathBuf::from("."));
 
     // Files to search for, without extension.
     let files = [".probe-rs"];

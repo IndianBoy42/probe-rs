@@ -13,12 +13,13 @@ use crate::{
     },
     probe::{
         BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbe, DebugProbeError,
-        Probe, Results, WireProtocol,
+        DebugProbeSelector, Probe, ProbeCreationError, ProbeFactory, ResetLine, Results,
+        WireProtocol,
+        list::ProbeListItem,
         swd::{Direction, Port, SwdBatch, SwdOp, SwdProbe},
     },
 };
 
-#[cfg(any(test, feature = "test"))]
 use object::{
     Object, ObjectSection,
     elf::PT_LOAD,
@@ -45,6 +46,8 @@ pub struct FakeProbe {
     operations: RefCell<VecDeque<Operation>>,
 
     memory_ap: MockedAp,
+
+    reset_line: ResetLine,
 }
 
 enum MockedAp {
@@ -345,6 +348,8 @@ impl FakeProbe {
             operations: RefCell::new(VecDeque::new()),
 
             memory_ap: MockedAp::MemoryAp(MockMemoryAp::with_pattern()),
+
+            reset_line: ResetLine::default(),
         }
     }
 
@@ -358,7 +363,6 @@ impl FakeProbe {
 
     /// Fake probe with a mocked core
     /// with access to an actual binary file.
-    #[cfg(any(test, feature = "test"))]
     pub fn with_mocked_core_and_binary(program_binary: &std::path::Path) -> Self {
         let file_data = std::fs::read(program_binary).unwrap();
         let file_data_slice = file_data.as_slice();
@@ -521,7 +525,6 @@ impl FakeProbe {
     }
 }
 
-#[cfg(any(test, feature = "test"))]
 fn core_with_binary<T: FileHeader>(elf_file: ElfFile<T>) -> MockCore {
     use probe_rs_target::MemoryRange;
 
@@ -582,6 +585,31 @@ impl Default for FakeProbe {
     }
 }
 
+/// A probe factory that opens no probe and lists no probes.
+///
+/// Use it to create a [`DebugProbeInfo`](crate::probe::DebugProbeInfo) for a fake probe. Open the
+/// fake probe through a [`ProbeLister`](crate::probe::list::ProbeLister).
+#[derive(Debug)]
+pub struct FakeProbeFactory;
+
+impl std::fmt::Display for FakeProbeFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mocked Probe")
+    }
+}
+
+impl ProbeFactory for FakeProbeFactory {
+    fn open(&self, _selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
+        Err(DebugProbeError::ProbeCouldNotBeCreated(
+            ProbeCreationError::Other("open a fake probe through a probe lister"),
+        ))
+    }
+
+    fn list_probes(&self) -> Vec<ProbeListItem> {
+        Vec::new()
+    }
+}
+
 impl DebugProbe for FakeProbe {
     /// Get human readable name for the probe
     fn get_name(&self) -> &str {
@@ -619,17 +647,23 @@ impl DebugProbe for FakeProbe {
 
     /// Resets the target device.
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         Err(DebugProbeError::CommandNotSupportedByProbe {
             command_name: "target_reset",
         })
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         unimplemented!()
     }
 
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
         Ok(())
+    }
+
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
     }
 
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
@@ -680,9 +714,13 @@ impl SwdProbe for FakeProbe {
                     }),
                 },
                 SwdOp::Sequence(_) | SwdOp::Idle { .. } => Ok(()),
-                SwdOp::Pins { .. } => Err(DebugProbeError::NotImplemented {
-                    function_name: "swj_pins",
-                }),
+                SwdOp::Pins { out, select, .. } => {
+                    self.reset_line.check_pins(*out, *select).and_then(|()| {
+                        Err(DebugProbeError::NotImplemented {
+                            function_name: "swj_pins",
+                        })
+                    })
+                }
             };
 
             if let Err(error) = op_result {
@@ -748,6 +786,10 @@ impl SwdSequence for FakeArmInterface {
 }
 
 impl ArmDebugInterface for FakeArmInterface {
+    fn driver_mut(&mut self) -> Option<&mut dyn DebugProbe> {
+        Some(self.probe.as_mut())
+    }
+
     fn memory_interface(
         &mut self,
         access_port_address: &FullyQualifiedApAddress,
@@ -862,6 +904,10 @@ impl DapAccess for FakeArmInterface {
 mod test {
     use super::{Direction, FakeProbe, Operation, Port, SwdBatch, SwdProbe};
     use crate::Permissions;
+    use crate::architecture::arm::sequences::{ArmDebugSequence, DefaultArmSequence};
+    use crate::architecture::arm::{ArmError, DapError, dp::DpAddress};
+    use crate::probe::DebugProbeError;
+    use crate::vendor::ti::sequences::cc23xx_cc27xx::CC23xxCC27xx;
 
     #[test]
     fn swd_transfer_runs_expected_operation() {
@@ -881,6 +927,93 @@ mod test {
     }
 
     #[test]
+    fn closed_arm_interface_keeps_unconnected_reset_line() {
+        let mut probe = FakeProbe::new().into_probe();
+        probe.set_reset_line_connected(false);
+        probe.attach_to_unspecified().unwrap();
+
+        let interface = probe
+            .try_into_arm_debug_interface(DefaultArmSequence::create())
+            .unwrap_or_else(|_| panic!("no ARM interface"));
+        let mut probe = interface.close();
+        probe.detach().unwrap();
+
+        assert!(matches!(
+            probe.attach_to_unspecified_under_reset(),
+            Err(crate::Error::Arm(ArmError::Probe(
+                DebugProbeError::ResetLineNotConnected
+            )))
+        ));
+    }
+
+    #[test]
+    fn reset_assert_fails_without_reset_line() {
+        let mut probe = FakeProbe::new().into_probe();
+        probe.set_reset_line_connected(false);
+        probe.attach_to_unspecified().unwrap();
+
+        assert!(matches!(
+            probe.target_reset_assert(),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        assert!(matches!(
+            probe.target_reset(),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        assert!(matches!(
+            probe.with_debug_port_wire(|wire| wire.target_reset_assert()),
+            Err(ArmError::Probe(DebugProbeError::ResetLineNotConnected))
+        ));
+        assert!(matches!(
+            probe.with_debug_port_wire(|wire| wire.target_reset()),
+            Err(ArmError::Probe(DebugProbeError::ResetLineNotConnected))
+        ));
+        probe.target_reset_deassert().unwrap();
+    }
+
+    #[test]
+    fn swj_pins_without_reset_line_does_not_assert_nreset() {
+        let mut probe = FakeProbe::new().into_probe();
+        probe.set_reset_line_connected(false);
+        probe.attach_to_unspecified().unwrap();
+        let mut interface = probe
+            .try_into_arm_debug_interface(DefaultArmSequence::create())
+            .unwrap_or_else(|_| panic!("no ARM interface"));
+        let nreset = 1 << 7;
+
+        assert!(matches!(
+            interface.swj_pins(0, nreset, 0),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        // A release passes the guard.
+        assert!(matches!(
+            interface.swj_pins(nreset, nreset, 0),
+            Err(DebugProbeError::NotImplemented { .. })
+        ));
+    }
+
+    #[test]
+    fn cc23xx_setup_without_reset_line_returns_the_connect_error() {
+        let mut fake_probe = FakeProbe::new();
+        fake_probe.set_dap_register_read_handler(Box::new(|_| {
+            Err(ArmError::Dap(DapError::NoAcknowledge))
+        }));
+        fake_probe.set_dap_register_write_handler(Box::new(|_, _| Ok(())));
+        let mut probe = fake_probe.into_probe();
+        probe.set_reset_line_connected(false);
+        probe.attach_to_unspecified().unwrap();
+
+        let sequence = CC23xxCC27xx::create("CC2340R5".to_string());
+        let result =
+            probe.with_debug_port_wire(|wire| sequence.debug_port_setup(wire, DpAddress::Default));
+
+        assert!(
+            matches!(result, Err(ArmError::NoTargetResponse { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn create_session_with_fake_probe() {
         let fake_probe = FakeProbe::with_mocked_core();
 
@@ -889,5 +1022,16 @@ mod test {
         probe
             .attach("nrf51822_xxAC", Permissions::default())
             .unwrap();
+    }
+
+    #[test]
+    fn a_session_lends_its_probe() {
+        let mut session = FakeProbe::with_mocked_core()
+            .into_probe()
+            .attach("nrf51822_xxAC", Permissions::default())
+            .unwrap();
+
+        let probe: &mut dyn std::any::Any = session.driver_mut().unwrap();
+        assert!(probe.downcast_mut::<FakeProbe>().is_some());
     }
 }

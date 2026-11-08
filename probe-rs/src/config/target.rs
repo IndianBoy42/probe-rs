@@ -9,11 +9,12 @@ use crate::{
         riscv::sequences::{DefaultRiscvSequence, RiscvDebugSequence},
         xtensa::sequences::{DefaultXtensaSequence, XtensaDebugSequence},
     },
-    flashing::DebugFlashSequence,
+    flashing::{DebugFlashSequence, FlashCompare},
     rtt::ScanRegion,
 };
 use probe_rs_target::{
-    Architecture, Chip, ChipFamily, Jtag, MemoryAccess, MemoryRange as _, NvmRegion,
+    Architecture, Chip, ChipFamily, CoreAccessOptions, Jtag, MemoryAccess, MemoryPort,
+    MemoryRange as _, NvmRegion,
 };
 use std::sync::Arc;
 
@@ -24,6 +25,8 @@ pub struct Target {
     pub name: String,
     /// The cores of the target.
     pub cores: Vec<Core>,
+    /// Additional memory access ports of the target.
+    pub memory_ports: Vec<MemoryPort>,
     /// The list of available flash algorithms.
     pub flash_algorithms: Vec<RawFlashAlgorithm>,
     /// The memory map of the target.
@@ -109,6 +112,7 @@ impl Target {
                         execute: false,
                         boot: false,
                     }),
+                    memory_ports: vec![],
                 }));
             }
 
@@ -135,6 +139,7 @@ impl Target {
         Target {
             name: chip.name.clone(),
             cores: chip.cores.clone(),
+            memory_ports: chip.memory_ports.clone(),
             flash_algorithms,
             source: family.source.clone(),
             memory_map,
@@ -169,6 +174,31 @@ impl Target {
     pub fn default_core(&self) -> &Core {
         // TODO: Check if this is specified in the target description.
         &self.cores[0]
+    }
+
+    /// Returns whether a session reaches the target through an ARM debug port. Only these
+    /// targets drive the reset line when attaching under reset.
+    pub fn uses_arm_debug_interface(&self) -> bool {
+        self.default_core().memory_ap().is_some()
+    }
+
+    /// Returns whether the described JTAG scan chain has a TAP for any core of the target.
+    ///
+    /// A target that describes its scan chain without a TAP at any core's `jtag_tap` index can't
+    /// be debugged over JTAG, for example because its JTAG pins only reach a boundary-scan TAP.
+    /// A target without a described scan chain is assumed to be reachable.
+    pub(crate) fn jtag_reaches_any_core(&self) -> bool {
+        let Some(scan_chain) = self.jtag.as_ref().and_then(|jtag| jtag.scan_chain.as_ref()) else {
+            return true;
+        };
+        self.cores.iter().any(|core| {
+            let jtag_tap = match &core.core_access_options {
+                CoreAccessOptions::Arm(options) => options.jtag_tap,
+                CoreAccessOptions::Riscv(options) => options.jtag_tap,
+                CoreAccessOptions::Xtensa(options) => options.jtag_tap,
+            };
+            jtag_tap.unwrap_or(0) < scan_chain.len()
+        })
     }
 
     /// Source description of this target.
@@ -214,8 +244,8 @@ pub enum TargetSelector {
     /// be used to search the internal list of
     /// targets.
     Unspecified(String),
-    /// Directly specify a target.
-    Specified(Target),
+    /// Directly specify a target. Boxed, because the target structure has become quite large.
+    Specified(Box<Target>),
     /// Try to automatically identify the target,
     /// by reading identifying information from
     /// the probe and / or target.
@@ -257,7 +287,7 @@ impl From<()> for TargetSelector {
 
 impl From<Target> for TargetSelector {
     fn from(target: Target) -> Self {
-        TargetSelector::Specified(target)
+        TargetSelector::Specified(Box::new(target))
     }
 }
 
@@ -285,45 +315,97 @@ impl DebugSequence {
             DebugSequence::Xtensa(seq) => seq.debug_flash_sequence(),
         }
     }
+
+    /// Return the flash compare method of this target, if it has one.
+    ///
+    /// Like [`Self::debug_flash_sequence`], this gives the flash loader one
+    /// architecture-agnostic entry point.
+    pub fn flash_compare(&self) -> Option<Arc<dyn FlashCompare>> {
+        match self {
+            DebugSequence::Arm(seq) => seq.flash_compare(),
+            DebugSequence::Riscv(seq) => seq.flash_compare(),
+            DebugSequence::Xtensa(seq) => seq.flash_compare(),
+        }
+    }
 }
 
-pub(crate) trait CoreExt {
-    // Retrieve the Coresight MemoryAP which should be used to
-    // access the core, if available.
+pub(crate) trait MemoryApExt {
+    /// Retrieve the Coresight MemoryAP through which this core or
+    /// memory port is accessed, if available.
     fn memory_ap(&self) -> Option<FullyQualifiedApAddress>;
 }
 
-impl CoreExt for Core {
+fn fully_qualified_ap(
+    targetsel: Option<u32>,
+    ap: &probe_rs_target::ApAddress,
+) -> FullyQualifiedApAddress {
+    let dp = match targetsel {
+        None => DpAddress::Default,
+        Some(x) => DpAddress::Multidrop(x),
+    };
+    match ap {
+        probe_rs_target::ApAddress::V1(ap) => FullyQualifiedApAddress::v1_with_dp(dp, *ap),
+        probe_rs_target::ApAddress::V2(ap) => {
+            FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address::new(*ap))
+        }
+    }
+}
+
+impl MemoryApExt for Core {
     fn memory_ap(&self) -> Option<FullyQualifiedApAddress> {
         match &self.core_access_options {
             probe_rs_target::CoreAccessOptions::Arm(options) => {
-                let dp = match options.targetsel {
-                    None => DpAddress::Default,
-                    Some(x) => DpAddress::Multidrop(x),
-                };
-                Some(match &options.ap {
-                    probe_rs_target::ApAddress::V1(ap) => {
-                        FullyQualifiedApAddress::v1_with_dp(dp, *ap)
-                    }
-                    probe_rs_target::ApAddress::V2(ap) => {
-                        FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address::new(*ap))
-                    }
-                })
+                Some(fully_qualified_ap(options.targetsel, &options.ap))
             }
-            probe_rs_target::CoreAccessOptions::Riscv(options) => {
-                options.mem_ap.as_ref().map(|ap| {
-                    let dp = DpAddress::Default;
-                    match ap {
-                        probe_rs_target::ApAddress::V1(ap_num) => {
-                            FullyQualifiedApAddress::v1_with_dp(dp, *ap_num)
-                        }
-                        probe_rs_target::ApAddress::V2(ap_num) => {
-                            FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address::new(*ap_num))
-                        }
-                    }
-                })
-            }
+            probe_rs_target::CoreAccessOptions::Riscv(options) => options
+                .mem_ap
+                .as_ref()
+                .map(|ap| fully_qualified_ap(None, ap)),
             probe_rs_target::CoreAccessOptions::Xtensa(_) => None,
         }
+    }
+}
+
+impl MemoryApExt for MemoryPort {
+    fn memory_ap(&self) -> Option<FullyQualifiedApAddress> {
+        match &self.memory_port_options {
+            probe_rs_target::MemoryPortOptions::Arm(options) => {
+                Some(fully_qualified_ap(options.targetsel, &options.ap))
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "builtin-targets"))]
+mod tests {
+    use crate::config::{Registry, Target};
+    use probe_rs_target::CoreAccessOptions;
+
+    fn target(name: &str) -> Target {
+        Registry::from_builtin_families()
+            .get_target_by_name(name)
+            .unwrap()
+    }
+
+    #[test]
+    fn jtag_reaches_any_core() {
+        // No described scan chain.
+        assert!(target("nRF52840_xxAA").jtag_reaches_any_core());
+        // The core TAP is the second of two.
+        assert!(target("X7Z").jtag_reaches_any_core());
+        // The core TAP is the first of two.
+        assert!(target("CC2652R").jtag_reaches_any_core());
+        // The JTAG pins only reach a boundary-scan TAP.
+        assert!(!target("S32K118xxxxVLHx").jtag_reaches_any_core());
+    }
+
+    #[test]
+    fn jtag_reaches_one_of_two_cores() {
+        let mut zynq = target("X7Z");
+        let CoreAccessOptions::Arm(options) = &mut zynq.cores[1].core_access_options else {
+            panic!("X7Z has ARM cores");
+        };
+        options.jtag_tap = Some(2);
+        assert!(zynq.jtag_reaches_any_core());
     }
 }

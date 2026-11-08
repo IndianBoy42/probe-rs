@@ -14,7 +14,9 @@ use probe_rs::{
     },
     probe::{
         BitbangJtag, DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
-        JtagChainState, ProbeFactory, TapState, WireProtocol, list::ProbeListItem,
+        JtagChainState, ProbeFactory, TapState, WireProtocol,
+        list::ProbeListItem,
+        target_serial::{HostSerialPort, LineState, SerialSettings, TargetSerial},
     },
 };
 
@@ -126,6 +128,17 @@ impl DebugProbe for EspUsbJtag {
         })
     }
 
+    fn target_serial(&mut self) -> Option<Box<dyn TargetSerial>> {
+        let filter = self.protocol.serial_filter.clone()?;
+        // DTR and RTS control reset and boot mode. Low on both lines is the idle state.
+        let settings = SerialSettings {
+            dtr: LineState::Low,
+            rts: LineState::Low,
+            ..SerialSettings::default()
+        };
+        Some(Box::new(HostSerialPort::new(filter, settings)))
+    }
+
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
         tracing::info!("reset_assert!");
         self.protocol.set_reset(true)?;
@@ -136,6 +149,10 @@ impl DebugProbe for EspUsbJtag {
         tracing::info!("reset_deassert!");
         self.protocol.set_reset(false)?;
         Ok(())
+    }
+
+    fn set_reset_line_connected(&mut self, _connected: bool) {
+        // The reset is inside the chip. There is no reset line.
     }
 
     fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {

@@ -36,7 +36,7 @@ mod dbgmcu {
     bitfield! {
         /// The control register (CR) of the DBGMCU. This register is described in "RM0456: STM32U5
         /// family reference manual" section 75.12.4
-        pub struct Control(u32);
+        pub struct Control(pub u32);
         impl Debug;
 
         pub u8, trace_mode, set_tracemode: 7, 6;
@@ -82,8 +82,11 @@ impl ArmDebugSequence for Stm32Armv8 {
     fn debug_core_stop(
         &self,
         memory: &mut dyn ArmMemoryInterface,
-        _core_type: CoreType,
+        core_type: CoreType,
     ) -> Result<(), ArmError> {
+        // The stock steps first: halting debug off and the vector catches cleared.
+        self.debug_core_stop_default(memory, core_type)?;
+
         let mut cr = dbgmcu::Control::read(&mut *memory)?;
         cr.enable_standby_debug(false);
         cr.enable_stop_debug(false);

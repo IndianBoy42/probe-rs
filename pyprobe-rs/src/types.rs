@@ -1,6 +1,6 @@
 //! PyO3 enum proxies mirroring probe-rs / probe-rs-target enums.
 
-use probe_rs_target::{Architecture, CoreType, InstructionSet};
+use probe_rs_target::{Architecture, CoreType, InstructionSet, Xlen};
 use pyo3::prelude::*;
 
 /// Wire protocol for debug probe communication.
@@ -45,6 +45,13 @@ pub enum InstructionSetProxy {
     RV64 = 5,
     RV64C = 6,
     Xtensa = 7,
+    // The F extension (single-precision floating point) is separate from the
+    // register width and the C extension, so it needs its own variants rather
+    // than a hidden bit.
+    RV32F = 8,
+    RV32FC = 9,
+    RV64F = 10,
+    RV64FC = 11,
 }
 
 #[pyclass(name = "Endian", eq, eq_int, from_py_object)]
@@ -177,10 +184,16 @@ pub fn instruction_set_to_py(i: InstructionSet) -> InstructionSetProxy {
         InstructionSet::Thumb2 => InstructionSetProxy::Thumb2,
         InstructionSet::A32 => InstructionSetProxy::A32,
         InstructionSet::A64 => InstructionSetProxy::A64,
-        InstructionSet::RV32 => InstructionSetProxy::RV32,
-        InstructionSet::RV32C => InstructionSetProxy::RV32C,
-        InstructionSet::RV64 => InstructionSetProxy::RV64,
-        InstructionSet::RV64C => InstructionSetProxy::RV64C,
+        InstructionSet::Riscv { xlen, c, f } => match (xlen, c, f) {
+            (Xlen::X32, false, false) => InstructionSetProxy::RV32,
+            (Xlen::X32, true, false) => InstructionSetProxy::RV32C,
+            (Xlen::X32, false, true) => InstructionSetProxy::RV32F,
+            (Xlen::X32, true, true) => InstructionSetProxy::RV32FC,
+            (Xlen::X64, false, false) => InstructionSetProxy::RV64,
+            (Xlen::X64, true, false) => InstructionSetProxy::RV64C,
+            (Xlen::X64, false, true) => InstructionSetProxy::RV64F,
+            (Xlen::X64, true, true) => InstructionSetProxy::RV64FC,
+        },
         InstructionSet::Xtensa => InstructionSetProxy::Xtensa,
     }
 }

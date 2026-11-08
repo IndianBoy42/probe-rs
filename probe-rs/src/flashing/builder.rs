@@ -138,6 +138,37 @@ impl FlashLayout {
     pub fn data_blocks(&self) -> &[FlashDataBlockSpan] {
         &self.data_blocks
     }
+
+    /// Returns the parts of a page that hold image data, as `(address, data)` pairs.
+    pub(crate) fn page_data_without_fills(&self, page_index: usize) -> Vec<(u64, &[u8])> {
+        let page = &self.pages[page_index];
+
+        // The fills are in page order, and in address order in a page.
+        let first = self
+            .fills
+            .partition_point(|fill| fill.page_index < page_index);
+        let fills = self.fills[first..]
+            .iter()
+            .take_while(|fill| fill.page_index == page_index);
+
+        let mut pieces = Vec::new();
+        let mut offset = 0;
+        for fill in fills {
+            let fill_offset = (fill.address - page.address) as usize;
+            if fill_offset > offset {
+                pieces.push((
+                    page.address + offset as u64,
+                    &page.data[offset..fill_offset],
+                ));
+            }
+            offset = fill_offset + fill.size as usize;
+        }
+        if offset < page.data.len() {
+            pieces.push((page.address + offset as u64, &page.data[offset..]));
+        }
+
+        pieces
+    }
 }
 
 /// A block of data that is to be written to flash.
@@ -292,6 +323,13 @@ impl FlashBuilder {
         self.build_layout(region, flash_properties, include_empty_pages)
     }
 
+    /// Whether there is data where `range` and the region overlap.
+    fn has_data_in_overlap(&self, range: &Range<u64>, region: &NvmRegion) -> bool {
+        let start = range.start.max(region.range.start);
+        let end = range.end.min(region.range.end);
+        start < end && self.has_data_in_range(&(start..end))
+    }
+
     /// Core layout algorithm used by both RAM-based and host-side flash programming paths.
     ///
     /// Both [`build_sectors_and_pages`] (which has a full [`FlashAlgorithm`]) and
@@ -311,6 +349,12 @@ impl FlashBuilder {
 
             // Ignore the sector if it's outside the NvmRegion.
             if !region.range.contains_range(&range) {
+                if self.has_data_in_overlap(&range, region) {
+                    tracing::warn!(
+                        "Sector {range:#010x?} is only partially inside region {:#010x?} and thus is skipped.",
+                        region.range
+                    );
+                }
                 continue;
             }
 
@@ -339,6 +383,12 @@ impl FlashBuilder {
 
             // Ignore the page if it's outside the NvmRegion.
             if !region.range.contains_range(&range) {
+                if self.has_data_in_overlap(&range, region) {
+                    tracing::warn!(
+                        "Page {range:#010x?} is only partially inside region {:#010x?} and thus is skipped.",
+                        region.range
+                    );
+                }
                 continue;
             }
 
@@ -432,6 +482,7 @@ mod tests {
             }),
             range: 0..1 << 16,
             cores: vec!["main".into()],
+            memory_ports: vec![],
             is_alias: false,
         };
 
@@ -464,6 +515,7 @@ mod tests {
             }),
             range: 0..1 << 16,
             cores: vec!["main".into()],
+            memory_ports: vec![],
             is_alias: false,
         };
 
@@ -538,6 +590,23 @@ mod tests {
                 }],
             }
         )
+    }
+
+    #[test]
+    fn page_data_without_fills() {
+        let (region, flash_algorithm) = assemble_demo_flash1();
+        let mut flash_builder = FlashBuilder::new();
+        flash_builder.add_data(0x10, &[1, 2]).unwrap();
+        flash_builder.add_data(0x20, &[3]).unwrap();
+        let flash_layout = flash_builder
+            .build_sectors_and_pages(&region, &flash_algorithm, true)
+            .unwrap();
+
+        assert_eq!(
+            flash_layout.page_data_without_fills(0),
+            vec![(0x10, &[1, 2][..]), (0x20, &[3][..])]
+        );
+        assert!(flash_layout.page_data_without_fills(1).is_empty());
     }
 
     #[test]
